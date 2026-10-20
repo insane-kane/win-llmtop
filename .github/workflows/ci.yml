@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: ["**"]  # not tags: release.yml runs this workflow itself on a v* tag
   pull_request:
   workflow_call:
   schedule:
@@ -32,10 +33,20 @@ jobs:
         run: ruff check .
       - name: Run editorconfig-checker
         uses: editorconfig-checker/action-editorconfig-checker@51f63319f592f97930c73d9c46184d20bd206393 # v3.0.0
+
+  audit:
+    # zizmor only reads YAML, so it runs on Linux, which its action supports (on Windows it warns "Unsupported runner OS").
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Run zizmor
         uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
         with:
-          inputs: .github/workflows/
+          version: "1.31.1"
+          inputs: .github/
           advanced-security: false
 
   test:
@@ -127,13 +138,14 @@ jobs:
   # Single check required by the repository ruleset before fast-forwarding to main.
   ci-ok:
     runs-on: windows-2025
-    needs: [lint, test, package]
+    needs: [lint, audit, test, package]
     if: always()
     steps:
       - name: Require all CI jobs to succeed
         env:
           LINT_RESULT: ${{ needs.lint.result }}
+          AUDIT_RESULT: ${{ needs.audit.result }}
           TEST_RESULT: ${{ needs.test.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
         run: |
-          python -c "import os, sys; res = {k: os.environ[k] for k in ('LINT_RESULT', 'TEST_RESULT', 'PACKAGE_RESULT')}; print(res); sys.exit(0 if all(v == 'success' for v in res.values()) else 1)"
+          python -c "import os, sys; res = {k: os.environ[k] for k in ('LINT_RESULT', 'AUDIT_RESULT', 'TEST_RESULT', 'PACKAGE_RESULT')}; print(res); sys.exit(0 if all(v == 'success' for v in res.values()) else 1)"

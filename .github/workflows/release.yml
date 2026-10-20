@@ -1,0 +1,150 @@
+# One-time PyPI setup this workflow relies on: a trusted publisher on
+# pypi.org for the project win-llmtop — owner insane-kane, repository
+# win-llmtop, workflow release.yml, environment pypi. The pypi job
+# authenticates with GitHub's OIDC token (permissions: id-token: write);
+# no API token is stored anywhere.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Check tagged commit is an ancestor of origin/main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: Check tag matches pyproject.toml version and dated changelog heading
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import datetime
+          import os
+          import re
+          import sys
+          import tomllib
+
+          tag = os.environ["TAG"]
+          if not tag.startswith("v"):
+            sys.exit("tag %r does not start with 'v'" % tag)
+          version = tag[1:]
+          py_version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          if version != py_version:
+            sys.exit("tag %s does not match pyproject.toml version %s" % (tag, py_version))
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(r"^## \[" + re.escape(version) + r"\] - (\d{4}-\d{2}-\d{2})\s*$", text, re.M)
+          if not m:
+            sys.exit("CHANGELOG.md has no '## [%s] - YYYY-MM-DD' heading" % version)
+          datetime.date.fromisoformat(m.group(1))
+          print("verified %s: pyproject.toml=%s, changelog date=%s" % (tag, py_version, m.group(1)))
+          PY
+
+  ci:
+    needs: verify
+    permissions:
+      contents: read
+    uses: $/.github/workflows/ci.yml  # the workflow's own repository at the commit being run (GitHub, July 2026)
+
+  build:
+    needs: ci
+    runs-on: windows-2025
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          architecture: x64
+      - name: Install build and twine
+        run: python -m pip install build==1.6.1 twine==7.0.0
+      - name: Build
+        run: python -m build
+      - name: Check dist
+        run: python -m twine check dist/*
+      - name: Upload dist
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/win-llmtop
+    permissions:
+      id-token: write
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download dist
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - name: Extract changelog section into notes.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          version = os.environ["TAG"].lstrip("v")
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(r"^## \[" + re.escape(version) + r"\][^\n]*\n.*?(?=^## \[|\Z)", text, re.M | re.S)
+          if not m:
+            sys.exit("no ## [%s] section in CHANGELOG.md" % version)
+          notes = m.group(0).strip() + "\n"
+          open("notes.md", "w", encoding="utf-8").write(notes)
+          sys.stdout.write(notes)
+          PY
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" dist/* --title "win-llmtop $TAG" --notes-file notes.md

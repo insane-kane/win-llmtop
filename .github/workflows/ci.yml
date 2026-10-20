@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_call:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: windows-2025
+    steps:
+      - name: Preserve LF line endings on checkout
+        run: git config --global core.autocrlf false
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          architecture: x64
+      - name: Install ruff
+        run: python -m pip install ruff==0.17.1
+      - name: Run ruff check
+        run: ruff check .
+      - name: Run editorconfig-checker
+        uses: editorconfig-checker/action-editorconfig-checker@51f63319f592f97930c73d9c46184d20bd206393 # v3.0.0
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
+        with:
+          inputs: .github/workflows/
+          advanced-security: false
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["windows-2025", "windows-2022", "windows-11-arm"]
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: ${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}
+      - name: Compile
+        run: python -m compileall -q llmtop.py llmtop_lib tests
+      - name: Install coverage
+        run: python -m pip install coverage==7.16.2
+      - name: Run tests under coverage
+        run: python -c "import glob, subprocess, sys; [subprocess.run([sys.executable, '-m', 'coverage', 'run', '--parallel-mode', f], check=True) for f in sorted(glob.glob('tests/test_*.py'))]"
+      - name: Combine coverage
+        run: python -m coverage combine
+      - name: Report coverage
+        run: python -m coverage report
+      - name: Upload coverage data
+        if: matrix.os == 'windows-2025' && matrix.python-version == '3.13'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-windows-2025-py3.13
+          path: .coverage
+          include-hidden-files: true
+
+  package:
+    runs-on: windows-2025
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          architecture: x64
+      - name: Install build and twine
+        run: python -m pip install build==1.6.1 twine==7.0.0
+      - name: Build package
+        run: python -m build
+      - name: Check package metadata
+        run: python -m twine check dist/*
+      - name: Verify wheel contents
+        run: |
+          python -c "
+          import glob, re, sys, zipfile
+          whls = glob.glob('dist/*.whl')
+          assert len(whls) == 1, whls
+          with zipfile.ZipFile(whls[0]) as zf:
+            names = zf.namelist()
+          bad = [n for n in names if not (n == 'llmtop.py' or re.match(r'^llmtop_lib/[^/]+\.py$', n) or re.match(r'^[^/]+\.dist-info/', n))]
+          if bad or 'llmtop.py' not in names or not any(n.startswith('llmtop_lib/') for n in names):
+            sys.exit(f'unexpected wheel contents: {names}')
+          print('wheel contents ok:', names)
+          "
+      - name: Install wheel in fresh venv and test entry points
+        run: |
+          python -c "
+          import glob, os, subprocess, sys, tempfile
+          whl = os.path.abspath(glob.glob('dist/*.whl')[0])
+          with tempfile.TemporaryDirectory() as td:
+            subprocess.run([sys.executable, '-m', 'venv', td], check=True)
+            py = os.path.join(td, 'Scripts', 'python.exe')
+            cli = os.path.join(td, 'Scripts', 'win-llmtop.exe')
+            subprocess.run([py, '-m', 'pip', 'install', whl], check=True, cwd=td)
+            h = subprocess.run([cli, '--help'], capture_output=True, text=True, cwd=td, check=True)
+            print(h.stdout)
+            c = subprocess.run([cli, '--check'], capture_output=True, text=True, cwd=td)
+            print(c.stdout)
+            if c.stderr:
+              print(c.stderr, file=sys.stderr)
+            if c.returncode not in (0, 1) or 'traceback' in (c.stdout + c.stderr).lower():
+              sys.exit(f'win-llmtop --check failed with rc={c.returncode}')
+          "
+
+  # Single check required by the repository ruleset before fast-forwarding to main.
+  ci-ok:
+    runs-on: windows-2025
+    needs: [lint, test, package]
+    if: always()
+    steps:
+      - name: Require all CI jobs to succeed
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+        run: |
+          python -c "import os, sys; res = {k: os.environ[k] for k in ('LINT_RESULT', 'TEST_RESULT', 'PACKAGE_RESULT')}; print(res); sys.exit(0 if all(v == 'success' for v in res.values()) else 1)"

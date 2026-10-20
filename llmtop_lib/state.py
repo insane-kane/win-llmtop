@@ -1,0 +1,1112 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""llmtop engine: time series, persistence, alert rules, and the per-tick collector that fuses every data source into one snapshot."""
+
+import hashlib
+import json
+import math
+import os
+import re
+import statistics
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from array import array
+from collections import defaultdict, deque
+
+from . import log as logmod
+from . import model, win
+
+NAN = float("nan")
+MIB = 2**20
+CFG = {
+	"router": None,
+	"log_dir": None,
+	"router_log": None,
+	"state_dir": os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local"), "win-llmtop"),
+	"api_key": None,
+	"gpu": None,
+	"hz": 4.0,  # sampling and redraw rate
+	"history_hours": 24,
+	"persist": True,
+	"calibrate": True,  # save the learned per-configuration VRAM overhead
+	"spill_mib": 256,  # shared GPU memory held by llama-server before it counts as an overflow
+	"burst_mib": 128,  # rise in shared GPU memory within burst_window_s that raises an alert
+	"avail_warn": 4096,
+	"avail_crit": 2048,
+	"commit_warn": 8192,
+	"commit_crit": 3072,
+	"pagein_warn": 300,  # hard page faults per second
+	"hold_s": 30,  # how long a burst stays in the banner
+	"clear_s": 10,  # quiet time before a sustained alert clears
+	"near_budget_mib": 512,  # shared-memory overflow is critical when resident VRAM is this close to the OS budget
+	"at_budget_mib": 64,  # "within N of the budget" warning
+	"idle_headroom_mib": 1024,  # resident plus shared memory this far under the OS budget counts as "no VRAM pressure" when learning the shared baseline
+	"rival_gpu_pct": 30,  # another process using this share of the GPU while a request runs
+	"card_full_pct": 97,
+	"pagefile_pct": 50,
+	"ws_drop_mib": 1024,  # fall in llama-server's working set within 10 s
+	"burst_window_s": 4,  # window for the shared-memory rise
+	"load_grace_s": 90,  # rises in shared memory this soon after a load are not reported as bursts
+}
+SCALED_THRESHOLDS = ("avail_warn", "avail_crit", "commit_warn", "commit_crit", "near_budget_mib", "idle_headroom_mib")
+RE_BAD_FILE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# series recorded once per second: key -> how the sub-second samples are combined
+SERIES = {"vram": "max", "vram_llama": "max", "spill": "max", "budget": "last", "gpu_llama": "max", "gpu_copy": "max", "gpu_other": "max",
+	"ram_used": "max", "ram_avail": "min", "commit": "max", "llama_ws": "max", "llama_cpu": "mean", "pages_in": "max", "ctx": "max",
+	"dec": "mean", "pre": "mean", "busy": "max", "heap": "last", "pf_used": "max", "pages_out": "max", "standby": "mean", "free": "mean"}
+LEVELS = {"info": 0, "warn": 1, "crit": 2}
+
+
+def agg(xs, how):
+	return max(xs) if how == "max" else min(xs) if how == "min" else sum(xs) / len(xs) if how == "mean" else xs[-1]
+
+
+def scale_thresholds(cfg, ram_mib=None, commit_max_mib=None, budget_mib=None, user_set=()):
+	"""Scale memory and VRAM alert thresholds to fit the machine unless explicitly set by the user."""
+	if ram_mib and ram_mib > 0:
+		if "avail_warn" not in user_set:
+			cfg["avail_warn"] = min(4096, round(0.07 * ram_mib))
+		if "avail_crit" not in user_set:
+			cfg["avail_crit"] = min(2048, round(0.035 * ram_mib))
+	if commit_max_mib and commit_max_mib > 0:
+		if "commit_warn" not in user_set:
+			cfg["commit_warn"] = min(8192, round(0.10 * commit_max_mib))
+		if "commit_crit" not in user_set:
+			cfg["commit_crit"] = min(3072, round(0.04 * commit_max_mib))
+	if budget_mib and budget_mib > 0:
+		if "near_budget_mib" not in user_set:
+			cfg["near_budget_mib"] = min(512, round(0.03 * budget_mib))
+		if "idle_headroom_mib" not in user_set:
+			cfg["idle_headroom_mib"] = min(1024, round(0.06 * budget_mib))
+	return cfg
+
+
+def _win_err(fn, pid):
+	e = win.errors.get((fn, pid))
+	if not e:
+		return None
+	if isinstance(e, tuple) and len(e) == 2:
+		return "%s (error %s)" % (e[1], e[0]) if e[0] else str(e[1])
+	return str(e)
+
+
+class Ring:
+	"""One value per wall-clock second over `span` seconds; NaN where nothing was recorded."""
+
+	def __init__(self, span=24 * 3600):
+		self.span, self.v, self.s = span, array("f", [NAN]) * span, array("q", [0]) * span
+
+	def put(self, t, x):
+		sec = int(t)
+		self.v[sec % self.span], self.s[sec % self.span] = x, sec
+
+	def at(self, sec):
+		i = sec % self.span
+		return self.v[i] if self.s[i] == sec else NAN
+
+	def cols(self, t_end, seconds, n, how="max"):
+		"""`n` columns covering the last `seconds` seconds up to `t_end`; NaN for gaps."""
+		start = int(t_end) + 1 - seconds
+		out = []
+		for j in range(n):
+			a, b = start + seconds * j // n, start + seconds * (j + 1) // n
+			xs = [x for x in map(self.at, range(a, max(b, a + 1))) if x == x]
+			out.append(agg(xs, how) if xs else NAN)
+		return out
+
+	def span_max(self, t0, t1):
+		xs = [x for x in map(self.at, range(int(t0), int(t1) + 1)) if x == x]
+		return max(xs) if xs else NAN
+
+
+class History:
+	"""JSONL on disk: one sample line per 5 s plus alert events, so sparklines and the event list survive a restart."""
+
+	def __init__(self, directory, keep_days=14, on_error=None):
+		self.dir, self.f, self.day, self.on_error = directory, None, None, on_error
+		if directory and os.path.isdir(directory):
+			try:
+				for name in os.listdir(directory):
+					if name.startswith("samples-") and name.endswith(".jsonl") and time.time() - os.path.getmtime(os.path.join(directory, name)) > keep_days * 86400:
+						try:
+							os.remove(os.path.join(directory, name))
+						except OSError:
+							pass
+			except OSError:
+				pass
+
+	def _write(self, t, obj):
+		if not self.dir:
+			return
+		day = time.strftime("%Y%m%d", time.localtime(t))
+		try:
+			os.makedirs(self.dir, exist_ok=True)
+			if day != self.day or self.f is None:
+				if self.f:
+					self.f.close()
+				self.f, self.day = open(os.path.join(self.dir, "samples-%s.jsonl" % day), "a", encoding="utf-8"), day
+			self.f.write(json.dumps(obj, separators=(",", ":")) + "\n")
+			self.f.flush()
+		except (OSError, ValueError) as e:
+			if self.f:
+				try:
+					self.f.close()
+				except OSError:
+					pass
+				self.f = None
+			if self.on_error:
+				self.on_error(e)
+
+	def write_sample(self, sec, vals):
+		self._write(sec, {"t": sec, "v": {k: round(v, 1) for k, v in vals.items()}})
+
+	def write_event(self, ev):
+		self._write(ev["wall"], {"t": int(ev["wall"]), "e": {k: ev[k] for k in ("level", "kind", "msg")}})
+
+	def load(self, since):
+		"""(samples, events) recorded after `since` (epoch)."""
+		if not self.dir or not os.path.isdir(self.dir):
+			return [], []
+		samples, events = [], []
+		try:
+			names = sorted(os.listdir(self.dir))
+		except OSError:
+			return [], []
+		for name in names:
+			if not (name.startswith("samples-") and name.endswith(".jsonl")):
+				continue
+			try:
+				with open(os.path.join(self.dir, name), encoding="utf-8") as f:
+					for line in f:
+						try:
+							d = json.loads(line)
+						except ValueError:
+							continue
+						if d.get("t", 0) < since:
+							continue
+						if "v" in d:
+							samples.append((d["t"], d["v"]))
+						elif "e" in d:
+							events.append({"wall": d["t"], "t": 0, "preset": None, "session": None, **d["e"]})
+			except OSError:
+				continue
+		return samples, events
+
+	def close(self):
+		if self.f:
+			try:
+				self.f.close()
+			except OSError:
+				pass
+			self.f = None
+
+
+class RequestLog:
+	"""Finished requests, one JSON line each. llama-server rewrites a preset's log file every time that model loads, so the logs alone lose history."""
+
+	def __init__(self, directory, on_error=None):
+		self.path = os.path.join(directory, "requests.jsonl") if directory else None
+		self.on_error = on_error
+
+	def load(self, limit=50000):
+		if not self.path or not os.path.isfile(self.path):
+			return []
+		out = []
+		try:
+			with open(self.path, encoding="utf-8") as f:
+				for line in f:
+					try:
+						out.append(json.loads(line))
+					except ValueError:
+						continue
+		except OSError:
+			pass
+		return out[-limit:]
+
+	def append(self, r):
+		if not self.path:
+			return
+		try:
+			os.makedirs(os.path.dirname(self.path), exist_ok=True)
+			with open(self.path, "a", encoding="utf-8") as f:
+				f.write(json.dumps({k: v for k, v in r.items() if k not in ("spill", "rival")}, separators=(",", ":")) + "\n")
+		except (OSError, ValueError, TypeError) as e:
+			if self.on_error:
+				self.on_error(e)
+
+
+class Recorder:
+	"""Folds the sub-second samples into one value per second per series."""
+
+	def __init__(self, rings, hist=None):
+		self.rings, self.hist, self.sec, self.acc, self.n = rings, hist, None, {}, 0
+
+	def add(self, t, vals):
+		sec = int(t)
+		if self.sec is not None and sec != self.sec:
+			self.flush()
+		self.sec = sec
+		for k, x in vals.items():
+			if x == x:
+				self.acc.setdefault(k, []).append(x)
+
+	def flush(self):
+		out = {k: agg(xs, SERIES[k]) for k, xs in self.acc.items()}
+		for k, x in out.items():
+			self.rings[k].put(self.sec, x)
+		self.acc, self.n = {}, self.n + 1
+		if self.hist and out and self.n % 5 == 0:
+			self.hist.write_sample(self.sec, out)
+
+
+class Alerts:
+	"""Alert rules with hysteresis. A rule refreshes its alert while its condition holds; it clears after CFG['clear_s'] of quiet."""
+
+	def __init__(self, cfg, emit):
+		self.cfg, self.emit, self.active, self.prev = cfg, emit, {}, deque(maxlen=40)
+
+	def flag(self, key, level, msg, now, hold=0):
+		a = self.active.get(key)
+		if a is None:
+			self.active[key] = {"level": level, "msg": msg, "since": now, "last": now + hold}
+			self.emit(level, "alert", msg)
+		else:
+			a.update(level=level, msg=msg, last=max(a["last"], now + hold))
+
+	def sweep(self, now):
+		for key in [k for k, a in self.active.items() if now - a["last"] > self.cfg["clear_s"]]:
+			a = self.active.pop(key)
+			self.emit("info", "alert", "cleared after %s: %s" % (hms(now - a["since"]), a["msg"]))
+
+	def ordered(self):
+		return sorted(self.active.items(), key=lambda kv: (-LEVELS[kv[1]["level"]], kv[1]["since"]))
+
+	def evaluate(self, snap, mem):
+		"""Every message states counter values and the threshold that was crossed; none states a cause."""
+		now, c, g, ll, rm = snap["t"], self.cfg, snap["gpu"], snap["llama"], snap["ram"]
+		if not snap["router_up"]:
+			self.flag("router", "crit", "router unreachable at %s: %s" % (c["router"], snap["router_error"]), now)
+		for preset, p in snap["presets"].items():
+			err = p.get("slot_error")
+			if err:
+				fix = ("pass --api-key or set LLAMA_API_KEY" if err in ("HTTP 401", "HTTP 403") else
+					"the server's /slots endpoint is off (start it with --slots)" if err in ("HTTP 404", "HTTP 501") else None)
+				msg = ("/slots for %s returned %s: %s" % (preset, err, fix)) if fix else ("/slots for %s returned %s" % (preset, err))
+				self.flag("slots:" + preset, "warn", msg, now)
+			else:
+				self.active.pop("slots:" + preset, None)
+		if g and ll["present"]:
+			self.prev.append((now, ll["shr"], ll["ded"]))
+			old = next((p for p in self.prev if now - p[0] <= c["burst_window_s"]), None)
+			near = bool(g["budget"]) and ll["ded"] >= g["budget"] - c["near_budget_mib"]
+			src = "measured on an earlier load with no VRAM pressure" if ll["allow_src"] == "measured" else "projected by llama.cpp, not verified for this preset"
+			share = " llama-server holds %.0f%% of all shared GPU memory (%s)." % (100 * ll["shr"] / g["shr"], mib(g["shr"])) if g["shr"] > 0 else ""
+			where = "within %s of the OS budget %s, the condition under which Windows documents demoting allocations" % (mib(c["near_budget_mib"]), mib(g["budget"])) if near else "%s under the OS budget %s" % (mib(g["budget"] - ll["ded"]), mib(g["budget"]))
+			grew = ll["floor_known"] and ll["shr"] - ll["floor"] >= c["spill_mib"]
+			excess = ll["allow_known"] and ll["over"] >= c["spill_mib"]
+			if grew or excess:
+				facts = []
+				if ll["floor_known"]:
+					facts.append("%s the %s it held once the model was resident (lowest seen since)" % ("up %s from" % mib(ll["shr"] - ll["floor"]) if ll["shr"] - ll["floor"] >= 1 else "unchanged from", mib(ll["floor"])))
+				if ll["allow_known"]:
+					facts.append("%s %s the %s of CPU-side buffers %s" % (mib(abs(ll["shr"] - ll["allow"])), "more than" if ll["shr"] >= ll["allow"] else "less than", mib(ll["allow"]), src))
+				self.flag("spill", "warn", "llama-server's shared GPU memory is %s: %s.%s Resident VRAM %s is %s" % (mib(ll["shr"]), "; ".join(facts), share, mib(ll["ded"]), where), now)
+			if old and ll["age"] > c["load_grace_s"] and ll["shr"] - old[1] >= c["burst_mib"]:
+				rose, fell = ll["shr"] - old[1], old[2] - ll["ded"]
+				if fell >= 0.5 * rose:
+					self.flag("burst", "crit", "memory moved from VRAM to shared: shared rose by %s and resident VRAM fell by %s within %.0f s (total %+.0f MiB)" % (mib(rose), mib(fell), now - old[0], rose - fell), now, hold=c["hold_s"])
+				else:
+					self.flag("burst", "warn", "llama-server's shared GPU memory rose by %s in %.0f s without a matching fall in resident VRAM (resident %+.0f MiB)" % (mib(rose), now - old[0], ll["ded"] - old[2]), now, hold=c["hold_s"])
+			if old and old[1] - ll["shr"] >= c["burst_mib"]:
+				self.flag("return", "info", "llama-server's shared GPU memory fell by %s in %.0f s (resident VRAM %+.0f MiB)" % (mib(old[1] - ll["shr"]), now - old[0], ll["ded"] - old[2]), now, hold=c["hold_s"] / 2)
+			if ll["com"] - ll["ded"] - ll["shr"] >= c["spill_mib"]:
+				self.flag("paged", "crit", "%s of llama-server's committed GPU memory is neither resident in VRAM nor in shared memory (committed %s, resident %s, shared %s)"
+					% (mib(ll["com"] - ll["ded"] - ll["shr"]), mib(ll["com"]), mib(ll["ded"]), mib(ll["shr"])), now)
+			if g["budget"] and ll["ded"] >= g["budget"] - c["at_budget_mib"] and ll["over"] < c["spill_mib"]:
+				self.flag("budget", "warn", "llama-server's resident VRAM %s is within %s of the OS budget %s" % (mib(ll["ded"]), mib(c["at_budget_mib"]), mib(g["budget"])), now)
+			rival = sorted((o for o in snap["others"] if o["eng"] >= c["rival_gpu_pct"]), key=lambda o: -o["eng"])
+			if rival and snap["busy"]:
+				self.flag("rival", "warn", "%s is using %.0f%% of the GPU while a llama-server request is running" % (rival[0]["exe"], rival[0]["eng"]), now)
+			if not g.get("uma") and g["vram"] > 0 and g["ded"] >= c["card_full_pct"] / 100.0 * g["vram"] and ll["over"] < c["spill_mib"]:
+				self.flag("full", "warn", "GPU memory is %.0f%% used (%s of %s)" % (100 * g["ded"] / g["vram"], mib(g["ded"]), mib(g["vram"])), now)
+		if rm:
+			if rm["avail"] < c["avail_crit"]:
+				self.flag("ram", "crit", "available RAM is %s" % mib(rm["avail"]), now)
+			elif rm["avail"] < c["avail_warn"]:
+				self.flag("ram", "warn", "available RAM is %s" % mib(rm["avail"]), now)
+			room, room_now = rm["commit_max"] - rm["commit"], rm["commit_limit"] - rm["commit"]
+			if room < c["commit_crit"]:
+				self.flag("commit", "crit", "commit charge %s leaves %s before the limit with the page file at its configured maximum (%s); deduced: Windows fails commit requests beyond the limit" % (mib(rm["commit"]), mib(room), mib(rm["commit_max"])), now)
+			elif room < c["commit_warn"]:
+				self.flag("commit", "warn", "commit charge %s leaves %s before the limit with the page file at its configured maximum (%s)" % (mib(rm["commit"]), mib(room), mib(rm["commit_max"])), now)
+			elif room_now < c["commit_warn"]:
+				self.flag("commit", "info", "commit charge %s is within %s of the current commit limit %s; the page file is below its configured maximum" % (mib(rm["commit"]), mib(room_now), mib(rm["commit_limit"])), now)
+			for pf in rm["pagefiles"]:
+				if pf["size"] and pf["used"] / pf["size"] * 100 >= c["pagefile_pct"]:
+					self.flag("pagefile", "warn", "page file %s is %.0f%% used (%s of %s)" % (pf["name"], 100 * pf["used"] / pf["size"], mib(pf["used"]), mib(pf["size"])), now)
+			if rm["pages_in"] >= c["pagein_warn"]:
+				self.flag("faults", "warn", "system-wide hard page faults: %.0f pages/s read from disk (Pages Input/sec)" % rm["pages_in"], now)
+		if ll["present"] and ll["ws_drop"] >= c["ws_drop_mib"]:
+			if ll["commit_drop"] >= 0.5 * ll["ws_drop"]:
+				self.flag("trim", "info", "llama-server's working set fell by %s within 10 s and its commit fell by %s: the process released memory (deduced: commit only falls when memory is released)"
+					% (mib(ll["ws_drop"]), mib(ll["commit_drop"])), now, hold=c["hold_s"])
+			else:
+				self.flag("trim", "warn", "llama-server's working set fell by %s within 10 s but its commit fell by only %s: the pages left the working set and stayed committed (deduced: Windows reclaimed them, llama-server did not free them)"
+					% (mib(ll["ws_drop"]), mib(ll["commit_drop"])), now, hold=c["hold_s"])
+		for ev in snap["new_events"]:
+			if ev["kind"] == "exit" and ev["level"] == "crit":
+				self.flag("exit", "crit", ev["msg"], now, hold=60)
+		self.sweep(now)
+
+
+class Collector:
+	"""Polls every source once per tick and keeps the derived state (request history, events, memory maps)."""
+
+	def __init__(self, cfg=CFG):
+		if cfg is CFG:
+			cfg = dict(CFG)
+		else:
+			for k, v in CFG.items():
+				cfg.setdefault(k, v)
+		self.cfg = cfg
+		self.user_thresholds = set(cfg.get("user_thresholds") or ())
+		for k in SCALED_THRESHOLDS:
+			if cfg.get(k) != CFG[k]:
+				self.user_thresholds.add(k)
+		raw_router = cfg.get("router")
+		self.router_explicit = bool(raw_router)
+		self.cfg["router"] = (raw_router or "http://127.0.0.1:8080").rstrip("/")
+		self.router_discovery, self.router_tried, self.mode = None, [], None
+		self._last_api_key = self.cfg.get("api_key")
+		self.dx = win.Dxgi() if win.WIN else None
+		self.gpu = self.dx.main() if self.dx else None
+		self.gpu_notice = None
+		self.counters = win.Counters() if win.WIN else None
+		self.procs, self.pids, self.pinfo, self.due, self.prev = {}, (), {}, {}, {}
+		self.pagefile_max = win.pagefile_max() if win.WIN else None
+		sm = win.sys_mem() if win.WIN else {}
+		commit_max = (max(sm["commit_limit"], sm["total"] + self.pagefile_max) if self.pagefile_max else sm.get("commit_limit")) if sm else None
+		scale_thresholds(self.cfg, sm.get("total") if sm else None, commit_max, self._gpu_budget(self.gpu), self.user_thresholds)
+		self.state_dir = self.cfg.get("state_dir")
+		self.state_error = None
+		if self.cfg.get("persist") or self.cfg.get("calibrate"):
+			self._validate_state_dir()
+		self.rings = {k: Ring(self.cfg["history_hours"] * 3600) for k in SERIES}
+		self.hist = History(self.state_dir if not self.state_error else None, on_error=self._fail_state_dir)
+		self.reqlog = RequestLog(self.state_dir if not self.state_error else None, on_error=self._fail_state_dir)
+		self.rec = Recorder(self.rings, self.hist if self.cfg["persist"] else None)
+		self.events, self.requests, self.follow, self.router_tail, self.router_start = [], [], {}, None, None
+		self.models, self.flags, self.mem, self.rate = {}, {}, {}, {}
+		self.router_up, self.router_error, self.last = False, "", None
+		self.ws_hist = deque(maxlen=48)
+		self.calib, self.calib_pid = {}, {}
+		self.allow, self.allow_known, self.pid_seen, self.shr_floor = 0.0, False, {}, {}
+		self.vm, self.vm_error, self.vm_busy, self.ws_by, self.ws_total, self.pagefiles = None, None, False, {}, 0.0, []
+		self.pf_cfg = win.pagefile_config() if win.WIN else []
+		self.calib_file = os.path.join(self.state_dir, "calibration.json") if self.state_dir and not self.state_error else None
+		if self.calib_file and os.path.isfile(self.calib_file):
+			try:
+				with open(self.calib_file, encoding="utf-8") as f:
+					self.calib = {k: v for k, v in json.load(f).items() if isinstance(v, dict) and v.get("v") == 4}  # older files held baselines learned under a headroom test on resident memory alone
+			except (OSError, ValueError):
+				pass
+		self.alerts = Alerts(self.cfg, self.emit)
+		self.started = time.time()
+
+	@staticmethod
+	def _gpu_budget(g):
+		if not g:
+			return 0.0
+		if g.get("vram", 0.0) <= 0:
+			return g.get("budget_shared") or g.get("shared") or g.get("budget", 0.0)
+		return g.get("budget", 0.0)
+
+	def _fail_state_dir(self, e):
+		if not self.state_error:
+			self.state_error = str(e)
+		self.cfg["persist"] = False
+		self.cfg["calibrate"] = False
+		if hasattr(self, "rec") and self.rec:
+			self.rec.hist = None
+
+	def _validate_state_dir(self):
+		d = self.state_dir
+		if not d or not isinstance(d, (str, os.PathLike)):
+			self._fail_state_dir("no state directory configured")
+			return
+		s = os.fspath(d)
+		drive, tail = os.path.splitdrive(s)
+		if any(c in tail for c in '\x00*?"<>|:'):
+			self._fail_state_dir("invalid path %r" % s)
+			return
+		if drive and not os.path.exists(drive + os.sep):
+			self._fail_state_dir("drive %s does not exist" % drive)
+			return
+		try:
+			cur = os.path.abspath(s)
+			while cur:
+				if os.path.exists(cur):
+					if not os.path.isdir(cur):
+						self._fail_state_dir("not a directory: %s" % cur)
+						return
+					if not os.access(cur, os.W_OK):
+						self._fail_state_dir("permission denied: %s" % cur)
+						return
+					break
+				parent = os.path.dirname(cur)
+				if parent == cur:
+					break
+				cur = parent
+		except (OSError, ValueError) as e:
+			self._fail_state_dir(e)
+
+	def _proc_info(self, pid):
+		if not pid or not win.WIN:
+			return {"exe": None, "argv": None, "created": None}
+		info = self.pinfo.get(pid)
+		if info is None:
+			info = win.proc_info(pid)
+			self.pinfo[pid] = info
+		return info
+
+	def _update_procs(self, now):
+		if not win.WIN:
+			return
+		self.procs = win.processes()
+		if self.dx:
+			self.dx.refresh()
+		pids = tuple(sorted(p for p, v in self.procs.items() if v[0].startswith("llama-server")))
+		for dead in [p for p in self.pinfo if p not in pids]:
+			self.pinfo.pop(dead, None)
+		if pids != self.pids or self.is_due("rebuild", now, 20.0):
+			self.pids = pids
+			if self.counters:
+				self.counters.rebuild()
+
+	def _model_pids(self):
+		kids = [p for p in self.pids if self.procs.get(self.procs.get(p, ("", 0))[1], ("",))[0].startswith("llama-server")]
+		if not kids and (self.mode == "single" or not self.models):  # single-model server or standalone llama-server is the model process
+			kids = list(self.pids)
+		return kids
+
+	def _child_created(self, preset):
+		if not self.pids and win.WIN:
+			self._update_procs(time.time())
+		m = self.models.get(preset)
+		if m is not None and isinstance(m.get("status"), dict) and m["status"].get("value") != "loaded":
+			return None
+		kids = self._model_pids()
+		if not kids:
+			return None
+		if len(kids) == 1:
+			return self._proc_info(kids[0]).get("created")
+		mpath = self.flags.get(preset, ({}, ""))[0].get("model")
+		for pid in kids:
+			info = self._proc_info(pid)
+			argv = info.get("argv") or ()
+			if preset in argv or (mpath and mpath in argv):
+				return info.get("created")
+		return self._proc_info(kids[0]).get("created")
+
+	def preset_log_path(self, preset):
+		flags = self.flags.get(preset, ({}, ""))[0]
+		lf = flags.get("log-file")
+		if isinstance(lf, str) and lf:
+			return lf
+		if self.cfg.get("log_dir"):
+			safe = RE_BAD_FILE.sub("_", preset)
+			return os.path.join(self.cfg["log_dir"], safe + ".log")
+		return None
+
+	# ---- events -----------------------------------------------------------------------------------------------------
+	def emit(self, level, kind, msg, wall=None, preset=None):
+		ev = {"wall": wall or time.time(), "t": 0, "level": level, "kind": kind, "msg": msg, "preset": preset, "session": None}
+		self.add_events([ev])
+		if self.hist and self.cfg["persist"] and kind == "alert":
+			self.hist.write_event(ev)
+
+	def add_events(self, evs):
+		self.events.extend(evs)
+		if len(self.events) > 6000:
+			del self.events[:1000]
+
+	# ---- startup: replay history ------------------------------------------------------------------------------------
+	def load_history(self):
+		"""Persisted samples and events, then every preset log and the router log: so the views start populated."""
+		if win.WIN:
+			self._update_procs(time.time())
+		if self.hist and not self.state_error:
+			samples, events = self.hist.load(time.time() - self.cfg["history_hours"] * 3600)
+			now = time.time()
+			for t, vals in samples:
+				for k, x in vals.items():
+					if k in self.rings:
+						for dt in range(5):  # one persisted sample stands for the 5 s around it
+							if t + dt <= now:
+								self.rings[k].put(t + dt, x)
+			self.add_events(events)
+		spawns = logmod.session_starts(self.cfg.get("log_dir"))
+		self.poll_models(time.time())
+		log_dir = self.cfg.get("log_dir")
+		names = list(self.models)
+		if not names and log_dir and os.path.isdir(log_dir):
+			try:
+				names = sorted(f[:-4] for f in os.listdir(log_dir) if f.endswith(".log") and not f.startswith("llama-server"))
+			except OSError:
+				names = []
+		for name in names:
+			self.open_preset(name, spawns.get(name, []))
+		self.follow_router()
+		saved = self.reqlog.load() if self.reqlog and not self.state_error else []  # requests kept from earlier runs, including those whose log has since been rewritten
+		known = defaultdict(list)
+		for r in saved:
+			known[(r["preset"], r["task"])].append(r.get("wall") or 0)
+		fresh = [r for r in self.requests if not any(r.get("wall") is None or abs(r["wall"] - w) <= 15 for w in known.get((r["preset"], r["task"]), ()))]
+		if self.cfg["persist"]:
+			for r in fresh:
+				if r.get("wall"):
+					self.reqlog.append(r)
+		self.requests = saved + fresh
+		self.requests.sort(key=lambda r: r.get("wall") or 0)
+		self.events.sort(key=lambda e: e["wall"])
+		for f in self.follow.values():
+			f[1].live = True
+
+	def follow_router(self):
+		"""Tail the newest router log (a restarted router writes a new file)."""
+		if not self.pids and win.WIN:
+			self._update_procs(time.time())
+		kids = set(self._model_pids())
+		roots = [p for p in self.pids if p not in kids]
+		router_pid = roots[0] if roots else (self.pids[0] if self.pids and self.mode == "router" else None)
+		rinfo = self._proc_info(router_pid) if router_pid else {"exe": None, "argv": None, "created": None}
+		router_created = rinfo.get("created")
+		routers = []
+		if self.cfg.get("router_log"):
+			routers = logmod.router_logs(None, [self.cfg["router_log"]])
+		elif rinfo.get("argv"):
+			exe = rinfo.get("exe") or rinfo["argv"][0]
+			rflags = model.parse_args(rinfo["argv"], model.server_aliases(exe))
+			rlf = rflags.get("log-file")
+			if isinstance(rlf, str) and rlf:
+				routers = logmod.router_logs(None, [rlf])
+		if not routers and self.cfg.get("log_dir"):
+			routers = logmod.router_logs(self.cfg["log_dir"])
+		if routers and (self.router_tail is None or routers[-1][1] != self.router_tail.path):
+			start, path = routers[-1]
+			if start is None:
+				start = router_created
+			self.router_tail, self.router_start = logmod.Tail(path, backfill=4 * MIB), start
+			self.add_events(logmod.parse_router(self.router_tail.poll(), start))
+
+	def open_preset(self, preset, spawns=()):
+		path = self.preset_log_path(preset)
+		if not path:
+			return
+		tail, asm = logmod.Tail(path), logmod.Assembler(preset)
+		reqs, evs = [], []
+		for line in tail.poll():
+			d, e = asm.feed(line)
+			reqs += d
+			evs += e
+		sp_list = list(spawns)
+		if not sp_list:
+			created = self._child_created(preset)
+			if created:
+				sp_list = [created]
+		logmod.resolve_walls(asm, reqs, evs, sp_list)
+		self.requests += reqs
+		self.add_events([e for e in evs if e.get("wall")])
+		self.follow[preset] = (tail, asm)
+
+	# ---- HTTP -------------------------------------------------------------------------------------------------------
+	def get(self, path, timeout=0.8):
+		headers = {"Authorization": "Bearer " + str(self.cfg["api_key"])} if self.cfg.get("api_key") else {}
+		req = urllib.request.Request(self.cfg["router"] + path, headers=headers)
+		with urllib.request.urlopen(req, timeout=timeout) as r:
+			return json.load(r)
+
+	def is_due(self, key, now, period):
+		if now >= self.due.get(key, 0):
+			self.due[key] = now + period
+			return True
+		return False
+
+	# ---- the tick ---------------------------------------------------------------------------------------------------
+	def tick(self, now=None):
+		now = now or time.time()
+		if self.cfg.get("api_key") != self._last_api_key:
+			self._last_api_key = self.cfg.get("api_key")
+			for k in [k for k in self.due if k == "models" or k.startswith("slots:")]:
+				self.due.pop(k, None)
+		new_events = []
+		if self.is_due("procs", now, 1.0) and win.WIN:
+			self._update_procs(now)
+		if self.is_due("models", now, 1.0):
+			self.poll_models(now)
+		if self.is_due("router-log", now, 5.0):
+			self.follow_router()
+		# log tails first, so the live view knows about a new request immediately
+		for _preset, (tail, asm) in self.follow.items():
+			for line in tail.poll():
+				d, e = asm.feed(line)
+				for r in d:
+					self.finish_request(r, now)
+				self.add_events(e)
+				new_events += e
+		if self.router_tail:
+			evs = logmod.parse_router(self.router_tail.poll(), None)
+			self.add_events(evs)
+			new_events += evs
+		snap = self.sample(now, new_events)
+		self.last = snap
+		return snap
+
+	def _discover_router(self, first_err):
+		tried = [self.cfg["router"]]
+		if not self.pids and win.WIN:
+			self._update_procs(time.time())
+		kids = {p for p in self.pids if self.procs.get(self.procs.get(p, ("", 0))[1], ("",))[0].startswith("llama-server")}
+		ordered = [p for p in self.pids if p not in kids] + [p for p in self.pids if p in kids]
+		for pid in ordered:
+			info = self._proc_info(pid)
+			argv = info.get("argv")
+			if not argv:
+				continue
+			exe = info.get("exe") or argv[0]
+			pflags = model.parse_args(argv, model.server_aliases(exe))
+			host = pflags.get("host", "127.0.0.1")
+			if not isinstance(host, str) or not host or host in ("0.0.0.0", "::", "::0", "[::]"):
+				host = "127.0.0.1"
+			port = pflags.get("port", "8080")
+			if isinstance(port, bool) or not port:
+				port = "8080"
+			url = "http://%s:%s" % ("[%s]" % host if ":" in host and not host.startswith("[") else host, port)
+			if url not in tried:
+				tried.append(url)
+			self.cfg["router"] = url
+			try:
+				data = self.get("/models")["data"]
+				self.router_tried = tried
+				self.router_discovery = "server found at %s from llama-server (pid %d) command line (tried %s)" % (url, pid, ", ".join(tried))
+				return data, None
+			except (OSError, ValueError, KeyError) as e:
+				first_err = e
+		self.router_tried = tried
+		self.router_discovery = None
+		return None, first_err
+
+	def poll_models(self, now):
+		try:
+			data = self.get("/models")["data"]
+			if not self.router_explicit and not self.router_discovery:
+				self.router_discovery = "server found at %s (default)" % self.cfg["router"]
+		except (OSError, ValueError, KeyError) as e:
+			if self.router_explicit:
+				self.router_up, self.router_error, self.mode = False, str(e)[:80], None
+				return
+			data, err = self._discover_router(e)
+			if data is None:
+				self.router_up, self.router_error, self.mode = False, str(err)[:80], None
+				return
+		self.models = {m["id"]: m for m in data if isinstance(m, dict) and "id" in m}
+		self.router_up, self.router_error = True, ""
+		self.mode = "single" if (self.models and any(not isinstance(m.get("status"), dict) for m in self.models.values())) else "router"
+		for name, m in self.models.items():
+			if isinstance(m.get("status"), dict):
+				args = m["status"].get("args")
+				if args:
+					exe = args[0]
+					self.flags[name] = (model.parse_args(args, model.server_aliases(exe)), exe)
+			else:
+				if not self.pids and win.WIN:
+					self._update_procs(now)
+				for pid in self.pids:
+					info = self._proc_info(pid)
+					argv, exe = info.get("argv"), info.get("exe")
+					if argv:
+						exe = exe or argv[0]
+						self.flags[name] = (model.parse_args(argv, model.server_aliases(exe)), exe)
+						break
+					if exe:
+						self.flags[name] = ({}, exe)
+						break
+			path = self.preset_log_path(name)
+			if path and (name not in self.follow or self.follow[name][0].path != path) and self.last is not None:
+				self.open_preset(name)
+				if name in self.follow:
+					self.follow[name][1].live = True
+
+	def finish_request(self, r, now):
+		r["wall"] = r.get("wall") or now
+		r["wall0"] = r.get("wall0") or r["wall"] - r.get("ms", 0) / 1e3
+		self.requests.append(r)
+		if self.cfg["persist"]:
+			self.reqlog.append(r)
+
+	def _select_gpu(self, pd, kids):
+		self.gpu_notice = None
+		adapters = getattr(self.dx, "adapters", None) if self.dx else None
+		if not adapters:
+			return self.gpu
+		spec = self.cfg.get("gpu")
+		if spec is not None and spec != "":
+			if isinstance(spec, int) or (isinstance(spec, str) and spec.strip().isdigit()):
+				idx = int(spec)
+				if 0 <= idx < len(adapters):
+					return adapters[idx]
+				self.gpu_notice = "GPU index %s not in 0..%d" % (spec, len(adapters) - 1)
+			else:
+				sub = str(spec).lower()
+				found = next((a for a in adapters if sub in a.get("name", "").lower()), None)
+				if found is not None:
+					return found
+				self.gpu_notice = "no GPU matching %r" % spec
+		by_luid = pd.get("procs_by_luid") or {}
+		if kids and by_luid:
+			scored = [(sum(by_luid.get(p, {}).get(a.get("luid"), {}).get("ded", 0.0) + by_luid.get(p, {}).get(a.get("luid"), {}).get("shr", 0.0) for p in kids), a.get("vram", 0.0), -i)
+				for i, a in enumerate(adapters)]
+			best_score = max(scored)
+			if best_score[0] > 0:
+				return adapters[-best_score[2]]
+		return self.dx.main() if hasattr(self.dx, "main") else max(adapters, key=lambda a: a.get("vram", 0.0), default=None)
+
+	def _build_notices(self, presets, kids):
+		notices = []
+		if self.state_error:
+			notices.append("state folder %s is unavailable: %s" % (self.state_dir, self.state_error))
+		if not self.router_explicit:
+			if self.router_up and self.router_discovery and not self.router_discovery.endswith("(default)"):  # the default URL working is not news
+				notices.append(self.router_discovery)
+			elif not self.router_up and self.router_tried:
+				notices.append("server unreachable (tried %s)" % ", ".join(self.router_tried))
+		if self.mode == "single":
+			notices.append("single-model mode")
+		if self.gpu_notice:
+			notices.append(self.gpu_notice)
+		loaded = [n for n, p in presets.items() if p["status"] == "loaded"]
+		if len(kids) > 1 or len(loaded) > 1:
+			notices.append("%d model processes resident: VRAM calibration is paused" % max(len(kids), len(loaded)))
+		for name in loaded:
+			if name not in self.follow or not os.path.isfile(self.follow[name][0].path):
+				notices.append("no log file for preset %s" % name)
+		for name, (_, asm) in self.follow.items():
+			if asm.lines_seen > 0 and asm.lines_parsed == 0:
+				notices.append("%s: lines are being read (%d) but none match the expected format" % (name, asm.lines_seen))
+			elif asm.lines_parsed > 0 and not asm.timestamps:
+				notices.append("%s: the log has no timestamps (pass --log-timestamps for wall-clock history)" % name)
+		return notices
+
+	def sample(self, now, new_events):
+		pd = self.counters.sample() if self.counters else {"procs": {}, "procs_by_luid": {}, "adapters": {}, "sys": {}}
+		sm = win.sys_mem() if win.WIN else {}
+		if sm:
+			sm["commit_max"] = max(sm["commit_limit"], sm["total"] + self.pagefile_max) if self.pagefile_max else sm["commit_limit"]
+		kids = self._model_pids()
+		self.gpu = self._select_gpu(pd, kids)
+		luid = self.gpu.get("luid") if self.gpu else None
+		ad = pd.get("adapters", {}).get(luid, {"ded": 0.0, "shr": 0.0, "com": 0.0}) if self.gpu else None
+		gpu = None
+		if self.gpu and ad is not None:
+			uma = self.gpu.get("vram", 0.0) <= 0
+			budget = self._gpu_budget(self.gpu)
+			if budget > 0:
+				scale_thresholds(self.cfg, None, None, budget, self.user_thresholds)
+			gpu = {"name": self.gpu["name"], "vram": self.gpu["vram"], "shared": self.gpu.get("shared", 0.0), "budget": budget,
+				"ded": ad["ded"], "shr": ad["shr"], "com": ad["com"], "uma": uma}
+		by_luid = pd.get("procs_by_luid")
+		use_luid = bool(luid and isinstance(by_luid, dict) and by_luid)
+		proc_gpu = (lambda pid_: by_luid.get(pid_, {}).get(luid)) if use_luid else (lambda pid_: pd.get("procs", {}).get(pid_))
+		ll = {"present": bool(kids), "pids": kids, "ded": 0.0, "shr": 0.0, "com": 0.0, "eng": {}, "ws": 0.0, "pws": 0.0, "commit": 0.0, "cpu": 0.0,
+			"faults_s": 0.0, "ws_drop": 0.0, "commit_drop": 0.0, "allow": 0.0, "over": 0.0, "age": 0.0, "vm": None, "vm_error": None, "pm_error": None,
+			"allow_known": False, "allow_src": "projected", "floor": 0.0, "floor_known": False}
+		for pid_ in kids:
+			p = proc_gpu(pid_)
+			if p:
+				for k in ("ded", "shr", "com"):
+					ll[k] += p[k]
+				for k, v in p["eng"].items():
+					ll["eng"][k] = min(100.0, ll["eng"].get(k, 0.0) + v)
+			pm = win.proc_mem(pid_)
+			if pm:
+				for k in ("ws", "pws", "commit"):
+					ll[k] += pm[k]
+				prev = self.prev.get(("pm", pid_))
+				if prev and now > prev[0]:
+					ll["cpu"] += max(0.0, (pm["cpu_s"] - prev[1]["cpu_s"]) / (now - prev[0]))
+					ll["faults_s"] += max(0.0, (pm["faults"] - prev[1]["faults"]) / (now - prev[0]))
+				self.prev[("pm", pid_)] = (now, pm)
+			else:
+				ll["pm_error"] = _win_err("proc_mem", pid_) or ("proc_mem failed for pid %d" % pid_)
+		if win.WIN and self.is_due("hostmem", now, 2.0):
+			self.ws_by, self.ws_total = win.working_sets(self.procs)
+			self.pagefiles = win.pagefiles()
+		if kids and not self.vm_busy and self.is_due("vm", now, 5.0):
+			self.vm_busy = True
+			target_pid = max(kids, key=lambda p: (proc_gpu(p) or {}).get("ded", 0.0))
+			threading.Thread(target=self.vm_job, args=(target_pid,), daemon=True).start()
+		ll["vm"] = self.vm if kids else None
+		ll["vm_error"] = self.vm_error if kids else None
+		if kids:
+			ll["age"] = now - self.pid_seen.setdefault(tuple(kids), now)
+		self.ws_hist.append((now, ll["ws"], ll["commit"]))
+		recent = [h for h in self.ws_hist if now - h[0] <= 10]
+		ll["ws_drop"] = max(0.0, max((h[1] for h in recent), default=0.0) - ll["ws"]) if ll["present"] else 0.0
+		ll["commit_drop"] = max(0.0, max((h[2] for h in recent), default=0.0) - ll["commit"]) if ll["present"] else 0.0
+		groups = {}
+		proc_keys = by_luid.keys() if use_luid else pd.get("procs", {}).keys()
+		for pid_ in proc_keys:
+			if pid_ in self.pids:
+				continue
+			p = proc_gpu(pid_)
+			if not p:
+				continue
+			exe = self.procs.get(pid_, ("pid %d" % pid_,))[0]
+			g = groups.setdefault(exe, {"exe": exe, "ded": 0.0, "shr": 0.0, "eng": 0.0, "n": 0})
+			g["ded"], g["shr"], g["n"] = g["ded"] + p["ded"], g["shr"] + p["shr"], g["n"] + 1
+			g["eng"] = max(g["eng"], max(p["eng"].values(), default=0.0))
+		others = sorted((g for g in groups.values() if g["ded"] >= 64 or g["eng"] >= 5), key=lambda g: -g["ded"])
+		ram = None
+		if sm:
+			ram = {**sm, "pages_in": pd["sys"].get("pages_in", 0.0), "pages_out": pd["sys"].get("pages_out", 0.0), "standby": pd["sys"].get("standby", 0.0),
+				"pagefile_pct": pd["sys"].get("pagefile_pct", 0.0), "free": pd["sys"].get("free", 0.0), "modified": pd["sys"].get("modified", 0.0),
+				"pagefiles": self.pagefiles, "pf_cfg": self.pf_cfg, "ws_by": self.ws_by, "ws_total": self.ws_total}
+		presets = {}
+		for pid_, m in self.models.items():
+			has_status = isinstance(m.get("status"), dict)
+			st = m["status"].get("value", "unloaded") if has_status else "loaded"
+			presets[pid_] = {"status": st, "meta": m.get("meta") or {}, "slot": None, "slot_error": None, "phase": "idle", "kv": 0, "rate_dec": NAN, "rate_pre": NAN,
+				"eta": NAN, "elapsed": NAN, "n_slots": 0, "exit": m["status"].get("exit_code") if has_status else None}
+			if st == "loaded":
+				self.sample_slot(pid_, presets[pid_], now)
+		busy = any(p["phase"] != "idle" for p in presets.values())
+		for name, p in presets.items():  # baseline for shared GPU memory: measured on an earlier load if known, else llama.cpp's host-buffer projection
+			e = self.mem.get(name)
+			if p["status"] == "loaded" and e and e.get("state") == "ready":
+				m = e["map"]
+				cal = self.calib.get(self.calib_key(e["key"]))
+				if cal and cal.get("idle_shared") is not None:
+					ll["allow"], ll["allow_src"] = float(cal["idle_shared"]), "measured"
+				else:
+					ll["allow"], ll["allow_src"] = (m["fit"] or {}).get("host", {}).get("self", m["weights"]["cpu"]), "projected"
+				ll["allow_known"] = True
+				if kids and ll["ded"] >= 0.9 * sum(r[1] for r in model.memory_rows(m)):  # once the model is resident: the lowest shared figure this process has held
+					key = tuple(kids)
+					self.shr_floor[key] = min(self.shr_floor.get(key, ll["shr"]), ll["shr"])
+					ll["floor"], ll["floor_known"] = self.shr_floor[key], True
+		ll["over"] = max(0.0, ll["shr"] - ll["allow"])
+		self.allow = ll["allow"] or self.allow
+		self.allow_known = self.allow_known or ll["allow_known"]
+		notices = self._build_notices(presets, kids)
+		snap = {"t": now, "mode": self.mode, "router_up": self.router_up, "router_error": self.router_error, "gpu": gpu, "llama": ll,
+			"vm_error": self.vm_error, "others": others, "ram": ram, "presets": presets, "busy": busy, "new_events": new_events, "notices": notices}
+		self.rec.add(now, self.series_values(snap))
+		self.alerts.evaluate(snap, self.mem)
+		for preset, p in presets.items():
+			if p["status"] == "loaded" and preset in self.flags:
+				self.ensure_map(preset)
+		self.calibrate(snap)
+		return snap
+
+	def vm_job(self, pid):
+		try:
+			vm = win.vm_summary(pid)
+			if vm:
+				self.vm = dict(vm, pid=pid, at=time.time())
+				self.vm_error = None
+			else:
+				self.vm_error = _win_err("vm_summary", pid) or ("vm_summary failed for pid %d" % pid)
+		except Exception as e:
+			self.vm_error = _win_err("vm_summary", pid) or ("%s: %s" % (type(e).__name__, e))
+		finally:
+			self.vm_busy = False
+
+	def sample_slot(self, preset, p, now):
+		asm = self.follow.get(preset, (None, None))[1]
+		in_log = bool(asm and any(now - (c.get("wall0") or now) < 1800 for c in asm.cur.values()))
+		active = self.rate.get(preset, {}).get("active", False) or in_log
+		if not self.is_due("slots:" + preset, now, 1.0 / self.cfg["hz"] if active else 3.0):
+			p.update(self.rate.get(preset, {}).get("p", {}))
+			return
+		path = "/slots" if self.mode == "single" else "/slots?model=" + urllib.parse.quote(preset, safe="")
+		try:
+			slots = self.get(path)
+		except urllib.error.HTTPError as e:
+			err = "HTTP %d" % e.code
+			r = self.rate.setdefault(preset, {"hist": deque(maxlen=64), "task": None, "t0": now, "dec": NAN, "pre": NAN})
+			prev_p = dict(r.get("p") or {})
+			prev_p["slot_error"] = err
+			r["p"] = prev_p
+			p.update(prev_p)
+			return
+		except (OSError, ValueError):
+			p.update(self.rate.get(preset, {}).get("p", {}))
+			return
+		if not slots:
+			p["slot_error"] = None
+			return
+		s = slots[0]
+		nt = (s.get("next_token") or [{}])[0]
+		decoded, proc = nt.get("n_decoded", 0), bool(s.get("is_processing"))
+		n_prompt, cached, done = s.get("n_prompt_tokens", 0), s.get("n_prompt_tokens_cache", 0), s.get("n_prompt_tokens_processed", 0)
+		todo, task = max(0, n_prompt - cached), s.get("id_task")
+		r = self.rate.setdefault(preset, {"hist": deque(maxlen=64), "task": None, "t0": now, "dec": NAN, "pre": NAN})
+		if task != r["task"]:
+			r.update(task=task, t0=now, dec=NAN, pre=NAN)
+			r["hist"].clear()
+		r["hist"].append((now, done, decoded))
+		pts = r.setdefault("pre_pts", deque(maxlen=8))
+		if task != r.get("pre_task"):
+			pts.clear()
+			r["pre_task"] = task
+		if proc and (not pts or done != pts[-1][1]):
+			pts.append((now, done))
+		if proc:
+			cur = (asm.cur.get(task) if asm else None) or {}
+			if cur.get("wall0") and cur["wall0"] > now - 3600:
+				r["t0"] = min(r["t0"], cur["wall0"])
+			dec = self.windowed(r["hist"], 2, 2.0, now)
+			pre = self.prefill_rate(pts, now)
+			if decoded > 0 and dec == dec:
+				r["dec"] = dec
+			if decoded == 0 and pre == pre:
+				r["pre"] = pre
+		phase = "idle" if not proc else "prefill" if decoded == 0 and done < todo else "starting" if decoded == 0 else "decode"
+		kv = cached + done + decoded if proc else (self.last_kv(preset) or n_prompt + decoded)
+		eta = (todo - done) / r["pre"] if phase == "prefill" and r["pre"] == r["pre"] and r["pre"] > 0 else NAN
+		out = {"slot": {"id": s.get("id", 0), "n_ctx": s.get("n_ctx", 0), "task": task, "n_prompt": n_prompt, "cached": cached, "done": done, "todo": todo,
+			"decoded": decoded, "remain": nt.get("n_remain", 0), "params": s.get("params") or {}, "speculative": s.get("speculative", False)},
+			"slot_error": None, "phase": phase, "kv": kv, "rate_dec": r["dec"] if proc else NAN, "rate_pre": r["pre"] if proc else NAN, "eta": eta,
+			"elapsed": now - r["t0"] if proc else NAN, "n_slots": len(slots)}
+		r["active"], r["p"] = proc, out
+		p.update(out)
+
+	@staticmethod
+	def prefill_rate(pts, now):
+		"""Prompt tokens per second between the last two batch completions (progress only advances once per batch); decays if the next batch is overdue."""
+		if len(pts) < 2:
+			return NAN
+		(t0, d0), (t1, d1) = pts[-2], pts[-1]
+		return (d1 - d0) / (t1 - t0) if now - t1 <= t1 - t0 else (d1 - d0) / max(1e-6, now - t0)
+
+	@staticmethod
+	def windowed(hist, idx, window, now):
+		"""Rate of column `idx` of the history over the last `window` seconds (NaN until two points span at least 0.3 s)."""
+		pts = [h for h in hist if now - h[0] <= window]
+		if len(pts) < 2 or pts[-1][0] - pts[0][0] < 0.3:
+			return NAN
+		return max(0.0, (pts[-1][idx] - pts[0][idx]) / (pts[-1][0] - pts[0][0]))
+
+	def last_kv(self, preset):
+		for r in reversed(self.requests):
+			if r["preset"] == preset:
+				return r.get("kv")
+		return None
+
+	def series_values(self, snap):
+		g, ll, rm = snap["gpu"], snap["llama"], snap["ram"]
+		v = {"busy": 1.0 if snap["busy"] else 0.0}
+		if g:
+			v.update(vram=g["ded"], budget=g["budget"], gpu_other=max((o["eng"] for o in snap["others"]), default=0.0))
+		if ll["present"]:
+			v.update(vram_llama=ll["ded"], spill=ll["shr"], gpu_llama=max(ll["eng"].values(), default=0.0), gpu_copy=ll["eng"].get("Copy", 0.0),
+				llama_ws=ll["ws"], llama_cpu=ll["cpu"])
+		if rm:
+			v.update(ram_used=rm["total"] - rm["avail"], ram_avail=rm["avail"], commit=rm["commit"], pages_in=rm["pages_in"], pages_out=rm["pages_out"], standby=rm["standby"], free=rm["free"])
+			if rm["pagefiles"]:
+				v["pf_used"] = sum(p["used"] for p in rm["pagefiles"])
+		if ll["vm"]:
+			v["heap"] = ll["vm"]["private"]
+		for p in snap["presets"].values():
+			if p["status"] == "loaded":
+				v["ctx"] = p["kv"]
+				if p["rate_dec"] == p["rate_dec"] and p["phase"] == "decode":
+					v["dec"] = p["rate_dec"]
+				if p["rate_pre"] == p["rate_pre"] and p["phase"] == "prefill":
+					v["pre"] = p["rate_pre"]
+		return v
+
+	# ---- learned overhead: what the OS measures beyond the projection, per model configuration -----------------------------
+	@staticmethod
+	def calib_key(key):
+		return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+	def calibrate(self, snap):
+		"""Per model configuration: resident VRAM minus the projection (overhead), and the lowest shared GPU memory seen while VRAM was not under pressure."""
+		ll, g = snap["llama"], snap["gpu"]
+		if not ll["present"]:
+			return
+		loaded = [n for n, p in snap["presets"].items() if p["status"] == "loaded"]
+		if len(ll["pids"]) > 1 or len(loaded) > 1:
+			return
+		for preset, p in snap["presets"].items():
+			e = self.mem.get(preset)
+			if p["status"] != "loaded" or not e or e.get("state") != "ready":
+				continue
+			rows_total = sum(r[1] for r in model.memory_rows(e["map"]))
+			if ll["ded"] < 0.9 * rows_total:  # the model is not (yet) resident: nothing measured now says anything about its footprint
+				continue
+			overhead = ll["ded"] - rows_total
+			k, pids = self.calib_key(e["key"]), tuple(ll["pids"])
+			cur = self.calib.get(k)
+			ent, changed = dict(cur) if cur else {"v": 4}, False
+			if cur is None or self.calib_pid.get(k) != pids or overhead > cur["overhead"] + 16:
+				ent.update(overhead=round(overhead), at=snap["t"], preset=preset, spilled=ll["over"] >= self.cfg["spill_mib"])
+				self.calib_pid[k], changed = pids, True
+			if g and ll["age"] >= self.cfg["load_grace_s"] / 3 and ll["ded"] + ll["shr"] <= g["budget"] - self.cfg["idle_headroom_mib"]:  # resident plus shared fits with room to spare: nothing could have been demoted
+				idle = round(ll["shr"])
+				if ent.get("idle_shared") is None or idle < ent["idle_shared"] - 16:
+					ent["idle_shared"], changed = idle, True
+			if changed:
+				self.calib[k] = ent
+				if self.cfg["calibrate"] and self.calib_file:
+					try:
+						os.makedirs(os.path.dirname(self.calib_file), exist_ok=True)
+						with open(self.calib_file, "w", encoding="utf-8") as f:
+							json.dump(self.calib, f, indent=1)
+					except (OSError, ValueError) as err:
+						self._fail_state_dir(err)
+
+	# ---- memory maps (computed off-thread: llama-fit-params takes about a second) ------------------------------------------
+	def ensure_map(self, preset):
+		flags, exe = self.flags[preset]
+		key = json.dumps({k: flags.get(k) for k in model.FIT_FLAGS + ("model-draft", "cache-ram", "swa-checkpoints", "ctx-checkpoints")}, sort_keys=True)
+		if self.mem.get(preset, {}).get("key") == key:
+			return
+		self.mem[preset] = {"key": key, "state": "pending"}
+		threading.Thread(target=self.map_job, args=(preset, flags, exe, key), daemon=True).start()
+
+	def map_job(self, preset, flags, exe, key):
+		try:
+			fit = model.fit_projection(os.path.dirname(exe), flags)
+			self.mem[preset] = {"key": key, "state": "ready", "map": model.analyze(flags, fit, model.server_defaults(exe)), "at": time.time()}
+		except Exception as e:
+			self.mem[preset] = {"key": key, "state": "error", "error": "%s: %s" % (type(e).__name__, e)}
+
+	def close(self):
+		if self.rec.sec is not None:
+			self.rec.flush()
+		if self.hist:
+			self.hist.close()
+
+
+# ---- shared formatting -----------------------------------------------------------------------------------------------
+
+def mib(x):
+	return "%.1f GiB" % (x / 1024) if abs(x) >= 10240 else "{:,.0f} MiB".format(x)
+
+
+def hms(seconds):
+	seconds = int(max(0, seconds))
+	return "%d:%02d:%02d" % (seconds // 3600, seconds // 60 % 60, seconds % 60) if seconds >= 3600 else "%d:%02d" % (seconds // 60, seconds % 60)
+
+
+def median(xs):
+	xs = [x for x in xs if x == x]
+	return statistics.median(xs) if xs else NAN
+
+
+def isnan(x):
+	return isinstance(x, float) and math.isnan(x)

@@ -217,7 +217,7 @@ def _check_case_once_live(proc, model_name):
 	return True, "model %s shown on live page in single-model mode" % model_name
 
 
-def _check_case_wrong_api_key(check_proc, live_proc, port_auth):
+def _check_case_unauthorized_reported(check_proc, live_proc, port_auth):
 	for label, proc in (("--check", check_proc), ("--once --page live", live_proc)):
 		combined = (proc.stdout + proc.stderr).lower()
 		if "traceback" in combined or "render error" in combined:
@@ -322,7 +322,7 @@ def main():
 				[*router_args_auth, "--once", "--page", "live", "--width", "120", "--api-key", "wrong"],
 				state_dir_auth, args.artifact_dir, "05-wrong-key-live",
 			)
-			ok, detail = _check_case_wrong_api_key(p_auth_check, p_auth_live, port_auth)
+			ok, detail = _check_case_unauthorized_reported(p_auth_check, p_auth_live, port_auth)
 			record("wrong_api_key_auth_error", ok, detail)
 		finally:
 			_stop_server(proc_auth)

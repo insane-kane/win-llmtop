@@ -26,8 +26,9 @@ from llmtop_lib import win  # noqa: E402
 
 LLMTOP_PY = str(ROOT / "llmtop.py")
 
+# a turn row: a clock time, then prefill and decode t/s, whatever columns sit around them
 RE_REQ_ROW = re.compile(
-	r"^\s*\d{2}:\d{2}:\d{2}\s+\d+\s+\d+\s+\d+\s+([0-9]+(?:\.[0-9]+)?)\s+t/s\s+\d+\s+([0-9]+(?:\.[0-9]+)?)\s+t/s\b"
+	r"^\s*(?:▸\s+)?\d{2}:\d{2}:\d{2}\s.*?\s([0-9]+(?:\.[0-9]+)?)\s+t/s\s.*?\s([0-9]+(?:\.[0-9]+)?)\s+t/s\b"
 )
 
 
@@ -185,7 +186,7 @@ def _check_case_once_all(proc):
 	in_requests = False
 	good_rows = []
 	for ln in proc.stdout.splitlines():
-		if "recent requests" in ln:
+		if "recent requests" in ln or "recent turns" in ln:
 			in_requests = True
 			continue
 		if in_requests and ln.startswith("── "):

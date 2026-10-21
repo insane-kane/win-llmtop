@@ -3,8 +3,9 @@ name: Release Gate
 on:
   push:
     branches:
+      # staging only: main moves only to a commit whose gate already passed here, and its
+      # release tag is pushed moments later, so a run on main could only ever fail
       - staging
-      - main
   workflow_dispatch:
 
 permissions: {}

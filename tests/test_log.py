@@ -67,6 +67,16 @@ CACHE_HIT = """\
 
 MISSING_EVAL = [line for line in CACHE_HIT if not re.search(r"\|\s*eval time =", line)]
 
+DRAFT_COUNTS = [
+	"0.00.100.000 I srv  llama_server: initializing ...",
+	"0.01.000.000 I srv  llama_server: model loaded",
+	"0.02.001.000 I slot launch_slot_: id  0 | task 4 | processing task, is_child = 0",
+	"0.05.000.000 I slot print_timing: id  0 | task 4 | prompt eval time =    500.00 ms /   500 tokens (    1.00 ms per token,   1000.00 tokens per second)",
+	"0.06.000.000 I slot print_timing: id  0 | task 4 |        eval time =     500.00 ms /    50 tokens (   10.00 ms per token,     10.00 tokens per second)",
+	"0.06.500.000 I slot print_timing: id  0 | task 4 | draft acceptance = 0.88000 ( 308 accepted /   350 generated), mean len =  3.91",
+	"0.07.000.000 I slot      release: id  0 | task 4 | stop processing: n_tokens = 550, truncated = 0",
+]
+
 COUNTERS = [
 	"garbage line without a level letter",
 	"0.00.100.000 I srv  llama_server: initializing ...",
@@ -94,12 +104,13 @@ def check_fixture(reqs):
 	assert r0["task"] == 0 and r73["task"] == 73
 	assert (r0["pn"], r0["tn"], r0["pp"], r0["tg"]) == (4178, 130, 554.96, 77.29)
 	assert r0["acc"] == 0.93333 and r0["mlen"] == 4.50
+	assert r0["dacc"] == 98 and r0["dgen"] == 105
 	assert r0["ms"] == 9197.48 and r0["kv"] == 4307 and r0["cached"] == 0
 	assert r0["sel"] == "LRU" and r0["sim"] == 0.0
 	assert r73["pn"] == 3913 and r73["tn"] == 94 and r73["pp"] == 596.00 and r73["tg"] == 78.58
 	assert r73["sel"] == "LCP" and r73["sim"] == 0.524
 	assert r73["ms"] == 7748.87 and r73["kv"] == 4006 and r73["cached"] == 0
-	assert "acc" not in r73
+	assert "acc" not in r73 and "dacc" not in r73 and "dgen" not in r73
 
 
 def test_b11669_with_timestamps():
@@ -140,6 +151,14 @@ def test_older_wording():
 	assert r["acc"] == 0.6 and r["mlen"] is None
 	assert r["pn"] == 1000 and r["tn"] == 50 and r["kv"] == 1050
 	assert r["trunc"] is False and r["cached"] == 0
+
+
+def test_draft_counts():
+	_, reqs, _ = feed(DRAFT_COUNTS)
+	assert len(reqs) == 1
+	r = reqs[0]
+	assert r["acc"] == 0.88 and r["mlen"] == 3.91
+	assert r["dacc"] == 308 and r["dgen"] == 350  # the accepted and generated draft tokens, not just the rate
 
 
 def test_full_cache_hit():
@@ -193,17 +212,42 @@ def test_router_log_start_and_router_logs():
 		assert log.session_starts(None) == {}
 
 
+def test_keep_and_slot():
+	lines = [
+		"I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1",
+		"I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0",
+		"I slot      release: id  0 | task 0 | stop processing: n_tokens = 100, truncated = 0",
+		"I slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, f_sim_best = 0.709 (> 0.100 thold), f_keep = 1.000",
+		"I slot launch_slot_: id  0 | task 1 | processing task, is_child = 0",
+		"I slot      release: id  0 | task 1 | stop processing: n_tokens = 200, truncated = 0",
+		"I slot get_availabl: id  2 | task -1 | selected slot by LCP similarity, f_sim_best = 0.812 (> 0.100 thold), f_keep = 0.312",
+		"I slot launch_slot_: id  2 | task 2 | processing task, is_child = 0",
+		"I slot      release: id  2 | task 2 | stop processing: n_tokens = 150, truncated = 0",
+		"I slot get_availabl: | task -1 | selected slot by LCP similarity, f_sim_best = 0.500",
+		"I slot launch_slot_: | task 3 | processing task, is_child = 0",
+		"I slot      release: | task 3 | stop processing: n_tokens = 80, truncated = 0",
+	]
+	_, reqs, _ = feed(lines)
+	assert len(reqs) == 4
+	assert reqs[0]["sel"] == "LRU" and reqs[0]["keep"] == 1.0 and reqs[0]["slot"] == 0
+	assert reqs[1]["sel"] == "LCP" and reqs[1]["sim"] == 0.709 and reqs[1]["keep"] == 1.0 and reqs[1]["slot"] == 0
+	assert reqs[2]["sel"] == "LCP" and reqs[2]["sim"] == 0.812 and reqs[2]["keep"] == 0.312 and reqs[2]["slot"] == 2
+	assert reqs[3]["sel"] == "LCP" and reqs[3]["sim"] == 0.500 and reqs[3]["keep"] == 1.0 and reqs[3]["slot"] is None
+
+
 CASES = [
 	("b11669_with_timestamps", test_b11669_with_timestamps),
 	("no_timestamps", test_no_timestamps),
 	("colours", test_colours),
 	("router_forwarded", test_router_forwarded),
 	("older_wording", test_older_wording),
+	("draft_counts", test_draft_counts),
 	("full_cache_hit", test_full_cache_hit),
 	("missing_eval_line", test_missing_eval_line),
 	("counters", test_counters),
 	("parse_router_forwarded_no_timestamps", test_parse_router_forwarded_no_timestamps),
 	("router_log_start_and_router_logs", test_router_log_start_and_router_logs),
+	("keep_and_slot", test_keep_and_slot),
 ]
 
 

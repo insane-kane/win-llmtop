@@ -191,6 +191,42 @@ class TestCLI(unittest.TestCase):
 		finally:
 			stub.close()
 
+	def test_removed_pagein_warn_threshold_accepted_with_note(self):
+		models_data = [
+			{
+				"id": "test-preset",
+				"object": "model",
+				"status": {
+					"value": "loaded",
+					"args": ["llama-server.exe", "-m", "test.gguf", "-c", "8192"],
+				},
+			}
+		]
+		stub = _StubServer(models_data)
+		try:
+			with tempfile.TemporaryDirectory() as tmpdir:
+				cmd = [
+					sys.executable, "-I", LLMTOP_PY,
+					"--once",
+					"--page", "all",
+					"--no-persist",
+					"--router", stub.url,
+					"--state-dir", tmpdir,
+					"--threshold", "pagein_warn=5",
+				]
+				proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+				self.assertEqual(proc.returncode, 0, "stderr: %s" % proc.stderr)
+				self.assertNotIn("unknown or non-numeric threshold", proc.stderr)
+				self.assertEqual(proc.stderr.count("win-llmtop: threshold pagein_warn was removed in 0.2.0 and is ignored"), 1, proc.stderr)
+
+				# every other unknown name is still an error
+				cmd = [sys.executable, "-I", LLMTOP_PY, "--once", "--page", "all", "--no-persist", "--router", stub.url, "--state-dir", tmpdir, "--threshold", "bogus=1"]
+				proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+				self.assertEqual(proc.returncode, 1)
+				self.assertIn("unknown or non-numeric threshold", proc.stderr)
+		finally:
+			stub.close()
+
 	def test_read_key_case_insensitivity(self):
 		# Test letters case-insensitivity
 		test_cases = [
@@ -243,6 +279,7 @@ CASES = [
 	("check_with_stub_server", TestCLI("test_check_with_stub_server")),
 	("check_unused_port_server_unreachable", TestCLI("test_check_unused_port_server_unreachable")),
 	("once_page_all_runs_cleanly", TestCLI("test_once_page_all_runs_cleanly")),
+	("removed_pagein_warn_threshold_accepted_with_note", TestCLI("test_removed_pagein_warn_threshold_accepted_with_note")),
 	("read_key_case_insensitivity", TestCLI("test_read_key_case_insensitivity")),
 ]
 

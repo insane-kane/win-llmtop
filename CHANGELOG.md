@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-21
+
+### Added
+
+- Prompts: the Requests page groups turns (one `llama-server` request each) into prompts, a conversation continuing on one slot without a pause of `prompt_gap_s` (30 s) or more, with time-weighted prefill and decode t/s per prompt. `t` nests turns under each prompt on the Requests page and switches between recent turns and recent prompts on the Live page.
+- Cache hit and speculative-draft acceptance for every turn and prompt.
+- CPU load, clock and processor queue on the Live page; per-core load, core and thread counts (P and E cores on hybrid CPUs), L1/L2/L3 cache sizes and CPU charts on the System page.
+- `--threshold prompt_gap_s=N`.
+- Sample counts in the speed table.
+
+### Changed
+
+- Prefill speed is grouped by context depth (tokens already in the KV cache plus the new ones) instead of by new prompt tokens: depth, not prompt size, drives prefill speed.
+- t/s colours compare with the same preset's median at a similar context depth, in five bands (120% or more, 80-120%, 50-80%, under 50%, not enough data), and never fall back to the terminal's default colour. A prompt is compared with the time its turns usually take at their own depths. The by-context tables rank presets in each column; near-ties share a colour.
+- Notes list only exceptions: `cache reset`, `cut off`, `shared`, `resized`.
+- Requests are called turns. The volume table adds prompts and an issues column (cache resets, cut-off prompts) and shows loads with the mean load time.
+- The prompt and turn tables fit 100 columns, dropping lower-priority columns on narrow terminals.
+
+### Removed
+
+- The hard page fault (page-in) alert: page-ins are normal OS activity. `--threshold pagein_warn` is still accepted, with a note, and ignored.
+- The slowest-prefills list, the worst-case speed columns, the shared-memory effect table, and the `cached` column in the prompt and turn tables.
+
 ## [0.1.1] - 2026-10-20
 
 ### Added

@@ -299,6 +299,28 @@ class TestState(unittest.TestCase):
 		finally:
 			srv.close()
 
+	def test_high_page_in_rate_raises_no_alert(self):
+		models_data = []
+		srv = _StubServer(models_data)
+		luid = "0x00000000_0x0001C3D4"
+		sample_data = {
+			"procs": {},
+			"procs_by_luid": {},
+			"adapters": {luid: {"ded": 0.0, "shr": 0.0, "com": 0.0}},
+			"sys": {"pages_in": 10000.0, "pages_out": 500.0, "standby": 8192.0, "free": 16384.0, "modified": 128.0, "pagefile_pct": 5.0},
+		}
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win(procs={}, proc_info_map={}, proc_mem_map={}, sample_data=sample_data):
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				c.ensure_map = lambda preset: None
+				snap = c.tick(1700000100.0)
+				self.assertEqual(snap["ram"]["pages_in"], 10000.0)
+				self.assertNotIn("faults", c.alerts.active)
+				self.assertFalse(any("page faults" in a["msg"] for a in c.alerts.active.values()))
+		finally:
+			srv.close()
+
 	def test_invalid_state_dir_disables_persistence_with_notice(self):
 		models_data = []
 		srv = _StubServer(models_data)
@@ -557,6 +579,7 @@ CASES = [
 	("single_model_mode_process_counted", TestState("test_single_model_mode_process_counted")),
 	("slots_401_and_api_key_header", TestState("test_slots_401_and_api_key_header")),
 	("uma_zero_vram_adapter", TestState("test_uma_zero_vram_adapter")),
+	("high_page_in_rate_raises_no_alert", TestState("test_high_page_in_rate_raises_no_alert")),
 	("invalid_state_dir_disables_persistence_with_notice", TestState("test_invalid_state_dir_disables_persistence_with_notice")),
 	("log_dir_none_and_no_router_log_touches_no_folder", TestState("test_log_dir_none_and_no_router_log_touches_no_folder")),
 	("threshold_arithmetic_8_16_64_gib", TestState("test_threshold_arithmetic_8_16_64_gib")),

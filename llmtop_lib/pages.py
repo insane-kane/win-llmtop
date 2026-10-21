@@ -6,14 +6,14 @@ import textwrap
 import time
 from collections import defaultdict
 
-from . import model
+from . import model, prompts
 from . import state as S
 from .state import mib
 from .ui import STYLE, C, ago, bar, clip, gib, num, pad, plot, rate, rpad, shade, stack, tok, vlen
 
 NAN = float("nan")
+CORE_BAR = "▁▂▃▄▅▆▇█"
 ICON = {"crit": ("◆", "bred"), "warn": ("▲", "byellow"), "info": ("●", "bcyan")}
-PRE_EDGES, PRE_LABELS = (256, 1000, 4000, 16000, 64000), ("<256", "256-1k", "1-4k", "4-16k", "16-64k", "64k+")
 DEC_EDGES, DEC_LABELS = (8000, 32000, 64000), ("<8k", "8-32k", "32-64k", "64k+")
 DEVICES = ("all", "GPU", "CPU")
 
@@ -24,7 +24,8 @@ class View:
 
 	def __init__(self, window=1):
 		self.page, self.win, self.scroll, self.msel, self.rsel, self.level, self.paused, self.msg = 0, window, 0, 0, 0, 0, False, ""
-		self.gh, self.tmode, self.dev = 0, 0, 0  # graph height (0 = fit the terminal), tensor view mode, tensor device filter
+		self.gh, self.tmode, self.dev, self.turns = 0, 0, 0, False  # graph height (0 = fit the terminal), tensor view mode, tensor device filter, nested turns
+		self.live_prompts = False  # the Live page's bottom table: recent prompts instead of recent turns
 		self.cache, self.cache_sec = {}, 0
 
 	@property
@@ -150,18 +151,33 @@ def paged(view, head, count, row, H, pin=None):
 	return out + rows
 
 
+def ctx_of(r):
+	return (r.get("cached") or 0) + r.get("pn", 0)
+
+
 def bucket_stats(c, view, snap):
-	"""Median throughput of similar requests: prefill by new prompt tokens, decode by context depth, per preset (cached per second)."""
+	"""Median throughput of similar turns: prefill and decode by context depth, per preset (cached per second)."""
 	sec = int(snap["t"])
-	if view.cache.get("bk_sec") != sec:
+	if view.cache.get("bk_sec") != sec or view.cache.get("bk_len") != len(c.requests):
 		pre, dec = defaultdict(list), defaultdict(list)
 		for r in c.requests:
-			if "pp" in r and r.get("pn", 0) >= 32:
-				pre[(r["preset"], bucket(r["pn"], PRE_EDGES))].append(r["pp"])
-			if "tg" in r and r.get("tn", 0) >= 20:
+			if "pp" in r and r["pp"] == r["pp"] and r.get("pn", 0) >= 256:
+				pre[(r["preset"], bucket(ctx_of(r), DEC_EDGES))].append(r["pp"])
+			if "tg" in r and r["tg"] == r["tg"] and r.get("tn", 0) >= 20:
 				dec[(r["preset"], bucket(r.get("kv", 0), DEC_EDGES))].append(r["tg"])
-		view.cache["bk"], view.cache["bk_sec"] = (pre, dec), sec
+		view.cache["bk"], view.cache["bk_sec"], view.cache["bk_len"] = (pre, dec), sec, len(c.requests)
 	return view.cache["bk"]
+
+
+def prompt_groups(c, view, snap):
+	"""Grouped prompts and the set of `id(turn)` for each prompt's first turn (cached per second)."""
+	sec = int(snap["t"])
+	gap_s = c.cfg.get("prompt_gap_s", S.CFG["prompt_gap_s"])
+	if view.cache.get("pr_sec") != sec or view.cache.get("pr_len") != len(c.requests) or view.cache.get("pr_gap") != gap_s:
+		ps = prompts.group(c.requests, gap_s)
+		firsts = {id(p["turns"][0]) for p in ps if p["turns"]}
+		view.cache["pr"], view.cache["pr_sec"], view.cache["pr_len"], view.cache["pr_gap"] = (ps, firsts), sec, len(c.requests), gap_s
+	return view.cache["pr"]
 
 
 def ref(xs):
@@ -169,16 +185,47 @@ def ref(xs):
 
 
 def rel(x, reference):
-	"""Colour a throughput against the usual value for similar requests."""
+	"""Colour a throughput against the usual value for similar turns; dim grey when not compared."""
 	if x != x:
 		return C.grey
 	if reference != reference or reference <= 0:
-		return ""
+		return C.grey
+	if x >= 1.2 * reference:
+		return C.bcyan  # a turn far faster than usual is its own colour, not green
 	return C.bgreen if x >= 0.8 * reference else C.byellow if x >= 0.5 * reference else C.bred
 
 
 def legend():
-	return "%s  colour: t/s against what is typical for this preset at a similar size   %s■%s 80%% or more   %s■%s 50-80%%   %s■%s under 50%%%s" % (C.grey, C.bgreen, C.grey, C.byellow, C.grey, C.bred, C.grey, C.reset)
+	return "%s  t/s vs usual: %s■%s ≥120%%  %s■%s 80-120%%  %s■%s 50-80%%  %s■%s <50%%  %s■%s no data%s" % (C.grey, C.bcyan, C.grey, C.bgreen, C.grey, C.byellow, C.grey, C.bred, C.grey, C.grey, C.grey, C.reset)
+
+
+def rank_colours(values):
+	"""Colours for one column of the by-context tables: `values` is a list of (median, n_turns) in preset order and the
+	return is one colour per entry. Cells with fewer than 3 turns are dim grey; of the rest, ranked fastest first and
+	grouped into near-tie clusters (walking fastest to slowest, a cell joins the current cluster while within 5% of
+	that cluster's fastest value), every cell in a cluster takes the colour its fastest member would get by rank: the
+	fastest `k` clusters are green and the slowest `k` red (k = 1 when there are at most 4 ranked presets, else 2) with
+	the middle yellow; a single ranked preset is plain."""
+	ranked = [(med, i) for i, (med, n) in enumerate(values) if n >= 3 and med == med]
+	out = [C.grey] * len(values)
+	if len(ranked) <= 1:  # nothing to compare: a single ranked preset is plain, an empty column is all grey
+		if ranked:
+			out[ranked[0][1]] = ""
+		return out
+	ranked.sort(key=lambda t: t[0], reverse=True)
+	k = 1 if len(ranked) <= 4 else 2
+	pos = 0
+	while pos < len(ranked):
+		start = pos  # the rank of this cluster's fastest member
+		first = ranked[pos][0]
+		members = []
+		while pos < len(ranked) and ranked[pos][0] >= 0.95 * first:
+			members.append(ranked[pos][1])
+			pos += 1
+		col = C.bgreen if start < k else C.bred if start >= len(ranked) - k else C.byellow
+		for i in members:
+			out[i] = col
+	return out
 
 
 # ---- frame ---------------------------------------------------------------------------------------------------------------
@@ -223,7 +270,7 @@ def notice_lines(snap, n=4):
 def footer(view, W):
 	page = View.PAGES[view.page]
 	keys = "1-6 or ←/→ page   [ ] time window   g graph height   s graph style   p pause   ↑↓ PgUp PgDn scroll"
-	keys += {"Live": "", "Memory": "   m next model", "System": "", "Requests": "   m preset filter", "Events": "   f level filter", "Tensors": "   t layers/tensors   d device   m next model"}[page]
+	keys += {"Live": "   t prompts/turns", "Memory": "   m next model", "System": "", "Requests": "   m preset   t turns", "Events": "   f level filter", "Tensors": "   t layers/tensors   d device   m next model"}[page]
 	return "%s %s   q quit%s%s" % (C.bold, keys, C.reset, "   " + view.msg if view.msg else "")
 
 
@@ -295,9 +342,26 @@ def ram_block(c, snap, view, W, gh):
 		un = pm_unavailable(ll)
 		out += block(c, view, snap, "llama_ws", G, gh, "llama-server RAM", un or gib(ll["ws"]), gib, "", None, 1024.0, C.bcyan, False, "" if un else "commit %s · %.1f cores" % (gib(ll["commit"]), ll["cpu"]))
 	out += block(c, view, snap, "ram_avail", G, gh, "RAM available", gib(rm["avail"]), gib, "", None, 2048.0, C.bgreen)
-	pi = rm["pages_in"]
-	out += block(c, view, snap, "pages_in", G, gh, "disk page-ins per s", "%s%.0f%s" % (C.bred if pi >= c.cfg["pagein_warn"] else "", pi, C.reset), num, "", 0.0, 100.0, C.byellow, True, "page-outs %.0f/s" % rm["pages_out"])
+	out += block(c, view, snap, "pages_in", G, gh, "disk page-ins per s", "%.0f" % rm["pages_in"], num, "", 0.0, 100.0, C.byellow, True, "page-outs %.0f/s" % rm["pages_out"])
 	return out
+
+
+def cpu_block(c, snap, view, W, gh):
+	cp = snap.get("cpu")
+	if not cp:
+		return []
+	ll = snap.get("llama") or {}
+	G = graph_w(W)
+	u, mhz, q, lcpu = cp.get("cpu", NAN), cp.get("cpu_mhz", NAN), cp.get("cpu_queue", NAN), ll.get("cpu", NAN)
+	bits = []
+	if lcpu == lcpu:
+		bits.append("llama-server %.1f cores" % lcpu)
+	if mhz == mhz:
+		bits.append("%.1f GHz" % (mhz / 1000.0))
+	if q == q:
+		bits.append("queue %.0f" % q)
+	val = "%.0f%%" % min(100.0, max(0.0, u)) if u == u else "-"
+	return block(c, view, snap, "cpu", G, gh, "CPU", val, num, "%", 0.0, 100.0, C.bcyan, True, " · ".join(bits))
 
 
 def last_request(c, preset):
@@ -372,56 +436,186 @@ def spill_of(c, r):
 	return r["spill"]
 
 
-def notes_legend():
-	return "%s  notes: LCP n%% = share of the slot's prompt prefix reused · LRU n = no similar prefix, oldest slot reused (it held n tokens) · shared n = llama-server shared GPU memory in MiB%s" % (C.grey, C.reset)
+def ktok(n):
+	return "%dk" % round(n / 1000) if n >= 1000 else str(int(n))
 
 
-REQ_COLS = (("time", 11, "l"), ("task", 5, "r"), ("preset", 24, "l"), ("new tok", 8, "r"), ("cached", 8, "r"), ("prefill", 11, "r"), ("gen", 7, "r"), ("decode", 10, "r"), ("draft", 5, "r"), ("total", 6, "r"))
+def row_notes(c, turns):
+	notes = []
+	ev = max((r.get("evicted", 0) for r in turns if r.get("sel") == "LRU" and r.get("evicted", 0) > 0), default=0)
+	if ev > 0:
+		notes.append("%scache reset %s%s" % (C.byellow, ktok(ev), C.reset))
+	if any(r.get("trunc") for r in turns):
+		notes.append(C.bred + "cut off" + C.reset)
+	if c.allow_known:
+		sps = [spill_of(c, r) - c.allow for r in turns if spill_of(c, r) == spill_of(c, r)]
+		sp = max(sps, default=NAN)
+		if sp == sp and sp >= c.cfg["spill_mib"]:
+			notes.append("%sshared +%s%s" % (C.byellow, gib(sp), C.reset))
+	if any(r.get("reallocs") for r in turns):
+		notes.append(C.byellow + "resized" + C.reset)
+	return "  ".join(notes)
 
 
-def req_line(cells, with_preset, tail=""):
+PROMPT_COLS = (("time", 12, "l"), ("preset", 24, "l"), ("turns", 5, "r"), ("context", 8, "r"), ("new", 8, "r"), ("hit", 5, "r"), ("prefill", 10, "r"), ("gen", 7, "r"), ("decode", 10, "r"), ("draft", 5, "r"), ("total", 6, "r"))
+DROP_ORDER = ("gen", "total", "turns")  # dropped in this order when the table is wider than the page; time, context, new, hit, prefill, decode and draft are never dropped
+
+
+def prompt_layout(W, presets, with_preset, with_turns=True):
+	"""The preset column's width, the columns dropped so the request table fits in W, and whether the header's "notes"
+	label is shown: the preset column sizes to the longest preset name shown (24 at most, 6 at least) and is omitted when
+	one preset is shown; DROP_ORDER columns are dropped in order until the header fits, and if it still would not, the
+	"notes" label is omitted rather than clipped."""
+	pw = 0 if not with_preset else min(24, max(6, max((len(p) for p in presets), default=0)))
+	drop = set()
+
+	def fits():
+		width, first = 2, True
+		for name, w, _ in PROMPT_COLS:
+			if name in drop or (name == "preset" and not with_preset) or (name == "turns" and not with_turns):
+				continue
+			width += (pw if name == "preset" else w) + (0 if first else 2)
+			first = False
+		return width + 7 <= W  # the header's "  notes" tail
+
+	for name in DROP_ORDER:
+		if fits():
+			break
+		drop.add(name)
+	return pw, drop, fits()
+
+
+def pct_cell(x):
+	"""A share as a whole percentage, uncoloured; '-' when unknown (NaN or None)."""
+	return "-" if x is None or x != x else "%.0f%%" % (100 * x)
+
+
+def req_line(cells, with_preset, tail="", with_turns=True, pw=24, drop=()):
 	parts = []
-	for (_, width, align), cell in zip(REQ_COLS, cells, strict=True):
-		if not with_preset and width == 24:
+	for (name, width, align), cell in zip(PROMPT_COLS, cells, strict=True):
+		if name in drop:
 			continue
-		parts.append(pad(cell, width) if align == "l" else rpad(cell, width))
-	return "  " + "  ".join(parts) + "  " + tail
+		if not with_preset and name == "preset":
+			continue
+		if not with_turns and name == "turns":
+			continue
+		parts.append(pad(cell, pw if name == "preset" else width) if align == "l" else rpad(cell, pw if name == "preset" else width))
+	return "  " + "  ".join(parts) + ("  " + tail if tail else "")
 
 
-def req_header(with_preset):
-	return C.grey + req_line([name for name, _, _ in REQ_COLS], with_preset, "notes") + C.reset
+def req_header(with_preset, with_turns=True, pw=24, drop=(), notes=True):
+	return C.grey + req_line([name for name, _, _ in PROMPT_COLS], with_preset, "notes" if notes else "", with_turns=with_turns, pw=pw, drop=drop) + C.reset
+
+
+def prompt_ratios(p, stats):
+	"""Compare a prompt against the time its turns would usually take: for each metric, sum pn_i / ref_i (prefill) or
+	tn_i / ref_i (decode) over the turns that have a bucket reference, and divide by the same turns' prefill (or decode)
+	time; ref_i is the preset's median for that turn's own bucket, the same reference the turn row uses, with the same
+	256+ / 20+ cutoffs. Each result is NaN (grey) when the referenced turns hold under half the prompt's new (or
+	generated) tokens, so a prompt is only compared when its turns' usual times cover most of it."""
+	pre, dec = stats
+	exp_p, act_p, pn_ref = 0.0, 0.0, 0
+	exp_d, act_d, tn_ref = 0.0, 0.0, 0
+	for r in p["turns"]:
+		pn, tn = r.get("pn", 0), r.get("tn", 0)
+		ctx = ctx_of(r)
+		kv = r["kv"] if "kv" in r else ctx + tn
+		if pn >= 256:
+			ref_p = ref(pre.get((r["preset"], bucket(ctx, DEC_EDGES)), []))
+			if ref_p == ref_p and ref_p > 0:
+				exp_p += pn / ref_p
+				act_p += prompts._pms(r) / 1000.0
+				pn_ref += pn
+		if tn >= 20:
+			ref_d = ref(dec.get((r["preset"], bucket(kv, DEC_EDGES)), []))
+			if ref_d == ref_d and ref_d > 0:
+				exp_d += tn / ref_d
+				act_d += prompts._tms(r) / 1000.0
+				tn_ref += tn
+	pp = exp_p / act_p if act_p > 0 and pn_ref >= 0.5 * p["pn"] else NAN
+	tg = exp_d / act_d if act_d > 0 and tn_ref >= 0.5 * p["tn"] else NAN
+	return pp, tg
+
+
+def prompt_row(c, p, stats, with_preset, pw=24, drop=()):
+	pp, tg = p["pp"], p["tg"]
+	kv = p["kv"]
+	pp_ratio, tg_ratio = prompt_ratios(p, stats)
+	cells = [
+		clock(p.get("wall")),
+		p["preset"][:24],
+		str(p["n"]),
+		tok(kv),
+		tok(p["pn"]),
+		pct_cell(p["hit"]),
+		"%s%s t/s%s" % (rel(pp_ratio, 1.0), "-" if pp != pp else "%.0f" % pp, C.reset),
+		tok(p["tn"]),
+		"%s%s t/s%s" % (rel(tg_ratio, 1.0), "-" if tg != tg else "%.1f" % tg, C.reset),
+		pct_cell(p["acc"]),
+		mmss(p["ms"] / 1e3),
+	]
+	return req_line(cells, with_preset, row_notes(c, p["turns"]), with_turns=True, pw=pw, drop=drop)
+
+
+def turn_row(c, r, stats, with_preset, mark="  ", with_turns=True, pw=24, drop=(), nested=False):
+	pre, dec = stats
+	pp, tg = r.get("pp", NAN), r.get("tg", NAN)
+	ctx = ctx_of(r)
+	kv = r["kv"] if "kv" in r else ctx + r.get("tn", 0)
+	pp_ref = ref(pre.get((r["preset"], bucket(ctx, DEC_EDGES)), [])) if r.get("pn", 0) >= 256 else NAN
+	tg_ref = ref(dec.get((r["preset"], bucket(kv, DEC_EDGES)), [])) if r.get("tn", 0) >= 20 else NAN
+	w = r.get("wall")
+	ts = time.strftime("%H:%M:%S", time.localtime(w)) if w else "--:--:--"
+	if mark == "▸ ":
+		t_cell = "%s▸ %s%s" % (C.bcyan, C.reset, ts)
+	elif mark.strip():
+		t_cell = "%s%s%s%s" % (C.grey, mark, C.reset, ts)
+	else:
+		t_cell = mark + ts
+	cached, pn = r.get("cached"), r.get("pn", 0)
+	hit = cached / (cached + pn) if cached is not None and cached + pn > 0 else NAN
+	cells = [
+		t_cell,
+		"" if nested else r["preset"][:24],  # a nested turn's prompt row names the preset
+		"",
+		tok(kv),
+		tok(pn),
+		pct_cell(hit),
+		"%s%s t/s%s" % (rel(pp, pp_ref), "-" if pp != pp else "%.0f" % pp, C.reset),
+		tok(r.get("tn", 0)),
+		"%s%s t/s%s" % (rel(tg, tg_ref), "-" if tg != tg else "%.1f" % tg, C.reset),
+		pct_cell(r.get("acc")),
+		mmss(r.get("ms", 0) / 1e3),
+	]
+	return req_line(cells, with_preset, row_notes(c, (r,)), with_turns=with_turns, pw=pw, drop=drop)
 
 
 def req_row(c, r, stats, with_preset):
-	pre, dec = stats
-	pp, tg = r.get("pp", NAN), r.get("tg", NAN)
-	pp_ref = ref(pre.get((r["preset"], bucket(r.get("pn", 0), PRE_EDGES)), [])) if r.get("pn", 0) >= 32 else NAN
-	tg_ref = ref(dec.get((r["preset"], bucket(r.get("kv", 0), DEC_EDGES)), [])) if r.get("tn", 0) >= 20 else NAN
-	notes = []
-	if r.get("sel") == "LRU" and r.get("evicted", 0) > 0:
-		notes.append("%sLRU %s%s" % (C.byellow, tok(r["evicted"]), C.reset))
-	elif r.get("sel") == "LCP":
-		notes.append("%sLCP %.0f%%%s" % (C.grey, 100 * r["sim"], C.reset))
-	sp = spill_of(c, r)
-	if c.allow_known and sp == sp and sp - c.allow >= c.cfg["spill_mib"]:
-		notes.append("%sshared %s%s" % (C.byellow, num(sp), C.reset))
-	if r.get("trunc"):
-		notes.append(C.bred + "truncated" + C.reset)
-	if r.get("reallocs"):
-		notes.append(C.byellow + "buffers resized" + C.reset)
-	cells = [clock(r.get("wall")), str(r["task"]), r["preset"][:24], tok(r.get("pn", 0)), "-" if r.get("cached", 0) is None else tok(r.get("cached", 0)),
-		"%s%s t/s%s" % (rel(pp, pp_ref), "-" if pp != pp else "%.0f" % pp, C.reset), tok(r.get("tn", 0)),
-		"%s%s t/s%s" % (rel(tg, tg_ref), "-" if tg != tg else "%.1f" % tg, C.reset),
-		"%.0f%%" % (100 * r["acc"]) if r.get("acc") is not None else "-", mmss(r.get("ms", 0) / 1e3)]
-	return req_line(cells, with_preset, " ".join(notes))
+	return turn_row(c, r, stats, with_preset, mark="  ", with_turns=False)
 
 
 def recent_requests(c, snap, view, W, n, preset=None):
 	rs = [r for r in c.requests if preset is None or r["preset"] == preset]
-	if not rs or n < 5:
+	if not rs or n < 4:
 		return []
 	st = bucket_stats(c, view, snap)
-	return [section("recent requests", W), legend(), notes_legend(), req_header(preset is None)] + [req_row(c, r, st, preset is None) for r in reversed(rs[-(n - 4):])]
+	_, firsts = prompt_groups(c, view, snap)
+	pw, drop, notes = prompt_layout(W, {r["preset"] for r in rs}, preset is None, with_turns=False)
+	return [section("recent turns", W, "(t: prompts)"), legend(), req_header(preset is None, with_turns=False, pw=pw, drop=drop, notes=notes)] + [
+		turn_row(c, r, st, preset is None, mark="▸ " if id(r) in firsts else "  ", with_turns=False, pw=pw, drop=drop) for r in reversed(rs[-(n - 3):])
+	]
+
+
+def recent_prompts(c, snap, view, W, n, preset=None):
+	ps, _ = prompt_groups(c, view, snap)
+	ps = [p for p in ps if preset is None or p["preset"] == preset]
+	if not ps or n < 4:
+		return []
+	st = bucket_stats(c, view, snap)
+	pw, drop, notes = prompt_layout(W, {p["preset"] for p in ps}, preset is None, with_turns=True)
+	return [section("recent prompts", W, "(t: turns)"), legend(), req_header(preset is None, with_turns=True, pw=pw, drop=drop, notes=notes)] + [
+		prompt_row(c, p, st, preset is None, pw=pw, drop=drop) for p in reversed(ps[-(n - 3):])
+	]
 
 
 def recent_events(c, W, n):
@@ -440,7 +634,7 @@ def live(c, snap, view, W, H):
 	notices = notice_lines(snap)
 
 	def build(gh):
-		out = gpu_block(c, snap, view, W, gh) + [""] + ram_block(c, snap, view, W, gh)
+		out = gpu_block(c, snap, view, W, gh) + [""] + ram_block(c, snap, view, W, gh) + cpu_block(c, snap, view, W, gh)
 		if not active:
 			out += ["", "%s no model loaded (models load on the first request)%s" % (C.grey, C.reset)]
 		for preset, p in active:
@@ -455,7 +649,8 @@ def live(c, snap, view, W, H):
 	room = H - len(out) - 1
 	ev_n = 5 if room >= 24 else 0
 	req_n = max(0, min(20, room - (ev_n + 1 if ev_n else 0)))
-	reqs = recent_requests(c, snap, view, W, req_n, active[0][0] if len(active) == 1 else None)
+	preset = active[0][0] if len(active) == 1 else None
+	reqs = recent_prompts(c, snap, view, W, req_n, preset) if view.live_prompts else recent_requests(c, snap, view, W, req_n, preset)
 	if reqs:
 		out += [""] + reqs
 	evs = recent_events(c, W, ev_n if H - len(out) - 1 >= ev_n else 0)
@@ -625,16 +820,60 @@ def memory(c, snap, view, W, H):
 
 # ---- page 3: system ------------------------------------------------------------------------------------------------------
 
+def cache_size(b):
+	if b >= 2**20 and b % 2**20 == 0:
+		return "%d MiB" % (b // 2**20)
+	if b >= 2**20 and (b * 2) % 2**20 == 0:
+		return "%.1f MiB" % (b / 2**20)
+	return "%d KiB" % (b // 1024)
+
+
 def system(c, snap, view, W, H):
-	rm, ll = snap["ram"], snap["llama"]
-	if not rm:
-		return ["", "%s no memory telemetry%s" % (C.grey, C.reset)]
+	rm, ll, cp = snap.get("ram"), snap.get("llama") or {}, snap.get("cpu") or {}
+	info = getattr(c, "cpu_info", None) or {}
 	G, gh, bw = graph_w(W), view.gh or 2, max(30, min(80, W - 40))
+	out = []
+	if info or cp:
+		err = info.get("error")
+		if not err and info.get("name"):
+			split = " (%dP + %dE)" % (info["p_cores"], info["e_cores"]) if info.get("e_cores") else ""
+			sub = "%s · %d cores%s, %d threads" % (info["name"], info.get("cores", 0), split, info.get("threads", 0))
+		else:
+			sub = ""
+		out.append(section("CPU", W, sub))
+		if err:
+			out.append("  %s%s%s" % (C.grey, err, C.reset))
+		cores = [v for v in (cp.get("cpu_cores") or []) if v == v]
+		if cores:
+			cells = []
+			for v in cores:
+				u = min(100.0, max(0.0, v))
+				col = C.bred if u > 85.0 else C.byellow if u >= 50.0 else C.bgreen
+				cells.append("%s%s%s" % (col, CORE_BAR[min(7, int(u * 8 / 100.0))], C.reset))
+			step = max(1, W - 4)
+			for i in range(0, len(cells), step):
+				out.append("  " + "".join(cells[i:i + step]))
+		if not err:
+			for ca in info.get("caches") or ():
+				lbl = "L%d%s" % (ca["level"], {"d": "d", "i": "i", "data": "d", "instruction": "i"}.get(ca.get("type", ""), ""))
+				sh = ca.get("shared", 0)
+				out.append("  %s %s × %d (%d %s each)" % (lbl, cache_size(ca["size"]), ca["count"], sh, "thread" if sh == 1 else "threads"))
+		out += ["", thead(view, G)]
+		u, mhz, lcpu = cp.get("cpu", NAN), cp.get("cpu_mhz", NAN), ll.get("cpu", NAN)
+		u_str = "%.0f%%" % min(100.0, max(0.0, u)) if u == u else "-"
+		l_str = "%.1f cores" % lcpu if lcpu == lcpu else "-"
+		m_str = "%.1f GHz" % (mhz / 1000.0) if mhz == mhz else "-"
+		out += block(c, view, snap, "cpu", G, gh, "CPU in use", u_str, num, "%", 0.0, 100.0, C.bcyan, True)
+		out += block(c, view, snap, "llama_cpu", G, gh, "llama-server", l_str, lambda x: "%.1f" % x, " cores", 0.0, 1.0, C.bgreen, True)
+		out += block(c, view, snap, "cpu_mhz", G, gh, "clock", m_str, lambda x: "%.1f" % (x / 1000.0), " GHz", None, 500.0, C.byellow)
+	if not rm:
+		out += ["", "%s no memory telemetry%s" % (C.grey, C.reset)]
+		return paged(view, out, 0, None, H) if len(out) > 2 else out
 	used = rm["total"] - rm["avail"]
 	procs = max(0.0, min(rm["ws_total"], used))
-	other = max(0.0, procs - ll["ws"])
+	other = max(0.0, procs - ll.get("ws", 0.0))
 	kernel = max(0.0, used - procs)
-	out = [section("SYSTEM RAM", W, "%s total · in use %s (%.0f%%) · file cache %s · free %s · modified %s" % (gib(rm["total"]), gib(used), 100 * used / rm["total"], gib(rm["standby"]), gib(rm["free"]), gib(rm["modified"])))]
+	out += [section("SYSTEM RAM", W, "%s total · in use %s (%.0f%%) · file cache %s · free %s · modified %s" % (gib(rm["total"]), gib(used), 100 * used / rm["total"], gib(rm["standby"]), gib(rm["free"]), gib(rm["modified"])))]
 	out.append("  " + stack([(ll["ws"], C.bcyan), (other, C.blue), (kernel, C.magenta), (rm["standby"], C.yellow)], rm["total"], bw))
 	out.append("  %s■%s llama-server %s    %s■%s other processes %s    %s■%s not in a working set %s    %s■%s file cache %s    %s░%s free %s" % (
 		C.bcyan, C.reset, gib(ll["ws"]), C.blue, C.reset, gib(other), C.magenta, C.reset, gib(kernel), C.yellow, C.reset, gib(rm["standby"]), C.grey, C.reset, gib(rm["free"])))
@@ -667,91 +906,70 @@ def system(c, snap, view, W, H):
 
 # ---- page 4: requests ----------------------------------------------------------------------------------------------------
 
-def preset_summary(c, preset):
+def preset_summary(c, preset, ps=None):
 	rs = [r for r in c.requests if r["preset"] == preset]
+	if ps is None:
+		ps = prompts.group(rs, c.cfg.get("prompt_gap_s", S.CFG["prompt_gap_s"]))
+	else:
+		ps = [p for p in ps if p["preset"] == preset]
 	# Speed figures use the long cutoffs (1,000+ new prompt tokens, 50+ generated) while at least one request reaches them,
-	# and the bucket cutoffs (32+, 20+) otherwise, so machines that only send short chat requests still get numbers.
+	# and the short cutoffs (32+, 20+) otherwise, so machines that only send short chat requests still get numbers.
 	pp_min = 1000 if any(r.get("pn", 0) >= 1000 and "pp" in r for r in rs) else 32
 	tg_min = 50 if any(r.get("tn", 0) >= 50 and "tg" in r for r in rs) else 20
-	pps = [r["pp"] for r in rs if r.get("pn", 0) >= pp_min and "pp" in r]
-	tgs = [r["tg"] for r in rs if r.get("tn", 0) >= tg_min and "tg" in r]
+	pps = [r["pp"] for r in rs if r.get("pn", 0) >= pp_min and "pp" in r and r["pp"] == r["pp"]]
+	tgs = [r["tg"] for r in rs if r.get("tn", 0) >= tg_min and "tg" in r and r["tg"] == r["tg"]]
 	acc = [r["acc"] for r in rs if r.get("acc") is not None]
 	mlen = [r["mlen"] for r in rs if r.get("mlen") is not None]
 	new, cached = sum(r.get("pn", 0) for r in rs), sum(r.get("cached") or 0 for r in rs)
 	asm = c.follow.get(preset, (None, None))[1]
 	loads = [s["load_s"] for s in (asm.sessions if asm else []) if s["load_s"]]
 	walls = [r["wall"] for r in rs if r.get("wall")]
-	return {"n": len(rs), "busy": sum(r.get("ms", 0) for r in rs) / 1e3, "new": new, "cached": cached, "gen": sum(r.get("tn", 0) for r in rs), "pps": pps, "tgs": tgs,
+	return {"prompts": len(ps), "n": len(rs), "busy": sum(r.get("ms", 0) for r in rs) / 1e3, "new": new, "cached": cached, "gen": sum(r.get("tn", 0) for r in rs), "pps": pps, "tgs": tgs,
 		"acc": sum(acc) / len(acc) if acc else NAN, "mlen": sum(mlen) / len(mlen) if mlen else NAN, "hit": cached / max(1, new + cached),
 		"miss": sum(1 for r in rs if r.get("sel") == "LRU" and r.get("evicted", 0) > 0), "trunc": sum(1 for r in rs if r.get("trunc")),
 		"loads": len(loads), "load_s": sum(loads) / len(loads) if loads else NAN, "first": min(walls) if walls else None, "last": max(walls) if walls else None,
 		"pp_min": pp_min, "tg_min": tg_min}
 
 
-def rival_of(c, r):
-	"""Highest GPU load (%) of any other process while the request ran (NaN if llmtop had no data then)."""
-	if "rival" not in r:
-		r["rival"] = c.rings["gpu_other"].span_max(r["wall0"], r["wall"]) if r.get("wall0") and r.get("wall") else NAN
-	return r["rival"]
-
-
-def effect_lines(c, shown):
-	"""Decode speed at the same context depth with and without two conditions that were recorded during each request. A correlation in the data, not proof of cause."""
-	cfg, rows = c.cfg, []
-	for p in shown:
-		for b in range(len(DEC_LABELS)):
-			rs = [r for r in c.requests if r["preset"] == p and "tg" in r and r.get("tn", 0) >= 20 and bucket(r.get("kv", 0), DEC_EDGES) == b]
-			groups, usable = [], False
-			for kind, thr in (("shared", cfg["spill_mib"]), ("rival", cfg["rival_gpu_pct"])):
-				hi, lo = [], []
-				for r in rs:
-					v = NAN if kind == "shared" and not c.allow_known else (spill_of(c, r) - c.allow if kind == "shared" else rival_of(c, r))
-					if v == v:
-						(hi if v >= thr else lo).append(r["tg"])
-				groups.append((hi, lo))
-				usable = usable or (len(hi) >= 3 and len(lo) >= 3)
-			if usable:
-				rows.append((p, DEC_LABELS[b], groups))
-	if not rows:
-		return ["  %snot enough requests yet: needs 3 or more with and 3 or more without a condition at the same context depth%s" % (C.grey, C.reset)]
-	out = [C.grey + "  " + pad("preset", 24) + pad("depth", 8) + rpad("shared above", 15) + rpad("shared below", 15) + rpad("ratio", 8) + rpad("apps above", 15) + rpad("apps below", 15) + rpad("ratio", 8) + C.reset]
-	for p, label, groups in rows:
-		cells = []
-		for hi, lo in groups:
-			ok = len(hi) >= 3 and len(lo) >= 3
-			mh, ml = (S.median(hi) if len(hi) >= 3 else NAN), (S.median(lo) if len(lo) >= 3 else NAN)
-			cells += [rpad("%s (%d)" % (f0(mh, "%.1f"), len(hi)) if len(hi) >= 3 else "-", 15), rpad("%s (%d)" % (f0(ml, "%.1f"), len(lo)) if len(lo) >= 3 else "-", 15),
-				(rel(mh, ml) if ok else C.grey) + rpad("%.2f×" % (mh / ml) if ok and ml else "-", 8) + C.reset]
-		out.append("  " + pad(p, 24) + pad(label, 8) + "".join(cells))
-	return out
-
-
 def requests(c, snap, view, W, H):
 	presets = sorted({r["preset"] for r in c.requests})
 	sel = presets[view.rsel - 1] if view.rsel and presets else None
 	shown = [p for p in presets if sel is None or p == sel]
+	all_ps, _ = prompt_groups(c, view, snap)
+	ps = [p for p in all_ps if sel is None or p["preset"] == sel]
 	rs = [r for r in c.requests if sel is None or r["preset"] == sel]
-	head = [section("REQUESTS", W, "%d recorded · %s   (m: cycle presets)" % (len(rs), sel or "all presets"))]
+	head = [section("REQUESTS", W, "%d prompts · %d turns · %s   (m: preset  t: turns)" % (len(ps), len(rs), sel or "all presets"))]
 	if not rs:
 		empty = "no finished requests in %s yet" % c.cfg["log_dir"] if c.cfg.get("log_dir") else "no finished requests yet"
 		return head + ["", "  %s%s%s" % (C.grey, empty, C.reset)]
-	sums = {p: preset_summary(c, p) for p in shown}
+	sums = {p: preset_summary(c, p, all_ps) for p in shown}
 	st = bucket_stats(c, view, snap)
-	head += ["", section("volume", W),
-		C.grey + "  " + pad("preset", 24) + rpad("reqs", 5) + rpad("busy", 9) + rpad("prompt tokens", 15) + rpad("new", 11) + rpad("cached", 11) + rpad("generated", 11) + rpad("cache hit", 10) + rpad("LRU picks", 10) + rpad("cut off", 8) + rpad("loads", 7) + rpad("load s", 8) + "   active" + C.reset]
+	issues_by_p = {}
 	for p in shown:
 		s = sums[p]
-		head.append("  " + pad(p, 24) + rpad(str(s["n"]), 5) + rpad(mmss(s["busy"]), 9) + rpad(tok(s["new"] + s["cached"]), 15) + rpad(tok(s["new"]), 11) + rpad(tok(s["cached"]), 11) + rpad(tok(s["gen"]), 11) + rpad("%.0f%%" % (100 * s["hit"]), 10)
-			+ rpad(str(s["miss"]), 10) + rpad(str(s["trunc"]), 8) + rpad(str(s["loads"]), 7) + rpad(f0(s["load_s"], "%.1f"), 8) + "   %s – %s" % (clock(s["first"]), clock(s["last"])))
+		iss = []
+		if s["miss"]:
+			iss.append("%d cache reset%s" % (s["miss"], "" if s["miss"] == 1 else "s"))
+		if s["trunc"]:
+			iss.append("%d cut off" % s["trunc"])
+		issues_by_p[p] = " · ".join(iss) if iss else "-"
+	iss_w = max(8, max(len(v) for v in issues_by_p.values()) + 2)
+	head += ["", section("volume", W),
+		C.grey + "  " + pad("preset", 24) + rpad("prompts", 8) + rpad("turns", 6) + rpad("busy", 8) + rpad("input", 10) + rpad("new", 10) + rpad("cached", 10) + rpad("output", 9) + rpad("cache hit", 10) + rpad("loads", 12) + rpad("issues", iss_w) + "   active" + C.reset]
+	for p in shown:
+		s = sums[p]
+		loads_str = "%d (%.1f s)" % (s["loads"], s["load_s"]) if s["loads"] and s["load_s"] == s["load_s"] else str(s["loads"]) if s["loads"] else "-"
+		head.append("  " + pad(p, 24) + rpad(str(s["prompts"]), 8) + rpad(str(s["n"]), 6) + rpad(mmss(s["busy"]), 8) + rpad(tok(s["new"] + s["cached"]), 10) + rpad(tok(s["new"]), 10) + rpad(tok(s["cached"]), 10) + rpad(tok(s["gen"]), 9) + rpad("%.0f%%" % (100 * s["hit"]), 10)
+			+ rpad(loads_str, 12) + rpad(issues_by_p[p], iss_w) + "   %s – %s" % (clock(s["first"]), clock(s["last"])))
 	cuts = {(s["pp_min"], s["tg_min"]) for s in sums.values() if s["n"]}
 	differ = len(cuts) != 1
-	if differ:  # presets that never reach the long cutoffs fall back to the bucket cutoffs, per preset
-		sub = "prefill over prompts of %s+ new tokens, decode over %s+ tokens, per preset (cutoffs in the preset column); slow 10%% = the slowest tenth" % (tok(min(m for m, _ in cuts)), tok(min(t for _, t in cuts)))
+	if differ:  # presets that never reach the long cutoffs fall back to the short cutoffs, per preset
+		sub = "prefill over %s+ new tokens, decode over %s+ (per preset)" % (tok(min(m for m, _ in cuts)), tok(min(t for _, t in cuts)))
 	else:
 		pp_min, tg_min = next(iter(cuts))
-		sub = "prefill over prompts of %s+ new tokens, decode over %s+ tokens; slow 10%% = the slowest tenth" % (tok(pp_min), tok(tg_min))
+		sub = "prefill over %s+ new tokens, decode over %s+" % (tok(pp_min), tok(tg_min))
 	head += ["", section("speed, t/s", W, sub),
-		C.grey + "  " + pad("preset", 24) + rpad("prefill median", 15) + rpad("slow 10%", 10) + rpad("worst", 8) + rpad("decode median", 15) + rpad("slow 10%", 10) + rpad("worst", 8) + rpad("draft acc", 11) + rpad("mean len", 10) + C.reset]
+		C.grey + "  " + pad("preset", 24) + rpad("prefill median", 15) + rpad("slow 10%", 10) + rpad("n", 6) + rpad("decode median", 15) + rpad("slow 10%", 10) + rpad("n", 6) + rpad("draft acc", 11) + rpad("mean len", 10) + C.reset]
 	for p in shown:
 		s = sums[p]
 		if differ:  # the label must not widen the preset column: keep the cell 24 wide, shortening the name from the start
@@ -759,39 +977,47 @@ def requests(c, snap, view, W, H):
 			name = label if len(label) <= 24 else "..." + label[-21:]
 		else:
 			name = p
-		head.append("  " + pad(name, 24) + rpad(f0(S.median(s["pps"])), 15) + rpad(f0(pct(s["pps"], 0.1)), 10) + rpad(f0(min(s["pps"]) if s["pps"] else NAN), 8) + rpad(f0(S.median(s["tgs"]), "%.1f"), 15) + rpad(f0(pct(s["tgs"], 0.1), "%.1f"), 10)
-			+ rpad(f0(min(s["tgs"]) if s["tgs"] else NAN, "%.1f"), 8) + rpad(f0(100 * s["acc"], "%.0f%%"), 11) + rpad(f0(s["mlen"], "%.2f"), 10))
-	for title, labels, table, unit in (("prefill t/s by new prompt tokens", PRE_LABELS, st[0], "pp"), ("decode t/s by context depth", DEC_LABELS, st[1], "tg")):
-		head += ["", section(title, W, "median, requests in brackets; colour is against the best preset in each column (3+ requests)"), C.grey + "  " + pad("preset", 24) + "".join(rpad(lb, 13) for lb in labels) + C.reset]
-		best = []  # the fastest preset in each column, over every preset so a filter does not change the colours
-		for b in range(len(labels)):
-			meds = [S.median(table[(q, b)]) for q in presets if len(table.get((q, b), [])) >= 3]
-			best.append(max(meds) if meds else NAN)
+		head.append("  " + pad(name, 24) + rpad(f0(S.median(s["pps"])), 15) + rpad(f0(pct(s["pps"], 0.1)), 10) + rpad(str(len(s["pps"])), 6) + rpad(f0(S.median(s["tgs"]), "%.1f"), 15) + rpad(f0(pct(s["tgs"], 0.1), "%.1f"), 10)
+			+ rpad(str(len(s["tgs"])), 6) + rpad(f0(100 * s["acc"], "%.0f%%"), 11) + rpad(f0(s["mlen"], "%.2f"), 10))
+	for title, sub_b, table, unit in (("prefill t/s by context", "median (turns); green fastest · red slowest in each column", st[0], "pp"), ("decode t/s by context", "median (turns); green fastest · red slowest in each column", st[1], "tg")):
+		head += ["", section(title, W, sub_b), C.grey + "  " + pad("preset", 24) + "".join(rpad(lb, 13) for lb in DEC_LABELS) + C.reset]
+		cols = []  # ranked colours per column, over every preset so a filter does not change them
+		for b in range(len(DEC_LABELS)):
+			values = [(S.median(table[(q, b)]) if table.get((q, b)) else NAN, len(table.get((q, b), []))) for q in presets]
+			cols.append(rank_colours(values))
 		for p in shown:
+			i = presets.index(p)
 			cells = []
-			for b in range(len(labels)):
+			for b in range(len(DEC_LABELS)):
 				xs = table.get((p, b), [])
-				text = "%s (%d)" % (f0(S.median(xs), "%.0f" if unit == "pp" else "%.1f"), len(xs)) if xs else "-"
-				cells.append((rel(S.median(xs), best[b]) if len(xs) >= 3 else C.grey if not xs else "") + rpad(text, 13) + C.reset)
+				med = S.median(xs) if xs else NAN
+				text = "%s (%d)" % (f0(med, "%.0f" if unit == "pp" else "%.1f"), len(xs)) if xs else "-"
+				cells.append(cols[b][i] + rpad(text, 13) + C.reset)
 			head.append("  " + pad(p, 24) + "".join(cells))
-	head += ["", section("effect of shared GPU memory and other apps", W, "decode t/s, median (requests), same context depth. above = shared memory %s MiB or more over the baseline / another process %s%% or more of the GPU during the request. A correlation, not proof of cause" % (c.cfg["spill_mib"], c.cfg["rival_gpu_pct"]))]
-	head += effect_lines(c, shown)
 	w, gh = max(20, min(120, W - 80)), view.gh or 2
-	tail = rs[-w * 2:]
-	pp_min = 500 if any(r.get("pn", 0) >= 500 and "pp" in r for r in tail) else 32
-	tg_min = 50 if any(r.get("tn", 0) >= 50 and "tg" in r for r in tail) else 20
-	pp = [r.get("pp", NAN) if r.get("pn", 0) >= pp_min else NAN for r in tail]
-	tg = [r.get("tg", NAN) if r.get("tn", 0) >= tg_min else NAN for r in tail]
-	sp_ = [spill_of(c, r) for r in tail]
-	head += ["", section("per request", W, "oldest to newest, last %d" % len(tail)), ""]
-	for label, vals, col, span, unit in (("prefill t/s", pp, C.bcyan, 100.0, ""), ("decode t/s", tg, C.bgreen, 20.0, ""), ("shared GPU memory", sp_, C.bred, 512.0, " MiB")):
+	pts = w * 2 if STYLE["mode"] == "braille" else w
+	pp = [r["pp"] for r in rs if r.get("pn", 0) >= 256 and "pp" in r and r["pp"] == r["pp"]][-pts:]
+	tg = [r["tg"] for r in rs if r.get("tn", 0) >= 20 and "tg" in r and r["tg"] == r["tg"]][-pts:]
+	tail = rs[-pts:]
+	sp_ = [spill_of(c, r) for r in tail if spill_of(c, r) == spill_of(c, r)]
+	show_sp = bool(c.allow_known and any(v - c.allow >= c.cfg["spill_mib"] for v in sp_))
+	head += ["", section("per turn", W, "last %d turns with 256+ new tokens, %d with 20+ decode" % (len(pp), len(tg))), ""]
+	charts = [("prefill t/s", pp or [NAN], C.bcyan, 100.0, ""), ("decode t/s", tg or [NAN], C.bgreen, 20.0, "")]
+	if show_sp:
+		charts.append(("shared GPU memory", sp_, C.bred, 512.0, " MiB"))
+	for label, vals, col, span, unit in charts:
 		head += block(c, view, snap, None, 0, gh, label, "", num, unit, 0.0, span, col, True, vals=vals)
-	slow = sorted((r for r in rs if r.get("pn", 0) >= 4000 and "pp" in r), key=lambda r: r["pp"])[:5]
-	if slow:
-		head += ["", section("slowest prefills", W, "prompts of 4,000+ new tokens"), req_header(sel is None)] + [req_row(c, r, st, sel is None) for r in slow]
-	head += ["", section("every request", W, "newest first"), legend(), notes_legend(), req_header(sel is None)]
-	rev = rs[::-1]
-	return paged(view, head, len(rev), lambda i: req_row(c, rev[i], st, sel is None), H, pin=req_header(sel is None))
+	sub_ep = "newest first · turns shown (t: hide)" if getattr(view, "turns", False) else "newest first (t: show turns)"
+	pw, drop, notes = prompt_layout(W, [p["preset"] for p in ps], sel is None)
+	head += ["", section("every prompt", W, sub_ep), legend(), req_header(sel is None, pw=pw, drop=drop, notes=notes)]
+	items = []
+	for p in reversed(ps):
+		items.append(("p", p, ""))
+		if getattr(view, "turns", False):
+			n_t = len(p["turns"])
+			for j, r in enumerate(p["turns"]):
+				items.append(("t", r, "  └ " if j == n_t - 1 else "  · "))
+	return paged(view, head, len(items), lambda i: prompt_row(c, items[i][1], st, sel is None, pw=pw, drop=drop) if items[i][0] == "p" else turn_row(c, items[i][1], st, sel is None, items[i][2], True, pw=pw, drop=drop, nested=True), H, pin=req_header(sel is None, pw=pw, drop=drop, notes=notes))
 
 
 # ---- page 5: events --------------------------------------------------------------------------------------------------------

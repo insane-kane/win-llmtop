@@ -37,7 +37,6 @@ CFG = {
 	"avail_crit": 2048,
 	"commit_warn": 8192,
 	"commit_crit": 3072,
-	"pagein_warn": 300,  # hard page faults per second
 	"hold_s": 30,  # how long a burst stays in the banner
 	"clear_s": 10,  # quiet time before a sustained alert clears
 	"near_budget_mib": 512,  # shared-memory overflow is critical when resident VRAM is this close to the OS budget
@@ -49,12 +48,13 @@ CFG = {
 	"ws_drop_mib": 1024,  # fall in llama-server's working set within 10 s
 	"burst_window_s": 4,  # window for the shared-memory rise
 	"load_grace_s": 90,  # rises in shared memory this soon after a load are not reported as bursts
+	"prompt_gap_s": 30,  # idle gap in seconds between turns on the same slot that starts a new prompt
 }
 SCALED_THRESHOLDS = ("avail_warn", "avail_crit", "commit_warn", "commit_crit", "near_budget_mib", "idle_headroom_mib")
 RE_BAD_FILE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 # series recorded once per second: key -> how the sub-second samples are combined
 SERIES = {"vram": "max", "vram_llama": "max", "spill": "max", "budget": "last", "gpu_llama": "max", "gpu_copy": "max", "gpu_other": "max",
-	"ram_used": "max", "ram_avail": "min", "commit": "max", "llama_ws": "max", "llama_cpu": "mean", "pages_in": "max", "ctx": "max",
+	"ram_used": "max", "ram_avail": "min", "commit": "max", "llama_ws": "max", "llama_cpu": "mean", "cpu": "mean", "cpu_mhz": "mean", "pages_in": "max", "ctx": "max",
 	"dec": "mean", "pre": "mean", "busy": "max", "heap": "last", "pf_used": "max", "pages_out": "max", "standby": "mean", "free": "mean"}
 LEVELS = {"info": 0, "warn": 1, "crit": 2}
 
@@ -349,8 +349,6 @@ class Alerts:
 			for pf in rm["pagefiles"]:
 				if pf["size"] and pf["used"] / pf["size"] * 100 >= c["pagefile_pct"]:
 					self.flag("pagefile", "warn", "page file %s is %.0f%% used (%s of %s)" % (pf["name"], 100 * pf["used"] / pf["size"], mib(pf["used"]), mib(pf["size"])), now)
-			if rm["pages_in"] >= c["pagein_warn"]:
-				self.flag("faults", "warn", "system-wide hard page faults: %.0f pages/s read from disk (Pages Input/sec)" % rm["pages_in"], now)
 		if ll["present"] and ll["ws_drop"] >= c["ws_drop_mib"]:
 			if ll["commit_drop"] >= 0.5 * ll["ws_drop"]:
 				self.flag("trim", "info", "llama-server's working set fell by %s within 10 s and its commit fell by %s: the process released memory (deduced: commit only falls when memory is released)"
@@ -408,6 +406,7 @@ class Collector:
 		self.allow, self.allow_known, self.pid_seen, self.shr_floor = 0.0, False, {}, {}
 		self.vm, self.vm_error, self.vm_busy, self.ws_by, self.ws_total, self.pagefiles = None, None, False, {}, 0.0, []
 		self.pf_cfg = win.pagefile_config() if win.WIN else []
+		self.cpu_info = win.cpu_info() if win.WIN else {"name": "", "cores": 0, "threads": 0, "p_cores": 0, "e_cores": 0, "caches": [], "error": "not Windows"}
 		self.calib_file = os.path.join(self.state_dir, "calibration.json") if self.state_dir and not self.state_error else None
 		if self.calib_file and os.path.isfile(self.calib_file):
 			try:
@@ -925,11 +924,13 @@ class Collector:
 			g["ded"], g["shr"], g["n"] = g["ded"] + p["ded"], g["shr"] + p["shr"], g["n"] + 1
 			g["eng"] = max(g["eng"], max(p["eng"].values(), default=0.0))
 		others = sorted((g for g in groups.values() if g["ded"] >= 64 or g["eng"] >= 5), key=lambda g: -g["ded"])
+		sy = pd.get("sys", {})
 		ram = None
 		if sm:
-			ram = {**sm, "pages_in": pd["sys"].get("pages_in", 0.0), "pages_out": pd["sys"].get("pages_out", 0.0), "standby": pd["sys"].get("standby", 0.0),
-				"pagefile_pct": pd["sys"].get("pagefile_pct", 0.0), "free": pd["sys"].get("free", 0.0), "modified": pd["sys"].get("modified", 0.0),
+			ram = {**sm, "pages_in": sy.get("pages_in", 0.0), "pages_out": sy.get("pages_out", 0.0), "standby": sy.get("standby", 0.0),
+				"pagefile_pct": sy.get("pagefile_pct", 0.0), "free": sy.get("free", 0.0), "modified": sy.get("modified", 0.0),
 				"pagefiles": self.pagefiles, "pf_cfg": self.pf_cfg, "ws_by": self.ws_by, "ws_total": self.ws_total}
+		cpu = {"cpu": sy.get("cpu", NAN), "cpu_mhz": sy.get("cpu_mhz", NAN), "cpu_queue": sy.get("cpu_queue", NAN), "cpu_cores": sy.get("cpu_cores", [])}
 		presets = {}
 		for pid_, m in self.models.items():
 			has_status = isinstance(m.get("status"), dict)
@@ -958,7 +959,7 @@ class Collector:
 		self.allow_known = self.allow_known or ll["allow_known"]
 		notices = self._build_notices(presets, kids)
 		snap = {"t": now, "mode": self.mode, "router_up": self.router_up, "router_error": self.router_error, "router_auth_error": self.router_auth_error, "gpu": gpu, "llama": ll,
-			"vm_error": self.vm_error, "others": others, "ram": ram, "presets": presets, "busy": busy, "new_events": new_events, "notices": notices}
+			"vm_error": self.vm_error, "others": others, "ram": ram, "cpu": cpu, "presets": presets, "busy": busy, "new_events": new_events, "notices": notices}
 		self.rec.add(now, self.series_values(snap))
 		self.alerts.evaluate(snap, self.mem)
 		for preset, p in presets.items():
@@ -1063,13 +1064,15 @@ class Collector:
 		return None
 
 	def series_values(self, snap):
-		g, ll, rm = snap["gpu"], snap["llama"], snap["ram"]
+		g, ll, rm, cp = snap["gpu"], snap["llama"], snap["ram"], snap.get("cpu")
 		v = {"busy": 1.0 if snap["busy"] else 0.0}
 		if g:
 			v.update(vram=g["ded"], budget=g["budget"], gpu_other=max((o["eng"] for o in snap["others"]), default=0.0))
 		if ll["present"]:
 			v.update(vram_llama=ll["ded"], spill=ll["shr"], gpu_llama=max(ll["eng"].values(), default=0.0), gpu_copy=ll["eng"].get("Copy", 0.0),
 				llama_ws=ll["ws"], llama_cpu=ll["cpu"])
+		if cp:
+			v.update(cpu=cp["cpu"], cpu_mhz=cp["cpu_mhz"])
 		if rm:
 			v.update(ram_used=rm["total"] - rm["avail"], ram_avail=rm["avail"], commit=rm["commit"], pages_in=rm["pages_in"], pages_out=rm["pages_out"], standby=rm["standby"], free=rm["free"])
 			if rm["pagefiles"]:

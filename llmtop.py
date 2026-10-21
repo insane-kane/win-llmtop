@@ -81,6 +81,10 @@ def handle(key, c, view, snap, H):
 		view.msel, view.scroll = view.msel + 1, 0
 	elif key == "m" and page == "Requests":
 		view.rsel, view.scroll = (view.rsel + 1) % (len({r["preset"] for r in c.requests}) + 1), 0
+	elif key == "t" and page == "Requests":
+		view.turns = not view.turns
+	elif key == "t" and page == "Live":
+		view.live_prompts = not view.live_prompts
 	elif key == "f" and page == "Events":
 		view.level, view.scroll = (view.level + 1) % 3, 0
 	elif key == "t" and page == "Tensors":
@@ -464,8 +468,14 @@ def main():
 		calibrate=not (args.no_persist or args.plan is not None or args.check),
 		user_thresholds=user_thresholds)
 	num_thresholds = {k: v for k, v in state.CFG.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+	pagein_warn_noted = False
 	for item in args.threshold:
 		name, _, value = item.partition("=")
+		if name == "pagein_warn":
+			if not pagein_warn_noted:
+				print("win-llmtop: threshold pagein_warn was removed in 0.2.0 and is ignored", file=sys.stderr)
+				pagein_warn_noted = True
+			continue
 		if name not in num_thresholds or not value:
 			sys.exit("unknown or non-numeric threshold %r; thresholds: %s" % (item, ", ".join(num_thresholds)))
 		cfg[name] = type(num_thresholds[name])(float(value))

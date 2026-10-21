@@ -17,7 +17,8 @@ RE_FWD = re.compile(r"^\[\s*(\d+)\]\s*")  # the router forwards each child's std
 RE_LINE = re.compile(r"^(\d+)\.(\d\d)\.(\d{3})\.(\d{3}) (\w) (.*)$")
 RE_LEVEL = re.compile(r"^(\w) (.*)$")  # a line without its (default-off) timestamp: level letter, then text
 RE_TASK = re.compile(r"\| task (-?\d+) \|\s*(.*)$")
-RE_LCP = re.compile(r"selected slot by LCP similarity, (?:f_)?sim_best = ([\d.]+)")
+RE_SLOT = re.compile(r"\bid\s+(\d+)\s*\|")
+RE_LCP = re.compile(r"selected slot by LCP similarity, (?:f_)?sim_best = ([\d.]+)(?:.*?(?:f_)?keep = ([\d.]+))?")
 RE_LRU = re.compile(r"selected slot by LRU, n_tokens = (\d+)")
 RE_RATE = r"([\d.]+|-nan\(ind\)|-nan|nan|inf)"  # tokens per second; 0 new tokens prints inf or nan
 RE_PEVAL = re.compile(r"^prompt eval time =\s*([\d.]+) ms /\s*(\d+) tokens.*?" + RE_RATE + r" tokens per second")
@@ -141,10 +142,12 @@ class Assembler:
 			events.append(self._event(t, wall, "crit" if lvl == "E" else "info" if NOTICE.search(text) else "warn", "log", text[:200]))
 			return done, events
 		if m := RE_LCP.search(text):
-			self.sel = {"sel": "LCP", "sim": float(m.group(1))}
+			sm = RE_SLOT.search(text)
+			self.sel = {"sel": "LCP", "sim": float(m.group(1)), "keep": float(m.group(2)) if m.group(2) is not None else 1.0, "slot": int(sm.group(1)) if sm else None}
 			return done, events
 		if m := RE_LRU.search(text):
-			self.sel = {"sel": "LRU", "sim": 0.0, "evicted": int(m.group(1))}
+			sm = RE_SLOT.search(text)
+			self.sel = {"sel": "LRU", "sim": 0.0, "evicted": int(m.group(1)), "keep": 1.0, "slot": int(sm.group(1)) if sm else None}
 			if int(m.group(1)) >= LRU_EVENT_TOKENS:
 				events.append(self._event(t, wall, "info", "slot", "slot chosen by LRU (no prefix match above the similarity threshold); it held %s tokens" % format(int(m.group(1)), ",")))
 			return done, events
@@ -154,7 +157,9 @@ class Assembler:
 		task, body = int(tm.group(1)), tm.group(2).strip()
 		if body.startswith("processing task"):
 			self.tasks_seen += 1
-			self.cur[task] = {"preset": self.preset, "session": len(self.sessions) - 1, "task": task, "t0": t, "wall0": wall, **(self.sel or {"sel": "-", "sim": 0.0})}
+			sm = RE_SLOT.search(text)
+			sel = self.sel or {"sel": "-", "sim": 0.0, "keep": 1.0, "slot": None}
+			self.cur[task] = {"preset": self.preset, "session": len(self.sessions) - 1, "task": task, "t0": t, "wall0": wall, **sel, "slot": int(sm.group(1)) if sm else sel.get("slot")}
 			self.sel = None
 			return done, events
 		r = self.cur.get(task)
@@ -171,7 +176,7 @@ class Assembler:
 			if int(m.group(2)):
 				events.append(self._event(t, wall, "info", "alloc", "task %d: compute graph reallocated with changed buffer sizes %d time(s) (log: %d same-size, %d changed-size)" % (task, int(m.group(2)), int(m.group(1)), int(m.group(2)))))
 		elif m := RE_DRAFT.search(body):
-			r.update(acc=float(m.group(1)), mlen=float(m.group(4)) if m.group(4) is not None else None)
+			r.update(acc=float(m.group(1)), dacc=int(m.group(2)), dgen=int(m.group(3)), mlen=float(m.group(4)) if m.group(4) is not None else None)
 		elif m := RE_RELEASE.search(body):
 			self.cur.pop(task)
 			self.requests_done += 1

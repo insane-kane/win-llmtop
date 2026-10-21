@@ -39,10 +39,10 @@ Run `win-llmtop` with no arguments for the interactive full-screen view (sampled
 
 | Key | Page | What it shows |
 | :--- | :--- | :--- |
-| `1` | **Live** | Active alerts; GPU VRAM bar against the OS budget, `llama-server` resident and shared memory, engine load and other apps' VRAM; system RAM, commit charge and paging with trend charts; running request phase, progress, ETA and tokens/s; recent requests and events |
+| `1` | **Live** | Active alerts; GPU VRAM bar against the OS budget, `llama-server` resident and shared memory, engine load and other apps' VRAM; system RAM, commit charge, paging and CPU load (`llama-server` cores, clock, processor queue) with trend charts; running request phase, progress, ETA and tokens/s; recent turns or recent prompts (`t` toggles; `▸` marks the first turn of each prompt) and events |
 | `2` | **Memory** | For one preset (`m` cycles presets, loaded or unloaded): VRAM by component (weights, KV cache, recurrent state, compute buffers, draft, overhead) against the OS budget; `llama-server` host RAM breakdown; layer placement overview |
-| `3` | **System** | System RAM by consumer (`llama-server`, other processes, kernel remainder, file cache, free) with top working sets; page file size, use, peak and commit limit; RAM and paging trend charts |
-| `4` | **Requests** | Per-preset request volume and busy time, median/slow-10%/worst prefill and decode speeds, prefill by new-prompt size, decode by context depth, slowest prefills, shared-VRAM/rival-GPU effect table, and every request (`m` filters by preset) |
+| `3` | **System** | CPU model, core and thread counts, per-core load, L1/L2/L3 cache topology, and CPU load and clock trend charts; system RAM by consumer (`llama-server`, other processes, kernel remainder, file cache, free) with top working sets; page file size, use, peak and commit limit; RAM and paging trend charts |
+| `4` | **Requests** | Per-preset prompt and turn volume, busy time, loads and issues; median, slow-10% and sample-count speeds; prefill and decode t/s by context depth (`<8k`, `8–32k`, `32–64k`, `64k+`); per-turn charts; and every prompt with nested turns, each with its cache hit and draft acceptance (`m` filters by preset, `t` toggles nested turns) |
 | `5` | **Events** | Threshold alerts raised and cleared, model loads, request queueing, preset evictions, prompt-cache misses, request errors and context truncation (`f` filters by severity level) |
 | `6` | **Tensors** | Every layer (`t` toggles individual tensors) with GGUF type, shape, size, `■ GPU` / `■ CPU` badge, and the flag or rule that placed CPU tensors (`d` filters by device) |
 
@@ -57,11 +57,21 @@ Run `win-llmtop` with no arguments for the interactive full-screen view (sampled
 | `p` or `Space` | All pages | Pause or resume the screen redraw while background sampling continues |
 | `↑` `↓`, `PgUp` `PgDn`, `Home` `End` | All except **Live** | Scroll long tables vertically |
 | `m` | **Memory**, **Tensors** | Cycle through presets (loaded first, then unloaded) |
-| `m` | **Requests** | Filter the request history table by preset |
+| `m` | **Requests** | Filter the Requests page by preset |
+| `t` | **Live** | Switch the bottom table between recent turns and recent prompts |
+| `t` | **Requests** | Show or hide individual turns nested under each prompt |
 | `f` | **Events** | Cycle the event severity filter (`all`, `warn+`, `crit`) |
 | `t` | **Tensors** | Switch between per-layer summary and every individual tensor |
 | `d` | **Tensors** | Filter tensors by device (`all`, `GPU`, `CPU`) |
 | `q` or `Esc` | All pages | Quit `win-llmtop` |
+
+### Reading the Requests page
+
+- **Turns, prompts and context:** A **turn** is one `llama-server` request. A **prompt** is a run of consecutive turns on the same preset and slot that continue one conversation without a long pause; its prefill and decode rates are time-weighted (`Σpn / Σpms` and `Σtn / Σtms`). **Context** is the tokens in the KV cache after a turn (`cached + pn + tn`); prefill speed is bucketed by the depth when prefill ends (`cached + pn`). A turn starts a new prompt when it is an LRU slot pick that evicted tokens (`evicted > 0`) or kept less than half of the slot's cached tokens (`f_keep < 0.5`), when the idle gap since the previous turn on that slot is at least `prompt_gap_s` (`30` s by default, configurable via [`--threshold`](llmtop.1.md#options) `prompt_gap_s=N`), or when the model was reloaded between them. Press `t` on **Requests** to expand or collapse the turns inside each prompt.
+- **Colours:** Prefill and decode t/s values in the prompt and turn tables are coloured against the **same preset's median at a similar context depth** (`<8k`, `8–32k`, `32–64k`, `64k+`), from ≥ 3 qualifying turns: blue ≥ 120%, green 80–120%, yellow 50–80%, red < 50%. A turn is compared against the median for its own bucket. A prompt is compared against the time its turns would usually take — each turn's new (or generated) tokens over that turn's own bucket median, summed, over the same turns' time — so a long prompt is not judged at its final depth; it is dim grey when the turns with a reference hold under half its new (or generated) tokens. Prefill is compared only over turns with `256+` new tokens and decode only over `20+` generated tokens; anything not compared is dim grey. In the context-depth bucket tables, the presets with 3+ turns in a column are ranked fastest first and grouped into near-tie clusters (a cell stays in a cluster while within 5% of that cluster's fastest value), and every cell in a cluster takes the colour its fastest member would get by rank: the fastest clusters are green, the slowest red, the middle yellow; cells with 1-2 turns and `-` cells are dim grey, and a column with a single ranked preset is plain. The `hit` and `draft` columns are never coloured: a prompt's first turn is often a `0%` hit by nature, and the `cache reset` note already marks real misses.
+- **Notes:** Row notes show exceptions only: `cache reset Nk` (an LRU pick dropped a slot holding `Nk` tokens), `cut off` (`llama-server` truncated the prompt), `shared +X.X GiB` (`llama-server` held that much shared GPU memory over its baseline during the turn), and `resized` (compute buffers were reallocated).
+- **Cache hit (`hit`):** the share of a turn's prompt tokens served from the slot's cache (`cached / (cached + new)`); a prompt's is token-weighted across its turns. A cache miss shows as the `cache reset` note.
+- **Draft acceptance (`draft`):** the share of speculative draft tokens accepted; a prompt's is weighted by draft tokens (`Σaccepted / Σgenerated`; for older history without counts, the per-turn rates are weighted by generated tokens).
 
 ---
 
@@ -73,9 +83,9 @@ Run `win-llmtop` with no arguments for the interactive full-screen view (sampled
 
 Pass `--log-file` (in router mode, each preset's `log-file`) and `--log-timestamps` to `llama-server`, and point [`--log-dir`](llmtop.1.md#options) (or `LLMTOP_LOG_DIR`) at the log directory if the preset does not specify an full path so `win-llmtop` can open `<log-dir>\<preset>.log`.
 
-- **What it unlocks:** finished request history on **Live** and **Requests** — per-request prefill and decode speeds, prompt cache hit tokens, speculative draft acceptance rates, and wall-clock completion times.
+- **What it unlocks:** finished turn and prompt history on **Live** and **Requests** — per-turn prefill and decode speeds, prompt cache hit tokens, speculative draft acceptance rates, and wall-clock completion times.
 - **What you lose without `--log-file` / [`--log-dir`](llmtop.1.md#options):** the request history is empty and `win-llmtop` prints a `no log file for preset <name>` notice.
-- **What you lose without `--log-timestamps`:** log lines carry no timestamps, so request durations and speeds are still parsed, but entries have no wall-clock times and `win-llmtop` prints a notice suggesting `--log-timestamps`.
+- **What you lose without `--log-timestamps`:** log lines carry no timestamps, so turn durations and speeds are still parsed, but entries have no wall-clock times and `win-llmtop` prints a notice suggesting `--log-timestamps`.
 
 ### Live slot telemetry
 

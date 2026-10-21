@@ -33,7 +33,7 @@ Options, with their environment variables and defaults:
 | `--hz HZ` | — | `4.0` | sampling and redraw rate |
 | `--history-hours HISTORY_HOURS` | — | `24` | hours of per-second history kept in memory and replayed |
 | `--spill-mib SPILL_MIB` | — | `256` | excess shared GPU memory (MiB) that raises an alert |
-| `--threshold NAME=VALUE` | — | (none) | override an alert threshold (see `CFG` in `llmtop_lib/state.py`); repeatable |
+| `--threshold NAME=VALUE` | — | (none) | override an alert or grouping threshold (see `CFG` in `llmtop_lib/state.py`); repeatable |
 | `--no-persist` | — | off | do not mirror history to disk |
 | `--graph-style {braille,blocks}` | — | braille in Windows Terminal, blocks otherwise | braille line plots, or block-character charts if the font lacks braille |
 | `--no-color` | — | off | disable ANSI colour escapes |
@@ -55,20 +55,36 @@ Notices are grey `· ` lines that say why a figure is missing or a source is abs
 ### Pages (keys `1`–`6`, `Tab`, or `←` `→`)
 | Page | Content |
 | :--- | :--- |
-| **Live** | Alerts; GPU (VRAM bar with the OS budget marked, llama-server resident and shared memory, engine load, other apps' VRAM) and RAM (in use, commit, file cache, page file) with framed trend charts; per loaded preset: phase, prefill or decode progress and live t/s, context fill, last draft acceptance, charts; recent requests and events. |
+| **Live** | Alerts; GPU (VRAM bar with the OS budget marked, llama-server resident and shared memory, engine load, other apps' VRAM), RAM (in use, commit, file cache, page file) and CPU (load, llama-server cores, clock, processor queue) with framed trend charts; per loaded preset: phase, prefill or decode progress and live t/s, context fill, last draft acceptance, charts; recent turns or recent prompts (`t` toggles; `▸` marks the first turn of each prompt) and events. |
 | **Memory** | For one preset (`m` cycles presets, loaded or not): VRAM by component against the OS budget, with what would fit; llama-server's own RAM as a short table (working set, commit by kind, mapped files, heap against the `cache-ram` and checkpoint ceilings); layer overview. |
-| **System** | System RAM by consumer (llama-server, other processes, kernel, file cache, free) with the largest working sets; llama-server working set and private commit; page file size, use and peak with the commit limit; RAM and paging trends. |
-| **Requests** | Per preset: volume (requests, busy time, tokens, cache hit and misses, cut-off requests, loads), speed (median, slow 10% and worst prefill and decode, draft acceptance), prefill by new-prompt size and decode by context depth, per-request charts, the slowest prefills, an effect table (decode speed at the same context depth with and without shared GPU memory above the baseline, and with and without another process using the GPU), and every request (`m` filters by preset). |
+| **System** | CPU (model, cores and threads, per-core load, L1/L2/L3 cache topology, load and clock trends); system RAM by consumer (llama-server, other processes, kernel, file cache, free) with the largest working sets; llama-server working set and private commit; page file size, use and peak with the commit limit; RAM and paging trends. |
+| **Requests** | Per preset: volume (prompts, turns, busy time, input/new/cached/output tokens, cache hit, loads with mean load time, issues), speed (prefill and decode median, slow 10% and sample count `n`, draft acceptance and mean length), prefill and decode t/s by context depth (`<8k`, `8–32k`, `32–64k`, `64k+`; coloured by rank within each column, green fastest and red slowest), per-turn charts for qualifying turns, and every prompt newest first with its cache hit and draft acceptance (`m` filters by preset, `t` toggles nested turns). |
 | **Events** | Alerts raised and cleared, model loads, queueing, evictions, prompt-cache misses, request errors, truncation (`f` filters by level). |
 | **Tensors** | Every layer (`t` switches to every tensor) with type, shape, size and device as a ■ GPU / ■ CPU badge, plus a short tag where something deliberate placed it on the CPU; `d` filters by device. |
 
-Keys: `[` `]` change the history window; `g` sets the graph height (auto, 1–4 lines); `s` switches the graph style; `↑` `↓` `PgUp` `PgDn` `Home` `End` scroll every page except Live; `p` or `Space` pauses the display (collection continues); `q` quits.
+Keys: `[` `]` change the history window; `g` sets the graph height (auto, 1–4 lines); `s` switches the graph style; `↑` `↓` `PgUp` `PgDn` `Home` `End` scroll every page except Live; on Live `t` switches the bottom table between recent turns and recent prompts; `p` or `Space` pauses the display (collection continues); `q` quits.
+
+### Prompts, turns and notes
+- **Turn:** one `llama-server` request.
+- **Prompt:** a run of consecutive turns on the same preset and slot that continue one conversation without a long pause. A prompt's prefill and decode rates are time-weighted across its turns (`Σpn / Σpms` and `Σtn / Σtms`, not a mean of per-turn rates); its `total` is total server busy time (`Σms`). Turn *b* starts a new prompt after turn *a* on the same preset and slot when any of:
+	1. *b* was an LRU slot pick that evicted held tokens (`sel == "LRU"` and `evicted > 0`), or kept less than half of the slot's cached tokens (`f_keep < 0.5`);
+	2. the idle gap `b.wall0 - a.wall` is at least `prompt_gap_s` (`30` s by default, settable with `--threshold prompt_gap_s=N`);
+	3. the model was reloaded between them (`session` differs).
+	When wall-clock times are missing (logs without timestamps), relative `t0`/`t` timestamps are used within one session; if neither is usable, only the cache and reload rules apply.
+- **Context:** tokens in the KV cache after a turn (`kv` = `cached + pn + tn`); a prompt row shows its last turn's. Prefill speed is bucketed by the depth when prefill ends (`cached + pn`).
+- **hit:** the share of a turn's prompt tokens served from the slot's cache (`cached / (cached + new)`); a prompt's is token-weighted across its turns. A cache miss shows as the `cache reset` note. The column is never coloured: a prompt's first turn is often a `0%` hit by nature.
+- **draft:** the share of speculative draft tokens accepted (`accepted / generated`); a prompt's is weighted by draft tokens (`Σaccepted / Σgenerated`; for older history without counts, the per-turn rates are weighted by generated tokens).
+- **Notes** (exceptions only; normal cache reuse is the `context − new − gen` difference, shown by the `hit` share):
+	- `cache reset Nk`: an LRU pick dropped a slot holding `Nk` tokens, so the whole prompt was recomputed;
+	- `cut off`: the prompt did not fit and `llama-server` truncated it;
+	- `shared +X.X GiB`: `llama-server` held `X.X GiB` of shared GPU memory over its baseline (≥ `spill_mib`, `256` MiB) during the turn;
+	- `resized`: compute buffers were reallocated with changed sizes.
 
 ### Graphs
-Each chart is a frame: labels and the current value sit beside the first line, the scale's high is printed on the top border and its low on the bottom border, and ticks on the borders mark quarters of the time window (the header says how far back the left edge is). The default style is a braille line trace (two samples per character, four dot rows per line); rate series are filled. `--graph-style blocks` or the `s` key uses block characters for fonts without braille. Each chart is scaled to what its series did in the window, so a steady value is a flat line at mid-height; charts anchored at zero (rates, context tokens) say so with a low of 0. A missing stretch of data is blank inside the frame. Auto height picks 3 lines, then 2, then a single line per chart, whichever leaves room for the request table.
+Each chart is a frame: labels and the current value sit beside the first line, the scale's high is printed on the top border and its low on the bottom border, and ticks on the borders mark quarters of the time window (the header says how far back the left edge is). The default style is a braille line trace (two samples per character, four dot rows per line); rate series are filled. `--graph-style blocks` or the `s` key uses block characters for fonts without braille. Each chart is scaled to what its series did in the window, so a steady value is a flat line at mid-height; charts anchored at zero (rates, context tokens) say so with a low of 0. A missing stretch of data is blank inside the frame. Auto height picks 3 lines, then 2, then a single line per chart, whichever leaves room for the request table. On the Requests page, the per-turn charts plot only qualifying turns (`256+` new tokens for prefill, `20+` generated for decode) without gaps, and the shared-memory chart is hidden when no turn in the window exceeded the baseline by `spill_mib`.
 
 ### Colour of t/s
-Prefill and decode rates in the request tables are coloured against the **median of the same preset's requests of similar size**: prefill is compared by new prompt tokens (<256, 256–1k, 1–4k, 4–16k, 16–64k, 64k+), decode by context depth (<8k, 8–32k, 32–64k, 64k+). Green is 80% or more of that median, yellow 50–80%, red under 50%, grey when fewer than three similar requests exist. Comparing like with like matters: short prompts are always slower per token than long ones.
+Every prefill and decode t/s value in the prompt and turn tables is coloured against the **same preset's median at a similar context depth** (`<8k`, `8–32k`, `32–64k`, `64k+`; prefill buckets by context `cached + pn`, decode by `kv`), from ≥ 3 qualifying turns: blue is 120% or more of that median, green 80–120%, yellow 50–80%, red under 50%. A turn is compared against the median for its own bucket. A prompt is compared against the time its turns would usually take — each turn's new (or generated) tokens over that turn's own bucket median, summed, over the same turns' time — so a long prompt is not judged at its final depth; it is dim grey when the turns with a reference hold under half its new (or generated) tokens. Prefill is compared only for turns with `pn` ≥ 256 (smaller prefills are dominated by fixed overhead) and decode only for `tn` ≥ 20; anything not compared (below those cutoffs or fewer than three qualifying turns in the bucket) is dim grey, never the default terminal colour. In the bucket tables, the presets with 3+ turns in a column are ranked fastest first and grouped into near-tie clusters (a cell stays in a cluster while within 5% of that cluster's fastest value), and every cell in a cluster takes the colour its fastest member would get by rank: the fastest clusters are green, the slowest red, the middle yellow; cells with fewer turns and `-` cells are dim grey, and a column with a single ranked preset is plain.
 
 ### Where every figure comes from
 llmtop shows what it can measure or read, and marks what it derives. It never states a cause: where a number needs interpreting, the page prints the numbers and the threshold, not an explanation.
@@ -77,6 +93,8 @@ llmtop shows what it can measure or read, and marks what it derives. It never st
 | :--- | :--- | :--- |
 | VRAM resident, shared and committed per process; GPU engine load | PDH counters `GPU Process Memory`, `GPU Engine` | measured |
 | VRAM capacity and the OS budget | DXGI `DedicatedVideoMemory` and `QueryVideoMemoryInfo`; the budget is reported for the calling process (llmtop), so llama-server's own may differ | measured |
+| CPU load (total and per logical processor), effective clock, processor queue length | PDH counters `Processor Information` (`% Processor Utility`, `% Processor Performance`, `Processor Frequency`), `System\Processor Queue Length` | measured |
+| CPU model name, core and thread counts (with P/E split), L1/L2/L3 cache topology | registry `CentralProcessor\0`, `GetLogicalProcessorInformationEx` (`RelationProcessorCore`, `RelationCache`) | measured |
 | System RAM, file cache, free, modified, page-ins and page-outs | PDH `Memory` counters, `GlobalMemoryStatusEx` | measured |
 | Page file size, use and peak | the kernel's page file table (`NtQuerySystemInformation`) | measured |
 | Page file configured sizes and the commit maximum | registry `PagingFiles` | configuration |
@@ -85,8 +103,8 @@ llmtop shows what it can measure or read, and marks what it derives. It never st
 | Slot state, token counts, prompt progress, sampler settings | router `/slots` | measured |
 | Live prefill and decode t/s | change in the `/slots` counters between polls | derived by arithmetic |
 | ETA | remaining prompt tokens divided by the rate over the last batch | derived estimate |
-| Request timings, draft acceptance, prefix similarity, slot pick | llama-server log lines, kept in `requests.jsonl` because llama-server rewrites a preset's log each time that model loads | reported by llama.cpp |
-| Cached tokens per request | tokens in the slot at release, minus generated, minus newly evaluated | derived (within a token) |
+| Turn timings, draft acceptance, prefix similarity, kept share (`f_keep`), slot id and pick | llama-server log lines, kept in `requests.jsonl` because llama-server rewrites a preset's log each time that model loads | reported by llama.cpp |
+| Cached tokens per turn | tokens in the slot at release, minus generated, minus newly evaluated | derived (within a token) |
 | Model structure, tensor names, shapes, types and sizes | the GGUF header | read from the file |
 | Flags of each preset | router `/models` status arguments | read from the router |
 | Value of a flag the preset does not set | `llama-server --help`, which states each default | read from the runtime; if it cannot be read, a labelled assumption |
@@ -98,8 +116,7 @@ llmtop shows what it can measure or read, and marks what it derives. It never st
 | Shared memory when the model became resident | the lowest shared figure of the llama-server process while resident VRAM is at least 90% of the projected rows | measured, per process |
 | CPU-side buffer baseline | the lowest shared GPU memory seen on an earlier load of the same configuration while resident plus shared memory was at least 1 GiB under the budget; until then llama.cpp's host projection, labelled unverified | measured or projected |
 | Alerts | thresholds applied to the figures above | thresholds in `CFG`; messages state values |
-| Colour of t/s | this preset's median for requests of similar size | derived |
-| Effect table (Requests) | decode t/s of requests grouped by the shared-memory excess and the other-process GPU load recorded while each ran | derived, a correlation |
+| Colour of t/s | this preset's median for turns at a similar context depth (`<8k`, `8–32k`, `32–64k`, `64k+`); a prompt is compared against the usual time of its turns, turn by turn | derived |
 
 Some lines are deductions from those figures; each says so and gives its basis:
 
@@ -129,7 +146,7 @@ Two baselines are shown against the shared figure, because neither alone settles
 The page also states what share of all processes' shared GPU memory belongs to llama-server. A **demotion** is reported (critical) only when it is observed: shared memory rose and resident VRAM fell by at least half as much within the window. Growth of shared memory without that exchange, or shared memory above a baseline while VRAM is near the budget, is a warning, never a conclusion. The OS budget is the DXGI figure for llmtop itself; Microsoft documents it as the amount of video memory the process can use before the video memory manager may demote its allocations.
 
 ### Alerts
-Each rule holds while its condition is true and clears after 10 s of quiet. Every threshold is in `CFG` in `llmtop_lib/state.py` and can be set with `--threshold NAME=VALUE`. Six of them scale with the machine unless set: `avail_warn` = the smaller of 4 GiB and 7% of installed RAM, `avail_crit` = 2 GiB or 3.5%, `commit_warn` = 8 GiB or 10% of the commit limit at the page file's configured maximum, `commit_crit` = 3 GiB or 4% of it, `near_budget_mib` = 512 MiB or 3% of the VRAM budget, `idle_headroom_mib` = 1 GiB or 6% of it; the table shows those caps. Messages state the counter values; none states a cause.
+Each rule holds while its condition is true and clears after 10 s of quiet. Every threshold is in `CFG` in `llmtop_lib/state.py` and can be set with `--threshold NAME=VALUE` (including `prompt_gap_s`, `30` s, for grouping turns into prompts). Six of them scale with the machine unless set: `avail_warn` = the smaller of 4 GiB and 7% of installed RAM, `avail_crit` = 2 GiB or 3.5%, `commit_warn` = 8 GiB or 10% of the commit limit at the page file's configured maximum, `commit_crit` = 3 GiB or 4% of it, `near_budget_mib` = 512 MiB or 3% of the VRAM budget, `idle_headroom_mib` = 1 GiB or 6% of it; the table shows those caps. Messages state the counter values; none states a cause.
 
 | Alert | Level | Condition (threshold name) |
 | :--- | :--- | :--- |
@@ -144,7 +161,6 @@ Each rule holds while its condition is true and clears after 10 s of quiet. Ever
 | available RAM | warn / crit | below `avail_warn` (4 GiB) / `avail_crit` (2 GiB) |
 | commit headroom | info / warn / crit | against the current limit below `commit_warn` (8 GiB): info; against the limit at the page file's configured maximum below `commit_warn` / `commit_crit` (3 GiB) |
 | page file use | warn | a page file is ≥ `pagefile_pct` (50%) used |
-| hard page faults | warn | system-wide Pages Input/sec ≥ `pagein_warn` (300) |
 | working set fell | warn / info | llama-server working set fell by ≥ `ws_drop_mib` (1 GiB) within 10 s; info when commit fell with it, warn when commit stayed |
 | router / exit | crit | router unreachable; a model process exited non-zero |
 
@@ -164,7 +180,7 @@ With `--check`, `win-llmtop` exits `0` when the server is reachable and either G
 | `llmtop.py` | Entry point, key handling, `--once`, `--plan` |
 | `llmtop_lib/win.py` | PDH counters, DXGI budget, process and system memory, address-space walk, page files (ctypes) |
 | `llmtop_lib/model.py` | GGUF reader, placement and its reasons, KV and state estimates, tensor roster, `llama-fit-params` wrapper |
-| `llmtop_lib/log.py` | Request assembler, log tailing, router events, session start times |
+| `llmtop_lib/log.py`, `prompts.py` | Request assembler, log tailing, router events, session start times, and prompt grouping |
 | `llmtop_lib/state.py` | Collector, time series, persistence, alert rules |
 | `llmtop_lib/ui.py`, `pages.py` | Drawing primitives and the six pages |
 | `%LOCALAPPDATA%\win-llmtop\` (the state folder, `--state-dir`) | `samples-*.jsonl`, `requests.jsonl`, `calibration.json` |
@@ -173,6 +189,7 @@ With `--check`, `win-llmtop` exits `0` when the server is reachable and either G
 - Which allocation or tensor is in shared GPU memory cannot be told from the counters; only how much.
 - The OS budget comes from DXGI for llmtop's own process. llama-server's budget may differ.
 - GPU temperature and power are not exposed by Windows' counters and are not shown.
+- CPU cache hit and miss rates are not shown because Windows provides them only through hardware performance counters that need administrator rights.
 - The address-space walk shows what kind of memory the process holds, not which allocation is the prompt cache or a checkpoint: the llama-server log carries no cache sizes at its default verbosity, so no checkpoint or cache size is shown, only the configured limits.
 - Prefill progress advances once per batch (`--batch-size`), so the live prefill rate is the rate over the last completed batch.
 - KV and state figures are derived. They were checked against `llama-fit-params` on a hybrid model and a sliding-window mixture-of-experts model; on any architecture the Memory page reports whether they agree.

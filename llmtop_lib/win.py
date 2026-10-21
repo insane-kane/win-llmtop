@@ -13,6 +13,7 @@ import re
 import uuid
 
 MIB = 2**20
+NAN = float("nan")
 WIN = os.name == "nt"
 IS_64 = ctypes.sizeof(ctypes.c_void_p) == 8
 PDH_FMT_DOUBLE = 0x200
@@ -23,6 +24,8 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_READ = 0x0010
 PROCESS_COMMAND_LINE_INFORMATION = 60
+RELATION_PROCESSOR_CORE = 0
+RELATION_CACHE = 2
 STD_OUTPUT_HANDLE = wt.DWORD(-11).value
 ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 EPOCH_AS_FILETIME = 116444736000000000
@@ -45,6 +48,11 @@ PATHS = {
 	"free": r"\Memory\Free & Zero Page List Bytes",
 	"modified": r"\Memory\Modified Page List Bytes",
 	"pagefile": r"\Paging File(_Total)\% Usage",
+	"cpu_util": r"\Processor Information(_Total)\% Processor Utility",
+	"cpu_core": r"\Processor Information(*)\% Processor Utility",
+	"cpu_perf": r"\Processor Information(_Total)\% Processor Performance",
+	"cpu_mhz_base": r"\Processor Information(_Total)\Processor Frequency",
+	"cpu_queue": r"\System\Processor Queue Length",
 }
 RE_PID = re.compile(r"pid_(\d+)_luid_0x([0-9A-Fa-f]+)_0x([0-9A-Fa-f]+)", re.I)
 RE_LUID = re.compile(r"luid_0x([0-9A-Fa-f]+)_0x([0-9A-Fa-f]+)", re.I)
@@ -53,6 +61,17 @@ RE_ENG = re.compile(r"pid_(\d+)_luid_0x([0-9A-Fa-f]+)_0x([0-9A-Fa-f]+).*engtype_
 
 def _fmt_luid(hi, lo):
 	return "0x%08X_0x%08X" % (int(hi, 16), int(lo, 16))
+
+
+def _cpu_cores(raw):
+	"""Per-logical-processor % values from a `\\Processor Information(*)\\% Processor Utility` read, ordered by (group, processor) and dropping `_Total`."""
+	cores = []
+	for name, val in raw.items():
+		parts = name.split(",")
+		if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+			cores.append((int(parts[0]), int(parts[1]), val))
+	cores.sort(key=lambda x: (x[0], x[1]))
+	return [x[2] for x in cores]
 
 
 class _Val(ctypes.Structure):
@@ -154,9 +173,12 @@ class Counters:
 				el = procs_by_luid.setdefault(pid, {}).setdefault(luid, new())["eng"]
 				el[eng] = min(100.0, el.get(eng, 0.0) + v)
 		one = lambda k: next(iter(self.q.read(k).values()), 0.0)
+		one_nan = lambda k: next(iter(self.q.read(k).values()), NAN)
 		return {"procs": procs, "procs_by_luid": procs_by_luid, "adapters": adapters, "sys": {
 			"pages_in": one("pages_in"), "pages_out": one("pages_out"), "standby": (one("standby") + one("standby_core") + one("standby_res")) / MIB, "free": one("free") / MIB,
-			"modified": one("modified") / MIB, "pagefile_pct": one("pagefile")}}
+			"modified": one("modified") / MIB, "pagefile_pct": one("pagefile"),
+			"cpu": one_nan("cpu_util"), "cpu_mhz": one_nan("cpu_mhz_base") * one_nan("cpu_perf") / 100.0,
+			"cpu_queue": one_nan("cpu_queue"), "cpu_cores": _cpu_cores(self.q.read("cpu_core"))}}
 
 
 # ---- DXGI: the VRAM budget ---------------------------------------------------------------------------------------
@@ -278,6 +300,23 @@ class _Mbi(ctypes.Structure):
 		("state", wt.DWORD), ("protect", wt.DWORD), ("type", wt.DWORD), ("pad2", wt.DWORD)]
 
 
+class _GroupAffinity(ctypes.Structure):
+	_fields_ = [("mask", ctypes.c_size_t), ("group", wt.WORD), ("reserved", wt.WORD * 3)]
+
+
+class _ProcRel(ctypes.Structure):
+	_fields_ = [("flags", wt.BYTE), ("efficiency_class", wt.BYTE), ("reserved", wt.BYTE * 20), ("group_count", wt.WORD), ("group_mask", _GroupAffinity * 1)]
+
+
+class _CacheRel(ctypes.Structure):
+	_fields_ = [("level", wt.BYTE), ("associativity", wt.BYTE), ("line_size", wt.WORD), ("cache_size", wt.DWORD), ("type", ctypes.c_int),
+		("reserved", wt.BYTE * 18), ("group_count", wt.WORD), ("group_mask", _GroupAffinity * 1)]
+
+
+class _ProcInfoHdr(ctypes.Structure):
+	_fields_ = [("relationship", ctypes.c_int), ("size", wt.DWORD)]
+
+
 _PMC_EX2_SIZE = ctypes.sizeof(_Pmc)
 _PMC_EX_SIZE = _Pmc.private_ws.offset
 _pmc_cb = _PMC_EX2_SIZE
@@ -308,6 +347,8 @@ if WIN:
 	_k32.GlobalMemoryStatusEx.restype = wt.BOOL
 	_k32.GetSystemInfo.argtypes = [ctypes.POINTER(_SysInfo)]
 	_k32.GetSystemInfo.restype = None
+	_k32.GetLogicalProcessorInformationEx.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(wt.DWORD)]
+	_k32.GetLogicalProcessorInformationEx.restype = wt.BOOL
 	_k32.QueryDosDeviceW.argtypes = [wt.LPCWSTR, wt.LPWSTR, wt.DWORD]
 	_k32.QueryDosDeviceW.restype = wt.DWORD
 	_k32.VirtualQueryEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.POINTER(_Mbi), ctypes.c_size_t]
@@ -602,3 +643,100 @@ def working_sets(procs):
 			total += pmc.ws / MIB
 		_k32.CloseHandle(h)
 	return by, total
+
+
+# ---- CPU static topology ------------------------------------------------------------------------------------------
+
+_CACHE_TYPES = {0: "u", 1: "i", 2: "d", 3: "t", "u": "u", "i": "i", "d": "d", "t": "t", "unified": "u", "instruction": "i", "data": "d", "trace": "t", "": "u"}
+_CACHE_ORDER = {"d": 0, "i": 1, "u": 2, "t": 3}
+
+
+def _split_cores(records):
+	"""(cores, threads, p_cores, e_cores) from RelationProcessorCore records."""
+	if not records:
+		return 0, 0, 0, 0
+	parsed = [
+		(r.get("efficiency_class", r.get("eff", 0)), r.get("threads", r["mask"].bit_count() if "mask" in r else 1))
+		if isinstance(r, dict) else (r[0], r[1])
+		for r in records
+	]
+	cores = len(parsed)
+	threads = sum(t for _, t in parsed)
+	classes = {e for e, _ in parsed}
+	if len(classes) <= 1:
+		return cores, threads, cores, 0
+	hi = max(classes)
+	p_cores = sum(1 for e, _ in parsed if e == hi)
+	return cores, threads, p_cores, cores - p_cores
+
+
+def _group_caches(records):
+	"""Group RelationCache records by (level, type) into [{'level', 'type', 'size', 'line', 'count', 'shared'}]."""
+	groups = {}
+	for r in records:
+		lvl = int(r["level"])
+		raw_t = r.get("type", 0)
+		ctype = _CACHE_TYPES.get(raw_t.lower() if isinstance(raw_t, str) else raw_t, str(raw_t))
+		sh = r.get("shared", r["mask"].bit_count() if "mask" in r else 0)
+		key = (lvl, ctype)
+		g = groups.get(key)
+		if g is None:
+			groups[key] = {"level": lvl, "type": ctype, "size": int(r["size"]), "line": int(r.get("line", 64)), "count": 1, "shared": int(sh)}
+		else:
+			g["count"] += 1
+	return [groups[k] for k in sorted(groups, key=lambda k: (k[0], _CACHE_ORDER.get(k[1], 9), k[1]))]
+
+
+def _proc_info_ex(rel_type):
+	n = wt.DWORD(0)
+	_k32.GetLogicalProcessorInformationEx(rel_type, None, ctypes.byref(n))
+	if not n.value:
+		err = ctypes.get_last_error()
+		raise OSError(err, ctypes.FormatError(err).strip() if err else "GetLogicalProcessorInformationEx failed")
+	buf = ctypes.create_string_buffer(n.value)
+	if not _k32.GetLogicalProcessorInformationEx(rel_type, buf, ctypes.byref(n)):
+		err = ctypes.get_last_error()
+		raise OSError(err, ctypes.FormatError(err).strip() if err else "GetLogicalProcessorInformationEx failed")
+	return buf, n.value
+
+
+def cpu_info():
+	"""Static CPU topology from the registry and GetLogicalProcessorInformationEx:
+	{'name', 'cores', 'threads', 'p_cores', 'e_cores', 'caches': [{'level', 'type', 'size', 'line', 'count', 'shared'}], 'error'}."""
+	empty = {"name": "", "cores": 0, "threads": 0, "p_cores": 0, "e_cores": 0, "caches": [], "error": None}
+	if not WIN:
+		return dict(empty, error="not Windows")
+	try:
+		import winreg
+
+		with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+			name = str(winreg.QueryValueEx(k, "ProcessorNameString")[0]).strip()
+		buf, total = _proc_info_ex(RELATION_PROCESSOR_CORE)
+		core_recs, off = [], 0
+		while off < total:
+			hdr = _ProcInfoHdr.from_buffer(buf, off)
+			if hdr.size <= 0:
+				break
+			if hdr.relationship == RELATION_PROCESSOR_CORE:
+				p = _ProcRel.from_buffer(buf, off + 8)
+				cnt = p.group_count or 1
+				thr = sum(_GroupAffinity.from_buffer(buf, off + 32 + i * 16).mask.bit_count() for i in range(cnt))
+				core_recs.append({"efficiency_class": p.efficiency_class, "threads": thr})
+			off += hdr.size
+		cores, threads, p_cores, e_cores = _split_cores(core_recs)
+		buf, total = _proc_info_ex(RELATION_CACHE)
+		cache_recs, off = [], 0
+		while off < total:
+			hdr = _ProcInfoHdr.from_buffer(buf, off)
+			if hdr.size <= 0:
+				break
+			if hdr.relationship == RELATION_CACHE:
+				c = _CacheRel.from_buffer(buf, off + 8)
+				cnt = c.group_count or 1
+				sh = sum(_GroupAffinity.from_buffer(buf, off + 40 + i * 16).mask.bit_count() for i in range(cnt))
+				cache_recs.append({"level": c.level, "type": c.type, "size": c.cache_size, "line": c.line_size, "shared": sh})
+			off += hdr.size
+		return {"name": name, "cores": cores, "threads": threads, "p_cores": p_cores, "e_cores": e_cores,
+			"caches": _group_caches(cache_recs), "error": None}
+	except Exception as e:
+		return dict(empty, error=str(e) or type(e).__name__)

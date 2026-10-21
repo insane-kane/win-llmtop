@@ -95,14 +95,14 @@ def test_requests_subtitle_per_preset_cutoffs():
 	assert "per preset" in text, text
 	assert "m 32+/20+" in text, text
 	assert "n 1,000+/50+" in text, text
-	assert "32+ new tokens" in text and "20+ tokens" in text, text
+	assert "32+ new tokens" in text and "decode over 20+" in text, text
 
 
 def test_requests_subtitle_single_cutoff():
 	c = collector([req(preset="m", pn=2000, pp=500.0, tn=100, tg=30.0)], cfg=dict(CFG))
 	text = "\n".join(plain_requests(c))
 	assert "per preset" not in text, text
-	assert "1,000+ new tokens" in text and "50+ tokens" in text, text
+	assert "1,000+ new tokens" in text and "decode over 50+" in text, text
 
 
 def test_requests_empty_message():
@@ -117,7 +117,7 @@ def test_speed_table_no_labels_when_cutoffs_match():
 	c = collector([req(preset="alpha", pn=2000, pp=500.0, tn=100, tg=30.0), req(preset="beta", pn=3000, pp=600.0, tn=200, tg=40.0)], cfg=dict(CFG))
 	lines = plain_requests(c)
 	sub = next(ln for ln in lines if "speed, t/s" in ln)
-	assert "1,000+ new tokens" in sub and "50+ tokens" in sub and "per preset" not in sub, sub
+	assert "1,000+ new tokens" in sub and "decode over 50+" in sub and "per preset" not in sub, sub
 	assert "1,000+/50+" not in "\n".join(lines), lines
 
 
@@ -188,8 +188,7 @@ def test_slot_error_replaces_waiting_text():
 def test_pm_error_shows_unavailable_not_zero():
 	rm = {"total": 32768.0, "avail": 8192.0, "commit": 4096.0, "commit_max": 24576.0, "pagefiles": [], "standby": 2048.0, "free": 4096.0, "pages_in": 0.0, "pages_out": 0.0}
 	ll = {"present": True, "ws": 0.0, "commit": 0.0, "cpu": 0.0, "pm_error": "access denied"}
-	cfg = dict(CFG, pagein_warn=100.0)
-	text = "\n".join(plain(pages.ram_block(collector([], cfg=cfg), {"t": 1000.0, "ram": rm, "llama": ll}, pages.View(), 120, 2)))
+	text = "\n".join(plain(pages.ram_block(collector([]), {"t": 1000.0, "ram": rm, "llama": ll}, pages.View(), 120, 2)))
 	assert "unavailable (access denied)" in text, text
 	assert "0.0 GiB" not in text, text
 
@@ -219,6 +218,173 @@ def test_header_mode_none_server_down_says_not_found():
 	assert "● server not found" in line, line
 
 
+def test_requests_v2_colours_notes_and_nested_turns():
+	assert pages.rel(float("nan"), 100.0) == pages.C.grey
+	assert pages.rel(100.0, float("nan")) == pages.C.grey
+	assert pages.rel(100.0, 0.0) == pages.C.grey
+	assert pages.rel(125.0, 100.0) == pages.C.bcyan  # a turn far faster than usual is blue, not green
+	assert pages.rel(100.0, 100.0) == pages.C.bgreen
+	assert pages.rel(80.0, 100.0) == pages.C.bgreen
+	assert pages.rel(60.0, 100.0) == pages.C.byellow
+	assert pages.rel(40.0, 100.0) == pages.C.bred
+
+	r1 = dict(req(preset="alpha", pn=500, pp=400.0, tn=40, tg=50.0, wall=1000.0), slot=0, cached=2000, kv=2540, sel="LRU", evicted=12000, trunc=True, reallocs=1, spill=1500.0)
+	r2 = dict(req(preset="alpha", pn=300, pp=420.0, tn=30, tg=52.0, wall=1005.0), slot=0, cached=2540, kv=2870, sel="LCP", sim=0.9, keep=1.0)
+	c = collector([r1, r2], cfg=dict(CFG))
+	c.allow, c.allow_known = 271.2, True
+	snap = {"t": 2000.0}
+	view = pages.View()
+	collapsed = plain(pages.requests(c, snap, view, 200, 80))
+	text = "\n".join(collapsed)
+	assert "1 prompts · 2 turns · all presets   (m: preset  t: turns)" in text, text
+	assert "cache reset 12k" in text and "cut off" in text and "shared +1.2 GiB" in text and "resized" in text, text
+	assert "LCP" not in text, text
+	assert "slowest prefills" not in text, text
+	assert "1 cache reset · 1 cut off" in text, text
+
+	view.turns = True
+	expanded = plain(pages.requests(c, snap, view, 200, 80))
+	exp_text = "\n".join(expanded)
+	assert any("  · " in ln for ln in expanded), exp_text
+	assert any("  └ " in ln for ln in expanded), exp_text
+
+	recent = plain(pages.recent_requests(c, snap, view, 140, 10))
+	rec_text = "\n".join(recent)
+	assert "recent turns" in rec_text, rec_text
+	assert any("▸ " in ln for ln in recent), rec_text
+
+
+def test_prompt_and_turn_rows_have_hit_and_draft():
+	r1 = dict(req(preset="alpha", pn=500, pp=400.0, tn=40, tg=50.0, wall=1000.0), slot=0, cached=2000, kv=2540, acc=0.88, dacc=308, dgen=350)
+	r2 = dict(req(preset="alpha", pn=300, pp=420.0, tn=30, tg=52.0, wall=1005.0), slot=0, cached=2540, kv=2870, acc=0.91, dacc=30, dgen=33)
+	c = collector([r1, r2], cfg=dict(CFG))
+	snap = {"t": 2000.0}
+	view = pages.View()
+	st = pages.bucket_stats(c, view, snap)
+	ps = pages.prompt_groups(c, view, snap)[0]
+	pw, drop, _notes = pages.prompt_layout(200, ["alpha"], True)
+	pr = plain([pages.prompt_row(c, ps[0], st, True, pw=pw, drop=drop)])[0]
+	tr = plain([pages.turn_row(c, r1, st, True, "  · ", True, pw=pw, drop=drop, nested=True)])[0]
+	# prompt: hit = 4540 / 5340, draft = 338 / 383; turn: hit = 2000 / 2500, draft = 0.88
+	assert "85%" in pr and "88%" in pr, pr
+	assert "80%" in tr and "88%" in tr, tr
+	assert "alpha" in pr and "alpha" not in tr, (pr, tr)  # the nested turn's preset cell is blank; the prompt row names it
+
+
+def test_requests_fit_width_100():
+	r1 = dict(req(preset="alpha", pn=500, pp=400.0, tn=40, tg=50.0, wall=1000.0), slot=0, cached=2000, kv=2540, acc=0.88)
+	r2 = dict(req(preset="alpha", pn=300, pp=420.0, tn=30, tg=52.0, wall=1005.0), slot=0, cached=2540, kv=2870, acc=0.91)
+	c = collector([r1, r2], cfg=dict(CFG))
+	view = pages.View()
+	view.turns = True
+	lines = plain(pages.requests(c, {"t": 2000.0}, view, 100, 80))
+	i = next(i for i, ln in enumerate(lines) if "every prompt" in ln)
+	tab = lines[i + 2:]  # the legend, then the header and the rows
+	header = tab[0]
+	assert "prefill" in header and "decode" in header and "hit" in header and "draft" in header, header
+	assert "cached" not in header and "gen" not in header, header  # the narrowest columns are dropped first
+	for ln in tab:
+		assert len(ln) <= 100, ln
+
+
+def test_by_context_tables_ranked_colours():
+	# three turns per preset in the same column: with two ranked presets the fastest is green and the slowest red
+	rs = []
+	for i in range(3):
+		rs.append(dict(req(preset="alpha", pn=500, pp=150.0, tn=40, tg=30.0, wall=1000.0 + i), slot=0, cached=1000, kv=1540))
+		rs.append(dict(req(preset="beta", pn=500, pp=200.0, tn=40, tg=40.0, wall=1000.0 + i), slot=1, cached=1000, kv=1540))
+	c = collector(rs, cfg=dict(CFG))
+	lines = pages.requests(c, {"t": 2000.0}, pages.View(), 200, 60)
+	i = next(i for i, ln in enumerate(lines) if "prefill t/s by context" in ln)
+	j = next(j for j, ln in enumerate(lines) if "decode t/s by context" in ln)
+	k = next(k for k, ln in enumerate(lines) if "per turn" in ln)
+	assert "green fastest · red slowest in each column" in lines[i] and "green fastest · red slowest in each column" in lines[j], (lines[i], lines[j])
+	pre = "".join(lines[i + 2:j])  # the column header row, then one row per preset
+	dec = "".join(lines[j + 2:k])
+	assert pages.C.bgreen in pre and pages.C.bgreen in dec, (pre, dec)  # beta is the fastest of the two
+	assert pages.C.bred in pre and pages.C.bred in dec, (pre, dec)  # alpha is the slowest of the two
+	assert pages.C.bold not in pre and pages.C.bold not in dec, (pre, dec)
+
+
+def test_effect_section_removed():
+	c = collector([req(preset="alpha", pn=500, pp=400.0, tn=40, tg=50.0, wall=1000.0), req(preset="alpha", pn=300, pp=420.0, tn=30, tg=52.0, wall=1005.0)], cfg=dict(CFG))
+	text = "\n".join(plain_requests(c))
+	assert "effect of shared GPU memory" not in text, text
+	assert not hasattr(pages, "rival_of") and not hasattr(pages, "effect_lines")
+	assert hasattr(pages, "spill_of")  # the notes and the per-turn graph still use it
+
+
+def test_rank_colours():
+	nan = float("nan")
+	# n = 1: the only ranked preset is plain (there is nothing to compare it to)
+	assert pages.rank_colours([(100.0, 3)]) == [""]
+	# n = 2: k = 1, fastest green, slowest red
+	assert pages.rank_colours([(100.0, 3), (50.0, 3)]) == [pages.C.bgreen, pages.C.bred]
+	# n = 3: top green, bottom red, middle yellow
+	assert pages.rank_colours([(100.0, 3), (70.0, 3), (40.0, 3)]) == [pages.C.bgreen, pages.C.byellow, pages.C.bred]
+	# n = 5: k = 2, top two green, bottom two red, middle yellow
+	assert pages.rank_colours([(100.0, 3), (80.0, 3), (60.0, 3), (40.0, 3), (20.0, 3)]) == [pages.C.bgreen, pages.C.bgreen, pages.C.byellow, pages.C.bred, pages.C.bred]
+	# n = 6: k = 2, top two green, bottom two red, middle two yellow
+	assert pages.rank_colours([(100.0, 3), (85.0, 3), (70.0, 3), (55.0, 3), (40.0, 3), (25.0, 3)]) == [pages.C.bgreen, pages.C.bgreen, pages.C.byellow, pages.C.byellow, pages.C.bred, pages.C.bred]
+	# a near-tie: within 5% of the fastest is green whatever its rank (611, 613, 600 are all green)
+	assert pages.rank_colours([(611.0, 3), (613.0, 3), (600.0, 3)]) == [pages.C.bgreen, pages.C.bgreen, pages.C.bgreen]
+	# near-ties share a colour: 487 is within 5% of 489, so both land in the fastest cluster and both come out green
+	assert pages.rank_colours([(489.0, 3), (487.0, 3)]) == [pages.C.bgreen, pages.C.bgreen]
+	# 613/611/600 are one near-tie cluster under a 1239 best: all three take the cluster's (2nd) rank colour, all yellow
+	assert pages.rank_colours([(613.0, 3), (611.0, 3), (600.0, 3), (1239.0, 3)]) == [pages.C.byellow, pages.C.byellow, pages.C.byellow, pages.C.bgreen]
+	# cells with fewer than 3 turns stay grey, whatever their value, and an empty cell is grey
+	assert pages.rank_colours([(100.0, 3), (50.0, 3), (90.0, 2), (80.0, 1)]) == [pages.C.bgreen, pages.C.bred, pages.C.grey, pages.C.grey]
+	assert pages.rank_colours([(100.0, 3), (nan, 0)]) == ["", pages.C.grey]
+
+
+def test_prompt_table_has_no_cached_column():
+	r1 = dict(req(preset="alpha", pn=500, pp=400.0, tn=40, tg=50.0, wall=1000.0), slot=0, cached=2000, kv=2540, acc=0.88)
+	c = collector([r1], cfg=dict(CFG))
+	view = pages.View()
+	lines = plain(pages.requests(c, {"t": 2000.0}, view, 200, 80))
+	i = next(i for i, ln in enumerate(lines) if "every prompt" in ln)
+	header = lines[i + 2]  # the legend, then the header
+	assert "cached" not in header, header
+	assert "context" in header and "new" in header and "hit" in header, header
+
+
+def test_prompt_row_compared_turn_by_turn():
+	# a prompt of two turns, each exactly at its own bucket median but at different depths: the turn-by-turn
+	# comparison is 1.0 (green), not the blue the old final-depth comparison would give
+	a = dict(req(preset="alpha", pn=500, pp=400.0, tn=40, tg=50.0, wall=1000.0), slot=0, cached=0, kv=540)
+	b = dict(req(preset="alpha", pn=500, pp=200.0, tn=40, tg=50.0, wall=1005.0), slot=0, cached=9000, kv=9540)
+	# filler turns on other slots so each bucket has a 3+ turn median: 400 (<8k) and 200 (8-32k)
+	f1 = dict(req(preset="alpha", pn=500, pp=400.0, tn=40, tg=50.0, wall=0.0), slot=1, cached=0, kv=540)
+	f2 = dict(req(preset="alpha", pn=500, pp=400.0, tn=40, tg=50.0, wall=1.0), slot=1, cached=0, kv=540)
+	f3 = dict(req(preset="alpha", pn=500, pp=200.0, tn=40, tg=50.0, wall=2.0), slot=2, cached=9000, kv=9540)
+	f4 = dict(req(preset="alpha", pn=500, pp=200.0, tn=40, tg=50.0, wall=3.0), slot=2, cached=9000, kv=9540)
+	c = collector([a, b, f1, f2, f3, f4], cfg=dict(CFG))
+	snap = {"t": 2000.0}
+	view = pages.View()
+	st = pages.bucket_stats(c, view, snap)
+	ps = pages.prompt_groups(c, view, snap)[0]
+	p = next(p for p in ps if p["turns"][0] is a)  # the two-turn prompt
+	pw, drop, _notes = pages.prompt_layout(200, ["alpha"], True)
+	line = pages.prompt_row(c, p, st, True, pw=pw, drop=drop)
+	assert pages.C.bgreen in line, line
+	assert pages.C.bcyan not in line, line  # not blue: each turn is at its own bucket median
+
+
+def test_live_shows_recent_prompts_when_toggled():
+	r1 = dict(req(preset="alpha", pn=500, pp=400.0, tn=40, tg=50.0, wall=1000.0), slot=0, cached=2000, kv=2540)
+	r2 = dict(req(preset="alpha", pn=300, pp=420.0, tn=30, tg=52.0, wall=1005.0), slot=0, cached=2540, kv=2870)
+	c = collector([r1, r2], cfg=dict(CFG))
+	snap = live_snap([])
+	view = pages.View()
+	base = plain(pages.live(c, snap, view, 120, 40))
+	assert any("recent turns" in ln for ln in base), base
+	assert not any("recent prompts" in ln for ln in base), base
+	view.live_prompts = True
+	toggled = plain(pages.live(c, snap, view, 120, 40))
+	assert any("recent prompts" in ln for ln in toggled), toggled
+	assert not any("recent turns" in ln for ln in toggled), toggled
+
+
 CASES = [
 	("summary_short_requests_fall_back", test_summary_short_requests_fall_back),
 	("summary_long_cutoffs_when_reached", test_summary_long_cutoffs_when_reached),
@@ -240,6 +406,15 @@ CASES = [
 	("vm_error_replaces_walk_text", test_vm_error_replaces_walk_text),
 	("uma_vram_bar_scales_against_budget", test_uma_vram_bar_scales_against_budget),
 	("header_mode_none_server_down_says_not_found", test_header_mode_none_server_down_says_not_found),
+	("requests_v2_colours_notes_and_nested_turns", test_requests_v2_colours_notes_and_nested_turns),
+	("prompt_and_turn_rows_have_hit_and_draft", test_prompt_and_turn_rows_have_hit_and_draft),
+	("requests_fit_width_100", test_requests_fit_width_100),
+	("by_context_tables_ranked_colours", test_by_context_tables_ranked_colours),
+	("effect_section_removed", test_effect_section_removed),
+	("rank_colours", test_rank_colours),
+	("prompt_table_has_no_cached_column", test_prompt_table_has_no_cached_column),
+	("prompt_row_compared_turn_by_turn", test_prompt_row_compared_turn_by_turn),
+	("live_shows_recent_prompts_when_toggled", test_live_shows_recent_prompts_when_toggled),
 ]
 
 

@@ -79,9 +79,9 @@ def make_demo_state():
 		(t_now - 1100, t_now - 1080),
 		(t_now - 650, t_now - 635),
 		(t_now - 326, t_now - 320),
-		(t_now - 215, t_now - 210),
-		(t_now - 122, t_now - 110),
-		(t_now - 43, t_now - 35),
+		(t_now - 288, t_now - 283),
+		(t_now - 273, t_now - 256),
+		(t_now - 246, t_now - 237),
 		(t_now - 14, t_now),
 	]
 
@@ -100,6 +100,7 @@ def make_demo_state():
 			rings["llama_ws"].put(sec, 0.0)
 			rings["ram_avail"].put(sec, max(0.0, min(65536.0, 54200.0 + rng.uniform(-5.0, 5.0))))
 			rings["pages_in"].put(sec, 0.0)
+			rings["cpu"].put(sec, rng.uniform(4.0, 8.0))
 			rings["dec"].put(sec, float("nan"))
 			rings["pre"].put(sec, float("nan"))
 			rings["ctx"].put(sec, 0.0)
@@ -112,6 +113,7 @@ def make_demo_state():
 			rings["ram_avail"].put(sec, max(0.0, min(65536.0, 43520.0 + rng.uniform(-5.0, 5.0))))
 			rings["pages_in"].put(sec, 1.0)
 			rings["gpu_llama"].put(sec, max(0.0, min(100.0, 85.0 + rng.uniform(-1.0, 1.0))))
+			rings["cpu"].put(sec, rng.uniform(45.0, 65.0))
 			rings["dec"].put(sec, float("nan"))
 			rings["pre"].put(sec, float("nan"))
 			rings["ctx"].put(sec, 0.0)
@@ -130,12 +132,14 @@ def make_demo_state():
 				rings["dec"].put(sec, max(0.0, 45.2 + rng.uniform(-0.3, 0.3)))
 				rings["pre"].put(sec, max(0.0, 480.0 + rng.uniform(-3.0, 3.0)) if sec == t_start else float("nan"))
 				rings["ctx"].put(sec, max(0.0, min(32768.0, 2450.0 + (sec - t_start) * 45.0)))
+				rings["cpu"].put(sec, max(0.0, min(100.0, 24.0 + rng.uniform(-2.0, 4.0))))
 			else:
 				rings["busy"].put(sec, 0.0)
 				rings["gpu_llama"].put(sec, max(0.0, min(100.0, rng.uniform(0.0, 0.8))))
 				rings["dec"].put(sec, float("nan"))
 				rings["pre"].put(sec, float("nan"))
 				rings["ctx"].put(sec, 2450.0)
+				rings["cpu"].put(sec, max(0.0, min(100.0, 16.0 + rng.uniform(-3.0, 4.0))))
 
 	requests = [
 		{
@@ -158,49 +162,60 @@ def make_demo_state():
 			"task": 101,
 			"preset": "demo-14b",
 			"pn": 450,
-			"cached": 0,
+			"cached": 2500,
 			"pp": 485.0,
 			"tn": 180,
 			"tg": 45.8,
-			"wall": FIXED_TIME - 210.0,
-			"wall0": FIXED_TIME - 215.0,
+			"wall": FIXED_TIME - 283.0,
+			"wall0": FIXED_TIME - 288.0,
 			"ms": 4900.0,
-			"acc": None,
-			"sel": "LRU",
-			"evicted": 1280,
-			"kv": 630,
+			"acc": 0.90,
+			"dacc": 180,
+			"dgen": 200,
+			"mlen": 1.90,
+			"sel": "LCP",
+			"keep": 1.0,
+			"kv": 3130,
 		},
 		{
 			"task": 102,
 			"preset": "demo-14b",
 			"pn": 3100,
-			"cached": 2560,
+			"cached": 3050,
 			"pp": 530.0,
 			"tn": 512,
 			"tg": 44.9,
-			"wall": FIXED_TIME - 110.0,
-			"wall0": FIXED_TIME - 122.0,
-			"ms": 12400.0,
-			"acc": None,
+			"wall": FIXED_TIME - 256.0,
+			"wall0": FIXED_TIME - 273.0,
+			"ms": 17200.0,
+			"acc": 0.88,
+			"dacc": 458,
+			"dgen": 520,
+			"mlen": 1.85,
 			"sel": "LCP",
+			"keep": 1.0,
 			"sim": 0.82,
-			"kv": 3612,
+			"kv": 6662,
 		},
 		{
 			"task": 103,
 			"preset": "demo-14b",
 			"pn": 820,
-			"cached": 512,
+			"cached": 6200,
 			"pp": 495.0,
 			"tn": 340,
 			"tg": 45.4,
-			"wall": FIXED_TIME - 35.0,
-			"wall0": FIXED_TIME - 43.0,
-			"ms": 8200.0,
-			"acc": None,
+			"wall": FIXED_TIME - 237.0,
+			"wall0": FIXED_TIME - 246.0,
+			"ms": 9100.0,
+			"acc": 0.92,
+			"dacc": 322,
+			"dgen": 350,
+			"mlen": 2.05,
 			"sel": "LCP",
+			"keep": 1.0,
 			"sim": 0.62,
-			"kv": 1672,
+			"kv": 7360,
 		},
 	]
 
@@ -215,7 +230,7 @@ def make_demo_state():
 		follow={"demo-14b": (None, types.SimpleNamespace(session=lambda: {"wall": FIXED_TIME - 2520.0}))},
 		flags={"demo-14b": ({"ctx-size": "32768", "cache-type-k": "q8_0", "cache-type-v": "q8_0"}, "")},
 		events=events,
-		cfg={"spill_mib": 256, "pagein_warn": 300, "router": "http://127.0.0.1:8080"},
+		cfg={"spill_mib": 256, "router": "http://127.0.0.1:8080"},
 		rings=rings,
 		alerts=types.SimpleNamespace(ordered=lambda: [], active={}),
 		allow=256.0,
@@ -263,6 +278,12 @@ def make_demo_state():
 			"free": 27136.0,
 			"pages_in": 0.0,
 			"pages_out": 0.0,
+		},
+		"cpu": {
+			"cpu": 18.0,
+			"cpu_mhz": 4400.0,
+			"cpu_queue": 0.0,
+			"cpu_cores": [16.0, 25.0, 11.0, 30.0, 7.0, 19.0, 27.0, 5.0, 14.0, 33.0, 9.0, 21.0, 17.0, 6.0, 29.0, 19.0],
 		},
 		"presets": {
 			"demo-14b": {

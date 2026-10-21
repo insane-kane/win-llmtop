@@ -245,7 +245,7 @@ Each entry lists the exact message printed by `win-llmtop` or `win-llmtop --chec
 
 **Cause:** [`--threshold`](llmtop.1.md#options) `NAME=VALUE` was given an unknown key or a non-numeric value, or an unexpected runtime exception occurred during a collector tick.
 
-**Fix:** Check the valid threshold names (`spill_mib`, `burst_mib`, `avail_warn`, `avail_crit`, `commit_warn`, `commit_crit`, `pagein_warn`, `hold_s`, `clear_s`, `near_budget_mib`, `at_budget_mib`, `idle_headroom_mib`, `rival_gpu_pct`, `card_full_pct`, `pagefile_pct`, `ws_drop_mib`, `burst_window_s`, `load_grace_s`, `hz`, `history_hours`) documented in [`llmtop.1.md#alerts`](llmtop.1.md#alerts).
+**Fix:** Check the valid threshold names (`spill_mib`, `burst_mib`, `avail_warn`, `avail_crit`, `commit_warn`, `commit_crit`, `hold_s`, `clear_s`, `near_budget_mib`, `at_budget_mib`, `idle_headroom_mib`, `rival_gpu_pct`, `card_full_pct`, `pagefile_pct`, `ws_drop_mib`, `burst_window_s`, `load_grace_s`, `hz`, `history_hours`) documented in [`llmtop.1.md#alerts`](llmtop.1.md#alerts).
 
 ---
 

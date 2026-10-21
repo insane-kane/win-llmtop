@@ -14,8 +14,9 @@ A live, read-only terminal panel for [llama.cpp](https://github.com/ggml-org/lla
 
 - **Dedicated and shared GPU memory per process** against the DXGI OS budget, with alerts when Windows demotes VRAM into system RAM.
 - **System RAM, commit charge and the page file** — working sets by consumer, private commit headroom and disk page-ins/page-outs.
+- **CPU load, clock and cache levels** — per-core load, P/E cores and L1/L2/L3 sizes.
 - **Live in-flight request progress** — active phase (`PREFILL` or `DECODE`), prompt batch progress, ETA, live tokens/s and KV context fill.
-- **Finished request history and speed** — prefill and decode throughput compared across similar prompt sizes and context depths, draft acceptance and prefix cache reuse.
+- **Prompt and turn history** — prefill and decode speed by context depth, cache hit and draft acceptance per turn and per prompt.
 - **Model memory map and tensor placement** — weights, KV cache, recurrent state and compute buffers derived from the GGUF header and checked against `llama-fit-params`, plus per-layer GPU/CPU placement.
 - **Router and threshold events** — model loads, queueing, evictions and sustained memory alerts persisted across restarts.
 

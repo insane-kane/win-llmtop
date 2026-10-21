@@ -248,7 +248,7 @@ def check(c, args):
 	if not win.WIN:
 		gpu_status, gpu_fact = "FAIL", "Windows only"
 	elif not adapters:
-		gpu_status, gpu_fact = "--", "no DXGI adapters found"
+		gpu_status, gpu_fact = "--", "no GPU adapters (CPU-only)"
 	else:
 		ad_strs = ["%s (%.0f MiB, budget %.0f MiB)" % (a["name"], a["vram"], a["budget"]) for a in adapters]
 		watch_str = "watching %s" % watched["name"] if watched else "no adapter selected"
@@ -296,6 +296,11 @@ def check(c, args):
 		else:
 			slot_str = "/slots not queried (no loaded models)"
 		server_fact = "%s (%s), %s, %s, %s" % (url, how, mode_str, count_str, slot_str)
+	elif getattr(c, "router_auth_error", None):
+		server_status = "FAIL"
+		url = c.cfg.get("router") or ""
+		how = "explicit" if c.router_explicit else (c.router_discovery or "discovered")
+		server_fact = "%s (%s): %s (pass --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY)" % (url, how, c.router_auth_error)
 	else:
 		server_status = "FAIL"
 		url = c.cfg.get("router") or ""
@@ -406,7 +411,8 @@ def check(c, args):
 	for n in snap.get("notices", []):
 		print("%-18s %-5s %s" % ("notice", "--", n))
 
-	return 0 if (server_ok and gpu_telemetry_ok) else 1
+	gpu_ok_or_cpu = bool(win.WIN and (gpu_telemetry_ok or not adapters))
+	return 0 if (server_ok and gpu_ok_or_cpu) else 1
 
 
 def main():

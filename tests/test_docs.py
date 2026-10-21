@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Docs-coverage tests for win-llmtop.
+"""Docs-coverage and link hygiene tests for win-llmtop.
 
-	Every command-line option and environment variable must be documented in both
-	README.md and docs/llmtop.1.md. The man page's Alerts section must name every
-	threshold that appears in an alert condition — every numeric CFG key referenced
-	in Alerts.evaluate in llmtop_lib/state.py, the method that computes every alert
-	condition and message. Keys that only set timing or non-alert behaviour (the
-	hysteresis clear_s in Alerts.sweep, the sampling rate hz, the history span
-	history_hours) are not conditions, so they are not required there; when such a
-	name is not in the man page at all the test prints it as a note, not a failure.
-	A threshold name counts as named when it appears as a code span of its own
-	(`name`), the convention both docs use for names.
+	Every command-line option and environment variable must be documented in
+	docs/llmtop.1.md (the complete reference), and every option named across
+	README.md and docs/*.md must be a real option in --help (or a known flag of
+	an external tool such as llama-server, pip, or gh). Every relative link in
+	docs/*.md must resolve to an existing file and heading anchor; every link in
+	README.md must be an absolute https:// URL or a #anchor for PyPI rendering.
+	The man page's Alerts section must name every threshold that appears in an
+	alert condition in Alerts.evaluate in llmtop_lib/state.py. No page may
+	contain forbidden local names or email addresses.
 
 	python -I tools/win-llmtop/tests/test_docs.py
 """
@@ -28,10 +27,64 @@ sys.path.insert(0, str(ROOT))
 from llmtop_lib import state  # noqa: E402
 from tests import _public_names  # noqa: E402
 
-README = (ROOT / "README.md").read_text(encoding="utf-8")
-MAN = (ROOT / "docs" / "llmtop.1.md").read_text(encoding="utf-8")
+README_PATH = ROOT / "README.md"
+MAN_PATH = ROOT / "docs" / "llmtop.1.md"
+EXPECTED_DOCS = ("README.md", "install.md", "usage.md", "troubleshooting.md", "llmtop.1.md")
+README = README_PATH.read_text(encoding="utf-8")
+MAN = MAN_PATH.read_text(encoding="utf-8")
 LLMTOP_PY = str(ROOT / "llmtop.py")
 FORBIDDEN = _public_names.FORBIDDEN
+
+# Flags belonging to external tools explicitly discussed in the documentation (llama-server, llama-fit-params, pip, gh)
+EXTERNAL_FLAGS = {
+	"--batch-size",
+	"--cpu-moe",
+	"--host",
+	"--log-file",
+	"--log-timestamps",
+	"--n-cpu-moe",
+	"--n-gpu-layers",
+	"--no-host",
+	"--override-tensor",
+	"--port",
+	"--repo",
+	"--slots",
+	"--upgrade",
+	"--user",
+}
+
+RE_LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
+RE_HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*$", re.M)
+RE_EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+
+
+def doc_pages():
+	"""All Markdown documentation files: README.md plus every file in docs/*.md."""
+	pages = [README_PATH] + sorted((ROOT / "docs").glob("*.md"))
+	return [(p.relative_to(ROOT).as_posix(), p, p.read_text(encoding="utf-8")) for p in pages]
+
+
+def github_slug(heading_text):
+	"""GitHub's heading anchor rule: lowercase, punctuation dropped, spaces to '-'."""
+	cleaned = re.sub(r"[^\w\s-]", "", heading_text.lower()).strip()
+	return cleaned.replace(" ", "-")
+
+
+def heading_slugs(path):
+	text = path.read_text(encoding="utf-8")
+	slugs = set()
+	counts = {}
+	for m in RE_HEADING.finditer(text):
+		base = github_slug(m.group(1))
+		if not base:
+			continue
+		if base not in counts:
+			counts[base] = 0
+			slugs.add(base)
+		else:
+			counts[base] += 1
+			slugs.add("%s-%d" % (base, counts[base]))
+	return slugs
 
 
 def help_text():
@@ -76,26 +129,87 @@ def alerts_section():
 	return m.group(0)
 
 
-def test_options_in_readme_and_man():
-	missing = []
-	for opt in options():
-		if opt not in README:
-			missing.append("%s in README.md" % opt)
-		if opt not in MAN:
-			missing.append("%s in docs/llmtop.1.md" % opt)
+def test_doc_set_exists():
+	missing = [name for name in EXPECTED_DOCS if not (ROOT / "docs" / name).is_file()]
 	if missing:
-		raise AssertionError("not documented: " + ", ".join(missing))
+		raise AssertionError("missing docs files: " + ", ".join(missing))
 
 
-def test_env_vars_in_readme_and_man():
-	missing = []
-	for var in env_vars():
-		if var not in README:
-			missing.append("%s in README.md" % var)
-		if var not in MAN:
-			missing.append("%s in docs/llmtop.1.md" % var)
+def test_options_in_man():
+	missing = [opt for opt in options() if opt not in MAN]
 	if missing:
-		raise AssertionError("not documented: " + ", ".join(missing))
+		raise AssertionError("not documented in docs/llmtop.1.md: " + ", ".join(missing))
+
+
+def test_env_vars_in_man():
+	missing = [var for var in env_vars() if var not in MAN]
+	if missing:
+		raise AssertionError("not documented in docs/llmtop.1.md: " + ", ".join(missing))
+
+
+def test_named_options_in_docs():
+	real = set(options())
+	allowed = real | EXTERNAL_FLAGS
+	bad = []
+	for rel, _path, text in doc_pages():
+		# Strip link targets so URLs or #anchors containing '--' are not treated as CLI flags
+		prose = RE_LINK.sub(lambda m: m.group(0).split("](")[0] + "]()", text)
+		for flag in sorted(set(re.findall(r"--[a-z][a-z0-9-]*", prose))):
+			if flag not in allowed:
+				bad.append("%s in %s" % (flag, rel))
+		# Any option linked directly to llmtop.1.md#options must be a win-llmtop option
+		for m in re.finditer(r"\[`(--[a-z][a-z0-9-]*)`\]\([^)]*llmtop\.1\.md#options\)", text):
+			if m.group(1) not in real:
+				bad.append("%s (linked to man page) in %s" % (m.group(1), rel))
+	if bad:
+		raise AssertionError("unknown or stale options: " + ", ".join(bad))
+
+
+def test_readme_links_for_pypi():
+	bad = []
+	slugs = heading_slugs(README_PATH)
+	blob_prefix = "https://github.com/insane-kane/win-llmtop/blob/main/"
+	for m in RE_LINK.finditer(README):
+		target = m.group(1).strip()
+		if target.startswith("#"):
+			if target[1:] not in slugs:
+				bad.append("broken anchor %s in README.md" % target)
+		elif not target.startswith("https://"):
+			bad.append("non-absolute link %s in README.md" % target)
+		elif target.startswith(blob_prefix) and "#" in target:
+			rel_path, _, anchor = target[len(blob_prefix):].partition("#")
+			target_file = (ROOT / rel_path).resolve()
+			if target_file.is_file() and target_file.suffix.lower() == ".md":
+				if anchor not in heading_slugs(target_file):
+					bad.append("broken anchor #%s in %s (from README.md)" % (anchor, rel_path))
+	if bad:
+		raise AssertionError("; ".join(bad))
+
+
+def test_docs_relative_links_resolve():
+	bad = []
+	for rel, path, text in doc_pages():
+		if path == README_PATH:
+			continue
+		for m in RE_LINK.finditer(text):
+			target = m.group(1).strip()
+			if target.startswith(("https://", "http://")):
+				continue
+			file_part, _, anchor = target.partition("#")
+			target_file = path if not file_part else (path.parent / file_part).resolve()
+			try:
+				target_file.relative_to(ROOT)
+			except ValueError:
+				bad.append("%s in %s escapes repo root" % (target, rel))
+				continue
+			if not target_file.is_file():
+				bad.append("%s in %s -> missing file" % (target, rel))
+				continue
+			if anchor and target_file.suffix.lower() == ".md":
+				if anchor not in heading_slugs(target_file):
+					bad.append("%s in %s -> missing heading #%s" % (target, rel, anchor))
+	if bad:
+		raise AssertionError("; ".join(bad))
 
 
 def test_threshold_names_in_man():
@@ -108,22 +222,28 @@ def test_threshold_names_in_man():
 		raise AssertionError("Alerts section names fewer thresholds than it should: " + ", ".join(missing))
 
 
-def test_no_local_names():
+def test_no_local_names_or_emails():
 	bad = []
-	for name in FORBIDDEN:
-		if name.lower() in README.lower():
-			bad.append("%s in README.md" % name)
-		if name.lower() in MAN.lower():
-			bad.append("%s in docs/llmtop.1.md" % name)
+	for rel, _path, text in doc_pages():
+		low = text.lower()
+		for name in FORBIDDEN:
+			if name.lower() in low:
+				bad.append("%s in %s" % (name, rel))
+		for m in RE_EMAIL.finditer(text):
+			bad.append("email %s in %s" % (m.group(0), rel))
 	if bad:
 		raise AssertionError("found: " + ", ".join(bad))
 
 
 CASES = [
-	("options_in_readme_and_man", test_options_in_readme_and_man),
-	("env_vars_in_readme_and_man", test_env_vars_in_readme_and_man),
+	("doc_set_exists", test_doc_set_exists),
+	("options_in_man", test_options_in_man),
+	("env_vars_in_man", test_env_vars_in_man),
+	("named_options_in_docs", test_named_options_in_docs),
+	("readme_links_for_pypi", test_readme_links_for_pypi),
+	("docs_relative_links_resolve", test_docs_relative_links_resolve),
 	("threshold_names_in_man", test_threshold_names_in_man),
-	("no_local_names", test_no_local_names),
+	("no_local_names_or_emails", test_no_local_names_or_emails),
 ]
 
 

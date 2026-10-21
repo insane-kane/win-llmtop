@@ -1,0 +1,27 @@
+name: Feature request
+description: Suggest an idea or improvement for win-llmtop.
+title: ""
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to suggest an idea.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What problem does this solve, or what is missing?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: The proposed solution
+      description: A description of what you would like to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any alternative solutions or features you considered.

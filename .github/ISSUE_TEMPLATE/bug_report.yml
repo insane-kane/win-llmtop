@@ -1,0 +1,88 @@
+name: Bug report
+description: Report a bug in win-llmtop.
+title: ""
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to file a bug report. The `win-llmtop --check` output is the most useful thing you can include.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A short description of the bug.
+      placeholder: Tell us what you saw.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+      description: A short description of the expected behaviour.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The commands and options you used, and what you did.
+    validations:
+      required: true
+  - type: textarea
+    id: check
+    attributes:
+      label: "`win-llmtop --check` output"
+      description: Run `win-llmtop --check` and paste the complete output. It prints one line per check (windows, gpu, processes, server, logs, llama-fit-params, state, plus any notices).
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: version
+    attributes:
+      label: win-llmtop version
+      description: There is no `--version` flag. Run `py -m pip show win-llmtop` and paste the output, or name the release you downloaded.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: Run `winver` and note the version and build.
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: llama.cpp build
+      description: The llama.cpp build you are running, for example `b11669`.
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Server mode
+      description: Is the llama-server in router mode or serving a single model?
+      options:
+        - Router
+        - Single model
+    validations:
+      required: true
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots (optional)
+      description: Paste a link to a screenshot, or drag one into this box.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant llama-server log lines (optional)
+      description: Paste the relevant lines from the llama-server log.
+      render: text
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for a similar report
+          required: true

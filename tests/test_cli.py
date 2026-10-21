@@ -134,12 +134,13 @@ class TestCLI(unittest.TestCase):
 				self.assertIsNotNone(server_line, "server line missing from --check output: %r" % out)
 				self.assertIn("ok", server_line.split())
 
-				# Check GPU line and exit code
+				# Check GPU line and exit code (ok or CPU-only both allow exit 0; FAIL forces exit 1)
 				gpu_line = next((ln for ln in lines if ln.lower().startswith("gpu")), None)
 				self.assertIsNotNone(gpu_line, "gpu line missing from --check output: %r" % out)
-				gpu_ok = "ok" in gpu_line.split()
-				self.assertEqual(proc.returncode == 0, gpu_ok,
-					"exit code %d does not match gpu ok (%s); out: %s" % (proc.returncode, gpu_ok, out))
+				gpu_parts = gpu_line.split()
+				gpu_pass = ("ok" in gpu_parts) or ("--" in gpu_parts and "no GPU adapters (CPU-only)" in gpu_line)
+				self.assertEqual(proc.returncode == 0, gpu_pass,
+					"exit code %d does not match gpu pass (%s); out: %s" % (proc.returncode, gpu_pass, out))
 
 				# Never leak API key
 				self.assertNotIn(secret_token, proc.stdout)

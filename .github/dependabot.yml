@@ -6,3 +6,13 @@ updates:
       interval: "weekly"
     cooldown:
       default-days: 7  # adopt an action release only after a week, a guard against a compromised release
+  - package-ecosystem: "pip"
+    directory: "/.github/requirements"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      ci-tools:
+        patterns:
+          - "*"

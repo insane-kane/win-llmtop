@@ -25,7 +25,7 @@ from llmtop_lib import state, win  # noqa: E402
 class _StubServer:
 	"""Ephemeral HTTP server on 127.0.0.1 for testing Collector."""
 
-	def __init__(self, models_data, slots_data=None, require_key=None, slots_status=200):
+	def __init__(self, models_data, slots_data=None, require_key=None, slots_status=200, require_key_on_models=False):
 		self.models_data = models_data
 		self.slots_data = slots_data if slots_data is not None else [
 			{
@@ -42,6 +42,7 @@ class _StubServer:
 			}
 		]
 		self.require_key = require_key
+		self.require_key_on_models = require_key_on_models
 		self.slots_status = slots_status
 		self.requests = []
 		parent = self
@@ -51,6 +52,9 @@ class _StubServer:
 				auth = self.headers.get("Authorization")
 				parent.requests.append((self.path, auth))
 				if self.path == "/models":
+					if parent.require_key_on_models and parent.require_key and auth != "Bearer " + parent.require_key:
+						self._send_json(401, {"error": {"message": "Invalid API Key", "code": 401}})
+						return
 					self._send_json(200, {"object": "list", "data": parent.models_data})
 					return
 				if self.path.startswith("/slots"):
@@ -425,6 +429,129 @@ class TestState(unittest.TestCase):
 			srv.close()
 
 
+	def test_models_401_discovery_and_auth_alert(self):
+		models_data = [
+			{
+				"id": "auth-model.gguf",
+				"object": "model",
+				"owned_by": "llamacpp",
+			}
+		]
+		srv = _StubServer(models_data, require_key="real-key-456", require_key_on_models=True)
+		port = str(srv.httpd.server_port)
+		procs = {4321: ("llama-server.exe", 500)}
+		proc_info_map = {
+			4321: {
+				"exe": "C:\\bin\\llama-server.exe",
+				"argv": ["C:\\bin\\llama-server.exe", "-m", "auth-model.gguf", "--port", port],
+				"created": 1700000050.0,
+			}
+		}
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win(procs=procs, proc_info_map=proc_info_map, proc_mem_map={}):
+				cfg = dict(state.CFG, router=None, state_dir=os.path.join(tmp, "state"), log_dir=None, api_key="wrong", persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				c.cfg["router"] = "http://127.0.0.1:1"
+				c.ensure_map = lambda preset: None
+				snap1 = c.tick(1700000100.0)
+				self.assertEqual(c.cfg["router"], srv.url)
+				self.assertFalse(snap1["router_up"])
+				self.assertEqual(snap1["router_auth_error"], "HTTP 401")
+				self.assertIsNotNone(c.router_discovery)
+				self.assertIn(c.router_discovery, snap1["notices"])
+				self.assertFalse(any("server unreachable" in n for n in snap1["notices"]), snap1["notices"])
+				self.assertIn("router", c.alerts.active)
+				alert_msg = c.alerts.active["router"]["msg"]
+				self.assertIn("HTTP 401", alert_msg)
+				self.assertIn("--api-key", alert_msg)
+				self.assertIn("LLMTOP_API_KEY", alert_msg)
+				self.assertIn("LLAMA_API_KEY", alert_msg)
+				self.assertNotIn("unreachable", alert_msg)
+
+				c.cfg["api_key"] = "real-key-456"
+				snap2 = c.tick(1700000100.5)
+				self.assertTrue(snap2["router_up"])
+				self.assertIsNone(snap2["router_auth_error"])
+				c.alerts.sweep(1700000100.0 + state.CFG["clear_s"] + 1)  # the alert clears after clear_s of quiet, like every other
+				self.assertNotIn("router", c.alerts.active)
+				self.assertEqual(snap2["mode"], "single")
+				self.assertEqual(snap2["presets"]["auth-model.gguf"]["slot"]["n_ctx"], 8192)
+		finally:
+			srv.close()
+
+	def test_multiple_independent_servers_and_single_model_pid_matching(self):
+		models_data = [
+			{
+				"id": "target.gguf",
+				"object": "model",
+				"owned_by": "llamacpp",
+			}
+		]
+		srv = _StubServer(models_data)
+		port = str(srv.httpd.server_port)
+		procs = {
+			1000: ("llama-server.exe", 400),
+			1001: ("llama-server.exe", 1000),
+			3000: ("llama-server.exe", 400),
+		}
+		proc_info_map = {
+			1000: {
+				"exe": "C:\\bin\\llama-server.exe",
+				"argv": ["C:\\bin\\llama-server.exe", "--models-preset", "presets.ini", "--log-file", "C:\\logs\\router.log"],
+				"created": 1700000000.0,
+			},
+			1001: {
+				"exe": "C:\\bin\\llama-server.exe",
+				"argv": ["C:\\bin\\llama-server.exe", "-m", "child.gguf", "--port", "59001", "--log-file", "C:\\logs\\child.log"],
+				"created": 1700000010.0,
+			},
+			3000: {
+				"exe": "C:\\bin\\llama-server.exe",
+				"argv": ["C:\\bin\\llama-server.exe", "-m", "target.gguf", "--port", port, "-c", "16384", "--log-file", "C:\\logs\\target.log"],
+				"created": 1700000020.0,
+			},
+		}
+		proc_mem_map = {
+			1000: {"ws": 50.0, "pws": 40.0, "commit": 60.0, "faults": 1, "cpu_s": 1.0},
+			1001: {"ws": 8000.0, "pws": 7900.0, "commit": 8100.0, "faults": 5, "cpu_s": 10.0},
+			3000: {"ws": 512.0, "pws": 500.0, "commit": 600.0, "faults": 2, "cpu_s": 2.0},
+		}
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win(procs=procs, proc_info_map=proc_info_map, proc_mem_map=proc_mem_map):
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				c.ensure_map = lambda preset: None
+				c.load_history()
+				snap = c.tick(1700000100.0)
+				self.assertEqual(snap["mode"], "single")
+				self.assertEqual(snap["llama"]["pids"], [3000])
+				self.assertEqual(snap["llama"]["ws"], 512.0)
+				self.assertEqual(c.preset_log_path("target.gguf"), "C:\\logs\\target.log")
+				self.assertIsNone(c.router_tail)
+				flags, _ = c.flags["target.gguf"]
+				self.assertEqual(flags.get("ctx-size"), "16384")
+				expected_notice = "2 llama-server instances found; watching %s (pass --router to choose)" % srv.url
+				self.assertIn(expected_notice, snap["notices"])
+
+			# When multiple independent servers exist and none matches the URL's port, never take another server's flags or log.
+			unmatched_info = dict(proc_info_map)
+			unmatched_info[3000] = {
+				"exe": "C:\\bin\\llama-server.exe",
+				"argv": ["C:\\bin\\llama-server.exe", "-m", "other.gguf", "--port", "8081", "--log-file", "C:\\logs\\other.log"],
+				"created": 1700000020.0,
+			}
+			with tempfile.TemporaryDirectory() as tmp, _patch_win(procs=procs, proc_info_map=unmatched_info, proc_mem_map=proc_mem_map):
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c2 = state.Collector(cfg)
+				c2.ensure_map = lambda preset: None
+				snap2 = c2.tick(1700000100.0)
+				self.assertEqual(snap2["llama"]["pids"], [])
+				self.assertNotIn("target.gguf", c2.flags)
+				self.assertIsNone(c2.preset_log_path("target.gguf"))
+		finally:
+			srv.close()
+
+
 CASES = [
 	("router_mode_preset_loaded_and_flags_parsed", TestState("test_router_mode_preset_loaded_and_flags_parsed")),
 	("single_model_mode_process_counted", TestState("test_single_model_mode_process_counted")),
@@ -434,6 +561,8 @@ CASES = [
 	("log_dir_none_and_no_router_log_touches_no_folder", TestState("test_log_dir_none_and_no_router_log_touches_no_folder")),
 	("threshold_arithmetic_8_16_64_gib", TestState("test_threshold_arithmetic_8_16_64_gib")),
 	("discovery_gpu_selection_errors_and_multi_resident", TestState("test_discovery_gpu_selection_errors_and_multi_resident")),
+	("models_401_discovery_and_auth_alert", TestState("test_models_401_discovery_and_auth_alert")),
+	("multiple_independent_servers_and_single_model_pid_matching", TestState("test_multiple_independent_servers_and_single_model_pid_matching")),
 ]
 
 

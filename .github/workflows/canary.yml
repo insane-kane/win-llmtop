@@ -1,0 +1,153 @@
+name: Canary (latest llama.cpp)
+
+on:
+  schedule:
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary-e2e:
+    name: Canary e2e vs latest llama.cpp (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      MODEL_REPO: ggml-org/tiny-llamas
+      MODEL_REV: 99dd1a73db5a37100bd4ae633f4cfce6560e1567
+      MODEL_FILE: stories260K.gguf
+      MODEL_SHA256: 047bf46455a544931cff6fef14d7910154c56afbc23ab1c5e56a72e69912c04b
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            arch: x64
+          - os: windows-11-arm
+            arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          architecture: ${{ matrix.arch }}
+      - name: Cache tiny GGUF model
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .e2e-cache
+          key: e2e-model-${{ env.MODEL_SHA256 }}
+      - name: Resolve latest llama.cpp release, verify SHA-256 digests, and run e2e
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNNER_ARCH: ${{ matrix.arch }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          import urllib.request
+          import zipfile
+
+          cache_dir = pathlib.Path(".e2e-cache")
+          cache_dir.mkdir(parents=True, exist_ok=True)
+
+          arch = os.environ["RUNNER_ARCH"]
+          gh_token = os.environ.get("GH_TOKEN", "")
+          model_repo = os.environ["MODEL_REPO"]
+          model_rev = os.environ["MODEL_REV"]
+          model_file = os.environ["MODEL_FILE"]
+          model_sha256 = os.environ["MODEL_SHA256"].lower()
+
+          def sha256_file(path):
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+              for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+            return h.hexdigest().lower()
+
+          def download_and_verify(path, url, expected, headers=None):
+            if not path.is_file():
+              print(f"Downloading {url} -> {path}")
+              req = urllib.request.Request(url, headers=headers or {})
+              with urllib.request.urlopen(req, timeout=120) as r, open(path, "wb") as f:
+                while True:
+                  buf = r.read(1 << 20)
+                  if not buf:
+                    break
+                  f.write(buf)
+            actual = sha256_file(path)
+            if actual != expected:
+              sys.exit(f"SHA-256 mismatch for {path}: expected {expected}, got {actual}")
+            print(f"Verified SHA-256 for {path.name}: {actual}")
+
+          # Note: ggml-org/llama.cpp marks b* builds as prerelease=true, so we query /releases
+          # and pick the newest non-draft release containing the Windows CPU zip for this arch.
+          api_url = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10"
+          api_headers = {"Accept": "application/vnd.github+json", "User-Agent": "win-llmtop-canary"}
+          if gh_token:
+            api_headers["Authorization"] = f"Bearer {gh_token}"
+          req = urllib.request.Request(api_url, headers=api_headers)
+          with urllib.request.urlopen(req, timeout=30) as r:
+            releases = json.load(r)
+
+          chosen_tag = None
+          chosen_asset = None
+          for rel in releases:
+            if rel.get("draft"):
+              continue
+            tag = rel.get("tag_name", "")
+            expected_name = f"llama-{tag}-bin-win-cpu-{arch}.zip"
+            for asset in rel.get("assets", []):
+              if asset.get("name") == expected_name and asset.get("digest", "").startswith("sha256:"):
+                chosen_tag = tag
+                chosen_asset = asset
+                break
+            if chosen_asset:
+              break
+
+          if not chosen_asset:
+            sys.exit(f"Could not find Windows CPU {arch} asset with sha256 digest in recent llama.cpp releases")
+
+          llama_asset = chosen_asset["name"]
+          llama_url = chosen_asset["browser_download_url"]
+          llama_sha256 = chosen_asset["digest"].split(":", 1)[1].lower()
+          print(f"Latest llama.cpp release for {arch}: tag={chosen_tag}, asset={llama_asset}, sha256={llama_sha256}")
+
+          zip_path = pathlib.Path(llama_asset)
+          download_and_verify(zip_path, llama_url, llama_sha256)
+
+          gguf_path = cache_dir / model_file
+          gguf_url = f"https://huggingface.co/{model_repo}/resolve/{model_rev}/{model_file}"
+          download_and_verify(gguf_path, gguf_url, model_sha256)
+
+          bin_dir = pathlib.Path(".e2e-bin")
+          with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(bin_dir)
+          matches = list(bin_dir.rglob("llama-server.exe"))
+          if not matches:
+            sys.exit("llama-server.exe not found in extracted archive")
+          server_exe = str(matches[0])
+
+          rc = subprocess.call([
+            sys.executable, "-I", "tests/e2e_server.py",
+            "--server", server_exe,
+            "--model", str(gguf_path),
+            "--artifact-dir", ".e2e-artifacts",
+          ])
+          sys.exit(rc)
+          PY
+      - name: Upload canary e2e logs and output on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: canary-e2e-logs-${{ matrix.os }}
+          path: .e2e-artifacts/

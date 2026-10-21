@@ -2,18 +2,22 @@ name: CodeQL
 
 on:
   push:
-    branches:
-      - main
+    branches: ["**"]
   pull_request:
   schedule:
     - cron: "0 7 * * 1"
 
 permissions: {}
 
+concurrency:
+  group: codeql-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   analyze:
     name: Analyze (Python)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       security-events: write
@@ -26,5 +30,45 @@ jobs:
         uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
         with:
           languages: python
+          queries: security-extended
       - name: Perform CodeQL Analysis
+        id: analyze
         uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          output: sarif-results
+      - name: Fail on any CodeQL finding
+        env:
+          SARIF_DIR: ${{ steps.analyze.outputs.sarif-output }}
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+          import os
+          import sys
+
+          sarif_dir = os.environ.get("SARIF_DIR") or "sarif-results"
+          files = sorted(glob.glob(os.path.join(sarif_dir, "*.sarif")))
+          if not files:
+            sys.exit(f"No SARIF files found in {sarif_dir}")
+
+          findings = []
+          for path in files:
+            with open(path, encoding="utf-8") as f:
+              doc = json.load(f)
+            for run in doc.get("runs", []):
+              for res in run.get("results", []):
+                rule_id = res.get("ruleId", "unknown-rule")
+                msg = (res.get("message") or {}).get("text", "").replace("\n", " ").strip()
+                locs = res.get("locations") or []
+                phys = (locs[0].get("physicalLocation") if locs else None) or {}
+                uri = (phys.get("artifactLocation") or {}).get("uri", "<unknown>")
+                line = (phys.get("region") or {}).get("startLine", 0)
+                findings.append(f"{rule_id} {uri}:{line}: {msg}")
+
+          if findings:
+            print(f"CodeQL reported {len(findings)} finding(s):")
+            for item in findings:
+              print(" ", item)
+            sys.exit(1)
+          print(f"CodeQL clean: 0 findings across {len(files)} SARIF file(s).")
+          PY

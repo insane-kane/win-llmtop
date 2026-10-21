@@ -20,6 +20,7 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -34,6 +35,26 @@ jobs:
           python-version: "3.13"
       - name: Check tagged commit is an ancestor of origin/main
         run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: Verify annotated tag is GPG-signed by the maintainer
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          git fetch --no-tags origin "refs/tags/$TAG:refs/tags/$TAG"
+          if [ "$(git cat-file -t "$TAG")" != "tag" ]; then
+            echo "error: $TAG is not an annotated tag object" >&2
+            exit 1
+          fi
+          GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          export GNUPGHOME
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          curl -fsSL https://github.com/insane-kane.gpg | gpg --batch --import
+          out="$(git tag -v "$TAG" 2>&1)" || {
+            echo "$out" >&2
+            exit 1
+          }
+          echo "$out"
+          echo "$out" | grep -Fq "gpg: Good signature from "
       - name: Check tag matches pyproject.toml version and dated changelog heading
         env:
           TAG: ${{ github.ref_name }}
@@ -69,8 +90,13 @@ jobs:
   build:
     needs: ci
     runs-on: windows-2025
+    timeout-minutes: 15
     permissions:
       contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      hashes: ${{ steps.hashes.outputs.hashes }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -82,11 +108,38 @@ jobs:
           python-version: "3.13"
           architecture: x64
       - name: Install build and twine
-        run: python -m pip install build==1.6.1 twine==7.0.0
+        run: "python -m pip install --require-hashes --no-deps --only-binary :all: -r .github/requirements/package.txt"
       - name: Build
         run: python -m build
       - name: Check dist
         run: python -m twine check dist/*
+      - name: Record dist SHA-256 digests
+        id: hashes
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob
+          import hashlib
+          import json
+          import os
+          import sys
+
+          files = sorted(glob.glob("dist/*"))
+          if not files:
+            sys.exit("no files built in dist/")
+          hashes = {}
+          for path in files:
+            name = os.path.basename(path)
+            digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+            hashes[name] = digest
+            print(f"{digest}  {name}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+            out.write(f"hashes={json.dumps(hashes, sort_keys=True)}\n")
+          PY
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "dist/*"
       - name: Upload dist
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -96,6 +149,7 @@ jobs:
   pypi:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment:
       name: pypi
       url: https://pypi.org/p/win-llmtop
@@ -111,8 +165,9 @@ jobs:
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
 
   github-release:
-    needs: build
+    needs: [build, pypi]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -147,4 +202,97 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist/* --title "win-llmtop $TAG" --notes-file notes.md
+        run: gh release create "$TAG" dist/* --verify-tag --title "win-llmtop $TAG" --notes-file notes.md
+
+  verify-pypi:
+    needs: [build, pypi]
+    runs-on: windows-2025
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          architecture: x64
+      - name: Download published files from PyPI, verify SHA-256 digests, and test entry points
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          EXPECTED_HASHES: ${{ needs.build.outputs.hashes }}
+        run: |
+          python - <<'PY'
+          import glob
+          import hashlib
+          import json
+          import os
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import time
+
+          tag = os.environ["TAG"]
+          version = tag.lstrip("v")
+          expected = json.loads(os.environ["EXPECTED_HASHES"])
+          if not expected:
+            sys.exit("EXPECTED_HASHES is empty")
+
+          dl_dir = "pypi-dist"
+          deadline = time.monotonic() + 600.0
+          attempt = 0
+          while True:
+            attempt += 1
+            shutil.rmtree(dl_dir, ignore_errors=True)
+            os.makedirs(dl_dir, exist_ok=True)
+            r_whl = subprocess.run([
+              sys.executable, "-m", "pip", "download",
+              f"win-llmtop=={version}", "--no-deps", "--only-binary", ":all:",
+              "--no-cache-dir", "-d", dl_dir,
+            ])
+            r_sdist = subprocess.run([
+              sys.executable, "-m", "pip", "download",
+              f"win-llmtop=={version}", "--no-deps", "--no-binary", ":all:",
+              "--no-cache-dir", "-d", dl_dir,
+            ])
+            if r_whl.returncode == 0 and r_sdist.returncode == 0:
+              break
+            if time.monotonic() >= deadline:
+              sys.exit(f"Timed out after 10 minutes waiting for win-llmtop=={version} on PyPI")
+            print(f"Attempt {attempt}: PyPI index not yet ready, retrying in 15s...")
+            time.sleep(15)
+
+          actual = {}
+          for path in sorted(glob.glob(os.path.join(dl_dir, "*"))):
+            name = os.path.basename(path)
+            actual[name] = hashlib.sha256(open(path, "rb").read()).hexdigest()
+            print(f"PyPI {actual[name]}  {name}")
+
+          if actual != expected:
+            sys.exit(f"PyPI SHA-256 mismatch: expected {expected}, got {actual}")
+          print("All PyPI file SHA-256 digests match built artifacts.")
+
+          whls = glob.glob(os.path.join(dl_dir, "*.whl"))
+          if len(whls) != 1:
+            sys.exit(f"Expected 1 wheel in {dl_dir}, found {whls}")
+          whl = os.path.abspath(whls[0])
+          whl_hash = actual[os.path.basename(whl)]
+
+          with tempfile.TemporaryDirectory() as td:
+            subprocess.run([sys.executable, "-m", "venv", td], check=True)
+            py = os.path.join(td, "Scripts", "python.exe")
+            cli = os.path.join(td, "Scripts", "win-llmtop.exe")
+            req = os.path.join(td, "wheel.txt")
+            with open(req, "w", encoding="utf-8") as f:
+              f.write(f"{whl} --hash=sha256:{whl_hash}\n")
+            subprocess.run([py, "-m", "pip", "install", "--require-hashes", "--no-deps", "-r", req], check=True, cwd=td)
+            h = subprocess.run([cli, "--help"], capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=td, check=True)
+            print(h.stdout)
+            c = subprocess.run([cli, "--check"], capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=td)
+            print(c.stdout)
+            if c.stderr:
+              print(c.stderr, file=sys.stderr)
+            if c.returncode not in (0, 1) or "traceback" in (c.stdout + c.stderr).lower():
+              sys.exit(f"win-llmtop --check failed with rc={c.returncode}")
+          PY

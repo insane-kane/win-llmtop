@@ -12,9 +12,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   lint:
     runs-on: windows-2025
+    timeout-minutes: 10
     steps:
       - name: Preserve LF line endings on checkout
         run: git config --global core.autocrlf false
@@ -27,16 +32,59 @@ jobs:
         with:
           python-version: "3.13"
           architecture: x64
-      - name: Install ruff
-        run: python -m pip install ruff==0.17.1
+      - name: Install ruff and PyYAML
+        run: "python -m pip install --require-hashes --no-deps --only-binary :all: -r .github/requirements/lint.txt"
       - name: Run ruff check
         run: ruff check .
+      - name: Validate YAML, CITATION.cff, and issue forms
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib
+          import sys
+          import yaml
+
+          excluded = {".git", ".venv", ".e2e-cache", ".e2e-bin", "build", "dist"}
+          files = sorted(
+            p for p in pathlib.Path(".").rglob("*")
+            if p.is_file()
+            and p.suffix.lower() in (".yml", ".yaml", ".cff")
+            and not any(part in excluded for part in p.parts)
+          )
+          if not files:
+            sys.exit("no YAML or CFF files found")
+          errors = []
+          for path in files:
+            rel = path.as_posix()
+            try:
+              with open(path, encoding="utf-8") as f:
+                docs = list(yaml.safe_load_all(f))
+            except Exception as e:
+              errors.append(f"{rel}: YAML parse error: {e}")
+              continue
+            if path.parent.as_posix() == ".github/ISSUE_TEMPLATE" and path.suffix.lower() in (".yml", ".yaml") and path.name != "config.yml":
+              doc = docs[0] if len(docs) == 1 else None
+              if not isinstance(doc, dict):
+                errors.append(f"{rel}: issue form must be a single YAML mapping")
+                continue
+              missing = [k for k in ("name", "description", "body") if k not in doc or doc[k] is None]
+              if missing:
+                errors.append(f"{rel}: missing required top-level key(s): {', '.join(missing)}")
+                continue
+            print(f"ok {rel}")
+          if errors:
+            for err in errors:
+              print(f"FAIL {err}", file=sys.stderr)
+            sys.exit(1)
+          print(f"Validated {len(files)} YAML/CFF file(s).")
+          PY
       - name: Run editorconfig-checker
         uses: editorconfig-checker/action-editorconfig-checker@51f63319f592f97930c73d9c46184d20bd206393 # v3.0.0
 
   audit:
     # zizmor only reads YAML, so it runs on Linux, which its action supports (on Windows it warns "Unsupported runner OS").
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,8 +97,23 @@ jobs:
           inputs: .github/
           advanced-security: false
 
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Dependency review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: low
+
   test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -69,7 +132,7 @@ jobs:
       - name: Compile
         run: python -m compileall -q llmtop.py llmtop_lib tests
       - name: Install coverage
-        run: python -m pip install coverage==7.16.2
+        run: "python -m pip install --require-hashes --no-deps --only-binary :all: -r .github/requirements/test.txt"
       - name: Run tests under coverage
         run: python -c "import glob, subprocess, sys; [subprocess.run([sys.executable, '-m', 'coverage', 'run', '--parallel-mode', f], check=True) for f in sorted(glob.glob('tests/test_*.py'))]"
       - name: Combine coverage
@@ -84,8 +147,123 @@ jobs:
           path: .coverage
           include-hidden-files: true
 
+  e2e:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      LLAMA_TAG: b11669
+      MODEL_REPO: ggml-org/tiny-llamas
+      MODEL_REV: 99dd1a73db5a37100bd4ae633f4cfce6560e1567
+      MODEL_FILE: stories260K.gguf
+      MODEL_SHA256: 047bf46455a544931cff6fef14d7910154c56afbc23ab1c5e56a72e69912c04b
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            arch: x64
+            llama_asset: llama-b11669-bin-win-cpu-x64.zip
+            llama_sha256: 37b3efcf962847ca869745fd4ccf7f5e7e8dacfeff9fa3523b4ca8cdc66d632b
+          - os: windows-11-arm
+            arch: arm64
+            llama_asset: llama-b11669-bin-win-cpu-arm64.zip
+            llama_sha256: 9cff39ffed17edcd03a7d876073f74d7b48cd43a1e5eafdd59ee094185ad871b
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          architecture: ${{ matrix.arch }}
+      - name: Cache llama-server and tiny GGUF model
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .e2e-cache
+          key: e2e-${{ matrix.llama_sha256 }}-${{ env.MODEL_SHA256 }}
+      - name: Download, verify SHA-256, and run end-to-end test
+        shell: bash
+        env:
+          LLAMA_ASSET: ${{ matrix.llama_asset }}
+          LLAMA_SHA256: ${{ matrix.llama_sha256 }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          import urllib.request
+          import zipfile
+
+          cache_dir = pathlib.Path(".e2e-cache")
+          cache_dir.mkdir(parents=True, exist_ok=True)
+
+          llama_tag = os.environ["LLAMA_TAG"]
+          llama_asset = os.environ["LLAMA_ASSET"]
+          llama_sha256 = os.environ["LLAMA_SHA256"].lower()
+          model_repo = os.environ["MODEL_REPO"]
+          model_rev = os.environ["MODEL_REV"]
+          model_file = os.environ["MODEL_FILE"]
+          model_sha256 = os.environ["MODEL_SHA256"].lower()
+
+          def sha256_file(path):
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+              for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+            return h.hexdigest().lower()
+
+          def ensure_verified(path, url, expected):
+            if not path.is_file():
+              print(f"Downloading {url} -> {path}")
+              with urllib.request.urlopen(url, timeout=120) as r, open(path, "wb") as f:
+                while True:
+                  buf = r.read(1 << 20)
+                  if not buf:
+                    break
+                  f.write(buf)
+            actual = sha256_file(path)
+            if actual != expected:
+              sys.exit(f"SHA-256 mismatch for {path}: expected {expected}, got {actual}")
+            print(f"Verified SHA-256 for {path.name}: {actual}")
+
+          zip_path = cache_dir / llama_asset
+          zip_url = f"https://github.com/ggml-org/llama.cpp/releases/download/{llama_tag}/{llama_asset}"
+          ensure_verified(zip_path, zip_url, llama_sha256)
+
+          gguf_path = cache_dir / model_file
+          gguf_url = f"https://huggingface.co/{model_repo}/resolve/{model_rev}/{model_file}"
+          ensure_verified(gguf_path, gguf_url, model_sha256)
+
+          bin_dir = pathlib.Path(".e2e-bin")
+          with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(bin_dir)
+          matches = list(bin_dir.rglob("llama-server.exe"))
+          if not matches:
+            sys.exit("llama-server.exe not found in extracted archive")
+          server_exe = str(matches[0])
+
+          rc = subprocess.call([
+            sys.executable, "-I", "tests/e2e_server.py",
+            "--server", server_exe,
+            "--model", str(gguf_path),
+            "--artifact-dir", ".e2e-artifacts",
+          ])
+          sys.exit(rc)
+          PY
+      - name: Upload e2e logs and output on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-logs-${{ matrix.os }}
+          path: .e2e-artifacts/
+
   package:
     runs-on: windows-2025
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -97,14 +275,15 @@ jobs:
           python-version: "3.13"
           architecture: x64
       - name: Install build and twine
-        run: python -m pip install build==1.6.1 twine==7.0.0
+        run: "python -m pip install --require-hashes --no-deps --only-binary :all: -r .github/requirements/package.txt"
       - name: Build package
         run: python -m build
       - name: Check package metadata
         run: python -m twine check dist/*
       - name: Verify wheel contents
+        shell: bash
         run: |
-          python -c "
+          python - <<'PY'
           import glob, re, sys, zipfile
           whls = glob.glob('dist/*.whl')
           assert len(whls) == 1, whls
@@ -114,17 +293,21 @@ jobs:
           if bad or 'llmtop.py' not in names or not any(n.startswith('llmtop_lib/') for n in names):
             sys.exit(f'unexpected wheel contents: {names}')
           print('wheel contents ok:', names)
-          "
+          PY
       - name: Install wheel in fresh venv and test entry points
+        shell: bash
         run: |
-          python -c "
-          import glob, os, subprocess, sys, tempfile
+          python - <<'PY'
+          import glob, hashlib, os, subprocess, sys, tempfile
           whl = os.path.abspath(glob.glob('dist/*.whl')[0])
+          digest = hashlib.sha256(open(whl, 'rb').read()).hexdigest()
           with tempfile.TemporaryDirectory() as td:
             subprocess.run([sys.executable, '-m', 'venv', td], check=True)
             py = os.path.join(td, 'Scripts', 'python.exe')
             cli = os.path.join(td, 'Scripts', 'win-llmtop.exe')
-            subprocess.run([py, '-m', 'pip', 'install', whl], check=True, cwd=td)
+            req = os.path.join(td, 'wheel.txt')
+            open(req, 'w', encoding='utf-8').write(f'{whl} --hash=sha256:{digest}\n')
+            subprocess.run([py, '-m', 'pip', 'install', '--require-hashes', '--no-deps', '-r', req], check=True, cwd=td)
             h = subprocess.run([cli, '--help'], capture_output=True, text=True, cwd=td, check=True)
             print(h.stdout)
             c = subprocess.run([cli, '--check'], capture_output=True, text=True, cwd=td)
@@ -133,19 +316,38 @@ jobs:
               print(c.stderr, file=sys.stderr)
             if c.returncode not in (0, 1) or 'traceback' in (c.stdout + c.stderr).lower():
               sys.exit(f'win-llmtop --check failed with rc={c.returncode}')
-          "
+          PY
 
   # Single check required by the repository ruleset before fast-forwarding to main.
   ci-ok:
     runs-on: windows-2025
-    needs: [lint, audit, test, package]
+    timeout-minutes: 5
+    needs: [lint, audit, dependency-review, test, e2e, package]
     if: always()
     steps:
       - name: Require all CI jobs to succeed
+        shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
           LINT_RESULT: ${{ needs.lint.result }}
           AUDIT_RESULT: ${{ needs.audit.result }}
+          DEP_REVIEW_RESULT: ${{ needs.dependency-review.result }}
           TEST_RESULT: ${{ needs.test.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
         run: |
-          python -c "import os, sys; res = {k: os.environ[k] for k in ('LINT_RESULT', 'AUDIT_RESULT', 'TEST_RESULT', 'PACKAGE_RESULT')}; print(res); sys.exit(0 if all(v == 'success' for v in res.values()) else 1)"
+          python - <<'PY'
+          import os
+          import sys
+
+          event = os.environ["EVENT_NAME"]
+          req = {
+            k: os.environ[k]
+            for k in ("LINT_RESULT", "AUDIT_RESULT", "TEST_RESULT", "E2E_RESULT", "PACKAGE_RESULT")
+          }
+          dep = os.environ["DEP_REVIEW_RESULT"]
+          print({"event": event, **req, "DEP_REVIEW_RESULT": dep})
+          dep_ok = (dep == "success") if event == "pull_request" else (dep == "skipped")
+          if not (all(v == "success" for v in req.values()) and dep_ok):
+            sys.exit(1)
+          PY

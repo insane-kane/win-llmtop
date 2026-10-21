@@ -1,5 +1,7 @@
 # win-llmtop(1) — Live Panel for the Local llama-server
 
+**Contents:** [NAME](#name) · [SYNOPSIS](#synopsis) · [OPTIONS](#options) · [DESCRIPTION](#description) · [Where every figure comes from](#where-every-figure-comes-from) · [Shared GPU memory](#shared-gpu-memory) · [Alerts](#alerts) · [EXIT STATUS](#exit-status) · [FILES](#files) · [LIMITS](#limits) · [SEE ALSO](#see-also)
+
 ## NAME
 `win-llmtop` — Terminal panel for llama.cpp's `llama-server` on Windows (router mode or a single model): what is loaded, what it is doing, how fast, where the VRAM and RAM go, and when Windows starts paging GPU memory into system RAM.
 
@@ -11,32 +13,33 @@ win-llmtop --once [--page live|memory|system|requests|events|tensors|all] [--gra
 win-llmtop --plan [PRESET]
 ```
 
+## OPTIONS
 Options, with their environment variables and defaults:
 
-| Option | Environment variable | Default |
-| :--- | :--- | :--- |
-| `-h`, `--help` | — | show the help and exit |
-| `--check` | — | off |
-| `--once` | — | off |
-| `--page` | — | `live` |
-| `--plan [PRESET]` | — | off |
-| `--window` | — | `5m` |
-| `--router URL` | `LLMTOP_ROUTER` | find it |
-| `--log-dir DIR` | `LLMTOP_LOG_DIR` | (none) |
-| `--router-log PATH` | — | (none) |
-| `--state-dir DIR` | `LLMTOP_STATE_DIR` | `%LOCALAPPDATA%\win-llmtop` |
-| `--api-key KEY` | `LLMTOP_API_KEY` or `LLAMA_API_KEY` | (none) |
-| `--gpu INDEX\|NAME` | — | the adapter the model runs on |
-| `--hz HZ` | — | `4.0` |
-| `--history-hours H` | — | `24` |
-| `--spill-mib N` | — | `256` |
-| `--threshold NAME=VALUE` | — | (none) |
-| `--no-persist` | — | off |
-| `--graph-style` | — | braille in Windows Terminal, blocks otherwise |
-| `--no-color` | — | off |
-| `--width N` | — | the terminal width |
+| Option | Environment variable | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `-h`, `--help` | — | show the help and exit | show the help message and exit |
+| `--check` | — | off | report on prerequisites and reachable sources, then exit |
+| `--once` | — | off | print one snapshot and exit |
+| `--page {live,memory,system,requests,events,tensors,all}` | — | `live` | page for `--once` |
+| `--plan [PRESET]` | — | off | project VRAM per preset against the OS budget |
+| `--window {1m,5m,15m,1h,6h,24h}` | — | `5m` | initial history window |
+| `--router URL` | `LLMTOP_ROUTER` | find it | `llama-server` URL |
+| `--log-dir DIR` | `LLMTOP_LOG_DIR` | (none) | directory of `llama-server` logs |
+| `--router-log PATH` | — | (none) | router log file path |
+| `--state-dir DIR` | `LLMTOP_STATE_DIR` | `%LOCALAPPDATA%\win-llmtop` | directory for persisted history and calibration |
+| `--api-key KEY` | `LLMTOP_API_KEY` or `LLAMA_API_KEY` | (none) | Bearer token for `llama-server` |
+| `--gpu INDEX\|NAME` | — | the adapter the model runs on | adapter index or name substring |
+| `--hz HZ` | — | `4.0` | sampling and redraw rate |
+| `--history-hours HISTORY_HOURS` | — | `24` | hours of per-second history kept in memory and replayed |
+| `--spill-mib SPILL_MIB` | — | `256` | excess shared GPU memory (MiB) that raises an alert |
+| `--threshold NAME=VALUE` | — | (none) | override an alert threshold (see `CFG` in `llmtop_lib/state.py`); repeatable |
+| `--no-persist` | — | off | do not mirror history to disk |
+| `--graph-style {braille,blocks}` | — | braille in Windows Terminal, blocks otherwise | braille line plots, or block-character charts if the font lacks braille |
+| `--no-color` | — | off | disable ANSI colour escapes |
+| `--width WIDTH` | — | the terminal width | line width for `--once` and `--plan` |
 
-`--router` finds the server when no URL is given: it tries the default `http://127.0.0.1:8080`, then the host and port read from each running llama-server's command line, and says how it found the one that answers. `--log-dir` is the folder the per-model logs and the router log live in; `--router-log` names the router log file directly. `--state-dir` is the folder for the persisted history and calibration.
+`--router` finds the server when no URL is given: it tries the default `http://127.0.0.1:8080`, then the host and port read from each running llama-server's command line, and says how it found the one that answers. When several independent `llama-server` instances are running, pass `--router` to choose which one to watch. `--api-key` (or `LLMTOP_API_KEY` / `LLAMA_API_KEY`) passes a Bearer token for HTTP requests; a server started with `--api-key` requires it for `/models` and `/slots`. `--log-dir` is the folder the per-model logs and the router log live in; `--router-log` names the router log file directly. `--state-dir` is the folder for the persisted history and calibration.
 
 ## DESCRIPTION
 The tool is read-only. It talks to the llama-server API (router or single-model), reads the llama-server logs, and reads Windows performance counters; it never changes the server. Windows only (Python 3.11+, standard library only).
@@ -44,10 +47,10 @@ The tool is read-only. It talks to the llama-server API (router or single-model)
 It samples at 4 Hz. The server's `/slots` endpoint is polled at that rate only while a request is running (every 3 s when idle) because the router logs every proxied request.
 
 ### Single-model servers
-A `llama-server` serving a single model directly, rather than as a router, is detected from the `/models` response (its entries carry no `status` object, which a router adds to each preset) and runs in single-model mode: a `single-model mode` notice is shown, the header says `server up` rather than `router up`, and `/slots` is polled without a model name. Everything else — the pages, the alerts, the memory figures — works the same.
+A `llama-server` serving a single model directly, rather than as a router, is detected from the `/models` response (its entries carry no `status` object, which a router adds to each preset) and runs in single-model mode: a `single-model mode` notice is shown, the header says `server up` rather than `router up`, `/slots` is polled without a model name, and `win-llmtop` matches the command-line flags and log of the process whose `--host` and `--port` correspond to the watched URL. Everything else — the pages, the alerts, the memory figures — works the same.
 
 ### Notices
-Notices are grey `· ` lines that say why a figure is missing or a source is absent, not what to do about it. They are printed at the top of the Live page (at most four, the rest counted) and in full on the Events page. They cover: the state folder being unavailable; a server found by discovery rather than given, or unreachable (with the URLs tried); single-model mode; a `--gpu` that matched no adapter; more than one model process resident (VRAM calibration paused); a loaded preset with no log file; a log whose lines are read but none match the expected format; and a log with no timestamps (pass `--log-timestamps` for wall-clock history).
+Notices are grey `· ` lines that say why a figure is missing or a source is absent, not what to do about it. They are printed at the top of the Live page (at most four, the rest counted) and in full on the Events page. They cover: the state folder being unavailable; a server found by discovery rather than given, or unreachable (with the URLs tried); several independent `llama-server` instances found (with the watched URL); single-model mode; a `--gpu` that matched no adapter; more than one model process resident (VRAM calibration paused); a loaded preset with no log file; a log whose lines are read but none match the expected format; and a log with no timestamps (pass `--log-timestamps` for wall-clock history).
 
 ### Pages (keys `1`–`6`, `Tab`, or `←` `→`)
 | Page | Content |
@@ -148,6 +151,13 @@ Each rule holds while its condition is true and clears after 10 s of quiet. Ever
 ### History
 Rings hold one value per second for 24 h. They are mirrored to the state folder's `samples-<date>.jsonl` (one sample per 5 s plus alert events, 14 days kept) and reloaded at start, so sparklines and the event list span restarts. Finished requests are kept in `requests.jsonl` (llama-server rewrites a preset's log file each time that model loads, so the logs alone lose them); model events are rebuilt from the logs each time; wall-clock times of old sessions come from the router log's file name plus its `spawning server instance` lines. `--no-persist` turns writing off; read-only runs still replay what exists.
 
+## EXIT STATUS
+In interactive mode, `--once`, and `--plan`, `win-llmtop` exits 0 on normal termination.
+
+It exits `1` with a message, before doing anything else, when it can't run: not Windows, 32-bit Python, Python older than 3.11, or an unknown or non-numeric `--threshold`.
+
+With `--check`, `win-llmtop` exits `0` when the server is reachable and either GPU telemetry is present or the machine has no GPU adapters (CPU-only), and exits `1` otherwise (the server is unreachable or requires an API key, or GPU adapters are present but PDH counters are missing).
+
 ## FILES
 | Path | Purpose |
 | :--- | :--- |
@@ -169,4 +179,8 @@ Rings hold one value per second for 24 h. They are mirrored to the state folder'
 - Fixed assumptions: llama.cpp's tensor naming (`attn_`, `ffn_`, `ssm_`, `_exps`, `nextn`), its offload rules, the GGUF type sizes, and the log line formats of build b11669, matched with or without timestamps. Alert thresholds, the colour thresholds for t/s (80% and 50%) and the size buckets of the Requests page are display or policy choices, not measurements.
 
 ## SEE ALSO
-[llama.cpp's server README](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+- [Documentation index (`README.md`)](README.md)
+- [Installation guide (`install.md`)](install.md)
+- [Usage guide (`usage.md`)](usage.md)
+- [Troubleshooting (`troubleshooting.md`)](troubleshooting.md)
+- [llama.cpp's server README](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)

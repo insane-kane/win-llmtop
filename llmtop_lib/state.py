@@ -287,7 +287,10 @@ class Alerts:
 		"""Every message states counter values and the threshold that was crossed; none states a cause."""
 		now, c, g, ll, rm = snap["t"], self.cfg, snap["gpu"], snap["llama"], snap["ram"]
 		if not snap["router_up"]:
-			self.flag("router", "crit", "router unreachable at %s: %s" % (c["router"], snap["router_error"]), now)
+			if snap.get("router_auth_error"):
+				self.flag("router", "crit", "server at %s returned %s: pass --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY" % (c["router"], snap["router_auth_error"]), now)
+			else:
+				self.flag("router", "crit", "router unreachable at %s: %s" % (c["router"], snap["router_error"]), now)
 		for preset, p in snap["presets"].items():
 			err = p.get("slot_error")
 			if err:
@@ -399,7 +402,7 @@ class Collector:
 		self.rec = Recorder(self.rings, self.hist if self.cfg["persist"] else None)
 		self.events, self.requests, self.follow, self.router_tail, self.router_start = [], [], {}, None, None
 		self.models, self.flags, self.mem, self.rate = {}, {}, {}, {}
-		self.router_up, self.router_error, self.last = False, "", None
+		self.router_up, self.router_error, self.router_auth_error, self.last = False, "", None, None
 		self.ws_hist = deque(maxlen=48)
 		self.calib, self.calib_pid = {}, {}
 		self.allow, self.allow_known, self.pid_seen, self.shr_floor = 0.0, False, {}, {}
@@ -485,9 +488,51 @@ class Collector:
 			if self.counters:
 				self.counters.rebuild()
 
+	def _independent_pids(self):
+		kids = {p for p in self.pids if self.procs.get(self.procs.get(p, ("", 0))[1], ("",))[0].startswith("llama-server")}
+		return [p for p in self.pids if p not in kids]
+
+	def _pid_url_and_flags(self, pid):
+		info = self._proc_info(pid)
+		argv, exe = info.get("argv"), info.get("exe")
+		if not argv:
+			return None, None, (({}, exe) if exe else None)
+		exe = exe or argv[0]
+		pflags = model.parse_args(argv, model.server_aliases(exe))
+		host = pflags.get("host", "127.0.0.1")
+		if not isinstance(host, str) or not host or host in ("0.0.0.0", "::", "::0", "[::]"):
+			host = "127.0.0.1"
+		port = pflags.get("port", "8080")
+		if isinstance(port, bool) or not port:
+			port = "8080"
+		url = "http://%s:%s" % ("[%s]" % host if ":" in host and not host.startswith("[") else host, port)
+		return url, str(port), (pflags, exe)
+
+	def _single_model_pid(self):
+		candidates = self._independent_pids() or list(self.pids)
+		if not candidates:
+			return None
+		u = urllib.parse.urlsplit(self.cfg.get("router") or "")
+		target_port = str(u.port or (443 if u.scheme == "https" else 80))
+		port_match = None
+		for pid in candidates:
+			url, port, _ = self._pid_url_and_flags(pid)
+			if url == self.cfg.get("router"):
+				return pid
+			if port == target_port and port_match is None:
+				port_match = pid
+		if port_match is not None:
+			return port_match
+		if len(candidates) == 1:
+			return candidates[0]
+		return None
+
 	def _model_pids(self):
+		if self.mode == "single":
+			mpid = self._single_model_pid()
+			return [mpid] if mpid is not None else []
 		kids = [p for p in self.pids if self.procs.get(self.procs.get(p, ("", 0))[1], ("",))[0].startswith("llama-server")]
-		if not kids and (self.mode == "single" or not self.models):  # single-model server or standalone llama-server is the model process
+		if not kids and not self.models:  # standalone llama-server before mode is known
 			kids = list(self.pids)
 		return kids
 
@@ -578,9 +623,13 @@ class Collector:
 		"""Tail the newest router log (a restarted router writes a new file)."""
 		if not self.pids and win.WIN:
 			self._update_procs(time.time())
-		kids = set(self._model_pids())
-		roots = [p for p in self.pids if p not in kids]
-		router_pid = roots[0] if roots else (self.pids[0] if self.pids and self.mode == "router" else None)
+		if self.mode == "single":
+			if not self.cfg.get("router_log") and not self.cfg.get("log_dir"):
+				self.router_tail = None
+				return
+			router_pid = None
+		else:
+			router_pid = self._single_model_pid()
 		rinfo = self._proc_info(router_pid) if router_pid else {"exe": None, "argv": None, "created": None}
 		router_created = rinfo.get("created")
 		routers = []
@@ -671,19 +720,9 @@ class Collector:
 		kids = {p for p in self.pids if self.procs.get(self.procs.get(p, ("", 0))[1], ("",))[0].startswith("llama-server")}
 		ordered = [p for p in self.pids if p not in kids] + [p for p in self.pids if p in kids]
 		for pid in ordered:
-			info = self._proc_info(pid)
-			argv = info.get("argv")
-			if not argv:
+			url, _, _ = self._pid_url_and_flags(pid)
+			if not url:
 				continue
-			exe = info.get("exe") or argv[0]
-			pflags = model.parse_args(argv, model.server_aliases(exe))
-			host = pflags.get("host", "127.0.0.1")
-			if not isinstance(host, str) or not host or host in ("0.0.0.0", "::", "::0", "[::]"):
-				host = "127.0.0.1"
-			port = pflags.get("port", "8080")
-			if isinstance(port, bool) or not port:
-				port = "8080"
-			url = "http://%s:%s" % ("[%s]" % host if ":" in host and not host.startswith("[") else host, port)
 			if url not in tried:
 				tried.append(url)
 			self.cfg["router"] = url
@@ -692,6 +731,12 @@ class Collector:
 				self.router_tried = tried
 				self.router_discovery = "server found at %s from llama-server (pid %d) command line (tried %s)" % (url, pid, ", ".join(tried))
 				return data, None
+			except urllib.error.HTTPError as e:
+				if e.code in (401, 403):
+					self.router_tried = tried
+					self.router_discovery = "server found at %s from llama-server (pid %d) command line (tried %s)" % (url, pid, ", ".join(tried))
+					return None, e
+				first_err = e
 			except (OSError, ValueError, KeyError) as e:
 				first_err = e
 		self.router_tried = tried
@@ -704,13 +749,26 @@ class Collector:
 			if not self.router_explicit and not self.router_discovery:
 				self.router_discovery = "server found at %s (default)" % self.cfg["router"]
 		except (OSError, ValueError, KeyError) as e:
-			if self.router_explicit:
-				self.router_up, self.router_error, self.mode = False, str(e)[:80], None
-				return
-			data, err = self._discover_router(e)
+			err = e
+			if isinstance(e, urllib.error.HTTPError) and e.code in (401, 403):
+				if not self.router_explicit and not self.router_discovery:
+					self.router_discovery = "server found at %s (default)" % self.cfg["router"]
+				data = None
+			elif self.router_explicit:
+				data = None
+			else:
+				data, err = self._discover_router(e)
 			if data is None:
-				self.router_up, self.router_error, self.mode = False, str(err)[:80], None
+				if isinstance(err, urllib.error.HTTPError) and err.code in (401, 403):
+					self.router_auth_error = "HTTP %d" % err.code
+					self.router_up = False
+					self.router_error = "%s (pass --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY)" % self.router_auth_error
+					self.models, self.mode = {}, None
+				else:
+					self.router_auth_error = None
+					self.router_up, self.router_error, self.mode = False, str(err)[:80], None
 				return
+		self.router_auth_error = None
 		self.models = {m["id"]: m for m in data if isinstance(m, dict) and "id" in m}
 		self.router_up, self.router_error = True, ""
 		self.mode = "single" if (self.models and any(not isinstance(m.get("status"), dict) for m in self.models.values())) else "router"
@@ -723,16 +781,12 @@ class Collector:
 			else:
 				if not self.pids and win.WIN:
 					self._update_procs(now)
-				for pid in self.pids:
-					info = self._proc_info(pid)
-					argv, exe = info.get("argv"), info.get("exe")
-					if argv:
-						exe = exe or argv[0]
-						self.flags[name] = (model.parse_args(argv, model.server_aliases(exe)), exe)
-						break
-					if exe:
-						self.flags[name] = ({}, exe)
-						break
+				mpid = self._single_model_pid()
+				fe = self._pid_url_and_flags(mpid)[2] if mpid is not None else None
+				if fe is not None:
+					self.flags[name] = fe
+				else:
+					self.flags.pop(name, None)
 			path = self.preset_log_path(name)
 			if path and (name not in self.follow or self.follow[name][0].path != path) and self.last is not None:
 				self.open_preset(name)
@@ -778,10 +832,13 @@ class Collector:
 		if self.state_error:
 			notices.append("state folder %s is unavailable: %s" % (self.state_dir, self.state_error))
 		if not self.router_explicit:
-			if self.router_up and self.router_discovery and not self.router_discovery.endswith("(default)"):  # the default URL working is not news
+			if (self.router_up or self.router_auth_error) and self.router_discovery and not self.router_discovery.endswith("(default)"):  # the default URL working is not news
 				notices.append(self.router_discovery)
-			elif not self.router_up and self.router_tried:
+			elif not self.router_up and not self.router_auth_error and self.router_tried:
 				notices.append("server unreachable (tried %s)" % ", ".join(self.router_tried))
+		indep = self._independent_pids()
+		if len(indep) > 1:
+			notices.append("%d llama-server instances found; watching %s (pass --router to choose)" % (len(indep), self.cfg["router"]))
 		if self.mode == "single":
 			notices.append("single-model mode")
 		if self.gpu_notice:
@@ -900,7 +957,7 @@ class Collector:
 		self.allow = ll["allow"] or self.allow
 		self.allow_known = self.allow_known or ll["allow_known"]
 		notices = self._build_notices(presets, kids)
-		snap = {"t": now, "mode": self.mode, "router_up": self.router_up, "router_error": self.router_error, "gpu": gpu, "llama": ll,
+		snap = {"t": now, "mode": self.mode, "router_up": self.router_up, "router_error": self.router_error, "router_auth_error": self.router_auth_error, "gpu": gpu, "llama": ll,
 			"vm_error": self.vm_error, "others": others, "ram": ram, "presets": presets, "busy": busy, "new_events": new_events, "notices": notices}
 		self.rec.add(now, self.series_values(snap))
 		self.alerts.evaluate(snap, self.mem)

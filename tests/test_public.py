@@ -18,6 +18,10 @@ sys.path.insert(0, str(ROOT))
 
 from tests import _public_names  # noqa: E402
 
+# The one address allowed in the public tree, built from pieces so this file
+# never matches its own patterns.
+CONTACT = "software@" + "kane" + "net.us"
+
 
 def tracked_files():
 	try:
@@ -49,6 +53,11 @@ def tracked_files():
 	return sorted(out)
 
 
+def line_matches(rx, line):
+	"""Whether the pattern hits a line once the contact address is removed."""
+	return rx.search(line.replace(CONTACT, "")) is not None
+
+
 def check_pattern(rx):
 	hits = []
 	for path in tracked_files():
@@ -61,13 +70,22 @@ def check_pattern(rx):
 		text = raw.decode("utf-8", errors="replace")
 		rel = path.relative_to(ROOT).as_posix()
 		for lineno, line in enumerate(text.splitlines(), 1):
-			if rx.search(line):
+			if line_matches(rx, line):
 				hits.append("%s:%d" % (rel, lineno))
 	if hits:
 		raise AssertionError("matched in " + ", ".join(hits))
 
 
+def contact_shields_only_the_address():
+	# A line holding the address plus forbidden text elsewhere must still hit.
+	rx = dict(_public_names.PATTERNS)["kane" + "net"]
+	line = CONTACT + " and " + "kan" + "enet"
+	if not line_matches(rx, line):
+		raise AssertionError("forbidden text beside the address was not caught")
+
+
 CASES = [(label, lambda rx=rx: check_pattern(rx)) for label, rx in _public_names.PATTERNS]
+CASES.append(("contact_shields_only_the_address", contact_shields_only_the_address))
 
 
 def main():

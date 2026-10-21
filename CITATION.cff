@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+title: "win-llmtop"
+type: software
+authors:
+  - family-names: Kane
+    given-names: Aaron
+repository-code: "https://github.com/insane-kane/win-llmtop"
+license: "GPL-3.0-or-later"
+version: "0.1.0"
+date-released: "2026-10-20"

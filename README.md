@@ -1,111 +1,101 @@
 # win-llmtop
 
-A live terminal panel for llama.cpp's `llama-server` on Windows. It shows where the memory goes while a model runs: dedicated and shared GPU memory per process against the OS budget, system RAM, commit charge and the page file, the running request's progress and speed, the history of finished requests, and the model's memory map. It is read-only: it reads the server's API and logs and Windows' performance counters, and never changes the server.
+[![CI](https://github.com/insane-kane/win-llmtop/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/insane-kane/win-llmtop/actions/workflows/ci.yml) [![PyPI version](https://img.shields.io/pypi/v/win-llmtop)](https://pypi.org/project/win-llmtop/) [![Python versions](https://img.shields.io/pypi/pyversions/win-llmtop)](https://pypi.org/project/win-llmtop/) [![Licence](https://img.shields.io/pypi/l/win-llmtop)](https://github.com/insane-kane/win-llmtop/blob/main/LICENSE)
 
-## Requirements
+A live, read-only terminal panel for [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` on Windows — see where your VRAM, shared GPU memory and system RAM go while a model runs.
 
-- Windows 10 version 1709 or later (the per-process GPU counters appear in that release);
-- 64-bit Python 3.11 or later;
-- no other packages (the standard library only);
-- a llama.cpp `llama-server` — in router mode or serving a single model — on the same machine.
+![The Live page](https://raw.githubusercontent.com/insane-kane/win-llmtop/main/docs/img/live.svg)
 
-## Install
+[What it shows](#what-it-shows) · [Who it is for](#who-it-is-for) · [Quick start](#quick-start) · [Install](#install-options-at-a-glance) · [Requirements](#requirements) · [Get more out of it](#get-more-out-of-it) · [Common options](#common-options) · [Documentation](#documentation)
+
+## What it shows
+
+`win-llmtop` is strictly **read-only**: it reads the server's HTTP API, log files and Windows performance counters, and never changes the server.
+
+- **Dedicated and shared GPU memory per process** against the DXGI OS budget, with alerts when Windows demotes VRAM into system RAM.
+- **System RAM, commit charge and the page file** — working sets by consumer, private commit headroom and disk page-ins/page-outs.
+- **Live in-flight request progress** — active phase (`PREFILL` or `DECODE`), prompt batch progress, ETA, live tokens/s and KV context fill.
+- **Finished request history and speed** — prefill and decode throughput compared across similar prompt sizes and context depths, draft acceptance and prefix cache reuse.
+- **Model memory map and tensor placement** — weights, KV cache, recurrent state and compute buffers derived from the GGUF header and checked against `llama-fit-params`, plus per-layer GPU/CPU placement.
+- **Router and threshold events** — model loads, queueing, evictions and sustained memory alerts persisted across restarts.
+
+## Who it is for
+
+Built by [Aaron Kane (`@insane-kane`)](https://github.com/insane-kane) for Windows users running llama.cpp's `llama-server` — either in router mode across multiple presets or serving a single model — on the same machine. It answers whether a preset fits inside Windows' VRAM budget, when shared GPU memory spillover slows decoding down, and where host RAM goes.
+
+## Quick start
 
 ```shell
 pipx install win-llmtop
+win-llmtop --check
+win-llmtop
 ```
 
-(recommended: an isolated install with `win-llmtop` on PATH), or `uv tool install win-llmtop`, or `py -m pip install win-llmtop`.
+- `pipx install win-llmtop` — installs `win-llmtop` into an isolated environment and puts it on `PATH`.
+- `win-llmtop --check` — checks Windows counters, the GPU budget, the running `llama-server`, logs and state directory, and exits `0` when the server is reachable and either GPU telemetry is present or the machine has no GPU adapters (`1` otherwise).
+- `win-llmtop` — opens the live six-page terminal panel (`1`–`6` or `Tab` switch pages, `q` quits).
 
-Getting 64-bit Python on Windows: python.org's Windows installer, or `winget install Python.Python.3.13`.
+## Install options at a glance
 
-From source: `py -m pip install git+https://github.com/insane-kane/win-llmtop`, or clone the repository and run `py llmtop.py`.
+See the [full installation guide (`docs/install.md`)](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md) for commands, upgrades, uninstalls and package verification.
 
-A signed standalone `win-llmtop.exe` and a winget package are planned for 0.1.1.
-
-## First run
-
-Run `win-llmtop --check`. It reports on the prerequisites and the sources it can reach, one line each, and exits 0 when the server is reachable and the GPU telemetry is present, 1 otherwise:
-
-| Line | What it checks |
-| :--- | :--- |
-| `windows` | the Windows build and the Python version and bitness; ok on 64-bit Windows |
-| `gpu` | the DXGI adapters (name, VRAM, the OS budget), which adapter it is watching, and whether the PDH GPU counters are present |
-| `processes` | the llama-server processes it found (pid and executable) |
-| `server` | the URL it uses and how it found it, the mode (router or single), how many models the server reports, and whether `/slots` is reachable |
-| `logs` | for each model, the log path and whether it exists and has timestamps; and the router log |
-| `llama-fit-params` | where it found the `llama-fit-params` helper (next to the server, on PATH, or not found) |
-| `state` | the state folder and whether it is writable |
-| `notice` | any notices, such as single-model mode, a server found by discovery, a missing log, or a log without timestamps |
-
-## Getting the most from it
-
-llmtop shows whatever it can reach. A few flags on the llama-server, and options on llmtop, unlock more:
-
-- `--log-file` (one per model; in router mode, the preset's `log-file`) and `--log-timestamps`: these give llmtop the per-model log it reads for the request history — per-request timings, draft acceptance, prefix reuse. Without a log file llmtop can find (give `--log-file`, or `--log-dir` so it can build `<log-dir>\<preset>.log`), the request history is empty and llmtop prints a notice. Without `--log-timestamps` the log lines carry no timestamps, so the history keeps its relative timings but has no wall-clock times, and llmtop prints a notice suggesting the flag.
-- `--slots` enabled: the running request's live progress — its phase, how far prefill or decode has got, the current t/s and the context fill — is read from the server's `/slots` endpoint. Without it the endpoint is off, so llmtop shows the memory and system figures but not the in-flight request, and raises a warning telling you to start the server with `--slots`.
-- For the router's own events — model loads, queueing, evictions — point `--router-log` at the router's log file, or `--log-dir` at the folder it writes its `llama-server-<date>-<time>.log` files into. Without either, llmtop cannot find the router log and those events are not shown.
-
-## Usage
-
-Run `win-llmtop` for the live view. `win-llmtop --once` prints one snapshot and exits; `--once --page all` prints every page. `win-llmtop --plan [PRESET]` projects each preset's VRAM against the OS budget without loading anything.
-
-Keys: `1`–`6`, `Tab`, or `←` `→` switch pages; `[` `]` change the history window; `g` sets the graph height; `s` switches the graph style; `↑` `↓` `PgUp` `PgDn` `Home` `End` scroll every page except Live; `p` or `Space` pauses the display (collection continues); `q` quits. On the Memory and Tensors pages `m` cycles models; on Requests `m` filters by preset; on Events `f` filters by level; on Tensors `t` switches between layers and every tensor and `d` filters by device.
-
-| Page | Content |
-| :--- | :--- |
-| **Live** | alerts; GPU and RAM with trend charts; the running request's phase, progress and t/s; recent requests and events |
-| **Memory** | VRAM by component against the OS budget, llama-server's own RAM, the layer overview |
-| **System** | system RAM by consumer, the page file, RAM and paging trends |
-| **Requests** | per-preset volume and speed, prefill by prompt size, decode by context depth, every request |
-| **Events** | alerts, model loads, queueing, evictions, slot picks, errors |
-| **Tensors** | every layer or tensor with its type, shape, size and device |
-
-Options, with their environment variables and defaults:
-
-| Option | Environment variable | Default |
+| Method | Command | Best for |
 | :--- | :--- | :--- |
-| `-h`, `--help` | — | show the help and exit |
-| `--check` | — | off |
-| `--once` | — | off |
-| `--page` | — | `live` |
-| `--plan [PRESET]` | — | off |
-| `--window` | — | `5m` |
-| `--router URL` | `LLMTOP_ROUTER` | find it |
-| `--log-dir DIR` | `LLMTOP_LOG_DIR` | (none) |
-| `--router-log PATH` | — | (none) |
-| `--state-dir DIR` | `LLMTOP_STATE_DIR` | `%LOCALAPPDATA%\win-llmtop` |
-| `--api-key KEY` | `LLMTOP_API_KEY` or `LLAMA_API_KEY` | (none) |
-| `--gpu INDEX\|NAME` | — | the adapter the model runs on |
-| `--hz HZ` | — | `4.0` |
-| `--history-hours H` | — | `24` |
-| `--spill-mib N` | — | `256` |
-| `--threshold NAME=VALUE` | — | (none) |
-| `--no-persist` | — | off |
-| `--graph-style` | — | braille in Windows Terminal, blocks otherwise |
-| `--no-color` | — | off |
-| `--width N` | — | the terminal width |
+| **[pipx](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#pipx-recommended)** (recommended) | `pipx install win-llmtop` | Most users; isolated CLI environment on `PATH` |
+| **[uv tool](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#uv)** | `uv tool install win-llmtop` | Machines that already use `uv` |
+| **[pip](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#pip-virtual-environment-or-user-site)** | `py -m pip install win-llmtop` | Existing virtual environments or `--user` installs |
+| **[GitHub release wheel](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#offline-or-air-gapped-install)** | `py -m pip install win_llmtop-*.whl` | Offline or air-gapped Windows machines |
+| **[From source](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#from-source)** | `py llmtop.py` | Running directly from a git checkout (zero dependencies) |
+| **[Standalone `.exe` and `winget`](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#standalone-exe-and-winget-planned-for-011)** | *Planned for 0.1.1* | Machines without Python installed (SignPath-signed `win-llmtop.exe`) |
 
-## Where it keeps its files
+## Requirements
 
-By default, `%LOCALAPPDATA%\win-llmtop\` (override with `--state-dir` or `LLMTOP_STATE_DIR`). It holds:
+- **Windows 10 version 1709 or later** — provides the per-process `GPU Process Memory` and `GPU Engine` performance counters.
+- **64-bit Python 3.11 or later** — 32-bit Python cannot inspect a 64-bit `llama-server` process.
+- **No third-party Python packages** — uses the Python standard library only.
+- **A local `llama-server`** — running in router mode or single-model mode on the same machine.
 
-- `samples-<date>.jsonl` — one sample per 5 s plus alert events, 14 days kept, so the sparklines and the event list span restarts;
-- `requests.jsonl` — finished requests, kept because llama-server rewrites a model's log each time that model loads;
-- `calibration.json` — the VRAM overhead learned per configuration.
+## Get more out of it
 
-`--no-persist` turns the writing off; a read-only run still replays whatever is already there.
+`win-llmtop` works with zero configuration, and unlocks deeper telemetry when `llama-server` exposes logs and slots:
 
-## Limits
+- **Per-model log file with timestamps** — pass `--log-file` and `--log-timestamps` to `llama-server` (win-llmtop reads the path from its command line; `--log-dir` only when it can't) for request history, cache hit rates, draft acceptance and wall-clock times ([usage guide](https://github.com/insane-kane/win-llmtop/blob/main/docs/usage.md#per-model-logs-and-timestamps)).
+- **Live `/slots` telemetry** — start `llama-server` with `--slots` to see live prefill/decode progress, current tokens/s, ETA and context fill ([usage guide](https://github.com/insane-kane/win-llmtop/blob/main/docs/usage.md#live-slot-telemetry)).
+- **Router event log** — pass `--router-log` or `--log-dir` so `win-llmtop` can tail router model loads, request queueing and preset evictions ([usage guide](https://github.com/insane-kane/win-llmtop/blob/main/docs/usage.md#router-event-log)).
 
-- Which allocation or tensor is in shared GPU memory cannot be told from the counters; only how much.
-- The OS budget comes from DXGI for llmtop's own process; the model's budget may differ.
-- GPU temperature and power are not exposed by Windows' counters and are not shown.
-- The address-space walk shows what kind of memory the process holds, not which allocation is the prompt cache or a checkpoint; the log carries no cache sizes at its default verbosity, so only the configured limits are shown.
-- Prefill progress advances once per batch (`--batch-size`), so the live prefill rate is the rate over the last completed batch.
-- KV and state figures are derived; they were checked against `llama-fit-params` on a hybrid model and a sliding-window mixture-of-experts model, and on any architecture the Memory page reports whether they agree.
-- Fixed assumptions: llama.cpp's tensor naming, its offload rules, the GGUF type sizes, and the log line formats of build b11669. The alert thresholds, the colour thresholds for t/s and the size buckets of the Requests page are display or policy choices, not measurements.
+## Common options
+
+See [`win-llmtop(1)`](https://github.com/insane-kane/win-llmtop/blob/main/docs/llmtop.1.md#options) for the complete reference of every command-line option, environment variable and default.
+
+| Option | Environment variable | Default | Purpose |
+| :--- | :--- | :--- | :--- |
+| `--check` | — | off | Check prerequisites and reachable sources, then exit |
+| `--once` | — | off | Print a single snapshot and exit (combine with `--page`) |
+| `--plan [PRESET]` | — | off | Project preset VRAM against the OS budget without loading |
+| `--router URL` | `LLMTOP_ROUTER` | find it | `llama-server` URL (`http://127.0.0.1:8080` or discovered) |
+| `--log-dir DIR` | `LLMTOP_LOG_DIR` | (none) | Directory containing per-model and router log files |
+| `--router-log PATH` | — | (none) | Path to the router's own log file |
+| `--api-key KEY` | `LLMTOP_API_KEY` or `LLAMA_API_KEY` | (none) | Bearer token for `llama-server` HTTP requests |
+| `--window {1m,5m,15m,1h,6h,24h}` | — | `5m` | Initial time window for trend charts |
+
+## Documentation
+
+- **[Documentation index (`docs/README.md`)](https://github.com/insane-kane/win-llmtop/blob/main/docs/README.md)** — one-line map of all documentation pages.
+- **[Installation (`docs/install.md`)](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md)** — every deployment method, offline wheels, provenance verification, 64-bit Python and terminal setup.
+- **[Usage (`docs/usage.md`)](https://github.com/insane-kane/win-llmtop/blob/main/docs/usage.md)** — `--check` output, the six pages, keyboard controls, `llama-server` flags, `--once`, `--plan` and state files.
+- **[Troubleshooting (`docs/troubleshooting.md`)](https://github.com/insane-kane/win-llmtop/blob/main/docs/troubleshooting.md)** — symptom, cause and fix for every `--check` failure, notice and warning.
+- **[Manual page (`docs/llmtop.1.md`)](https://github.com/insane-kane/win-llmtop/blob/main/docs/llmtop.1.md)** — `win-llmtop(1)` reference: all options, alert rules, data sources and measurement limits.
+
+## Contributing, support and security
+
+- **Contributing and support** — see [`CONTRIBUTING.md`](https://github.com/insane-kane/win-llmtop/blob/main/CONTRIBUTING.md) to report bugs or submit pull requests, and [`SUPPORT.md`](https://github.com/insane-kane/win-llmtop/blob/main/SUPPORT.md) for usage help.
+- **Security** — see [`SECURITY.md`](https://github.com/insane-kane/win-llmtop/blob/main/SECURITY.md) to report a vulnerability privately through [GitHub's private vulnerability reporting](https://github.com/insane-kane/win-llmtop/security/advisories/new).
+- **Code of conduct** — participation is governed by [`CODE_OF_CONDUCT.md`](https://github.com/insane-kane/win-llmtop/blob/main/CODE_OF_CONDUCT.md).
+
+## Citing
+
+If you use `win-llmtop` in research or benchmarks, see [`CITATION.cff`](https://github.com/insane-kane/win-llmtop/blob/main/CITATION.cff) for citation metadata.
 
 ## Licence
 
-GNU General Public License, version 3 or (at your option) any later version (`GPL-3.0-or-later`); see `LICENSE`.
+GNU General Public License v3.0 or later (`GPL-3.0-or-later`); see [`LICENSE`](https://github.com/insane-kane/win-llmtop/blob/main/LICENSE).

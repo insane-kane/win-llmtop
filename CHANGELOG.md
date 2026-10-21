@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The install guide and README no longer announce a standalone `.exe` or a `winget` package: neither is planned.
+
 ## [0.2.0] - 2026-10-21
 
 ### Added

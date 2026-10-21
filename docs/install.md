@@ -1,6 +1,6 @@
 # Installing win-llmtop on Windows
 
-**Contents:** [pipx (recommended)](#pipx-recommended) · [uv](#uv) · [pip](#pip-virtual-environment-or-user-site) · [Specific version](#install-a-specific-version) · [Offline install](#offline-or-air-gapped-install) · [Verify downloads](#verify-what-you-downloaded) · [From source](#from-source) · [64-bit Python](#getting-64-bit-python) · [Standalone exe and winget](#standalone-exe-and-winget-planned-for-011) · [Recommended terminal](#recommended-terminal)
+**Contents:** [pipx (recommended)](#pipx-recommended) · [uv](#uv) · [pip](#pip-virtual-environment-or-user-site) · [Specific version](#install-a-specific-version) · [Offline install](#offline-or-air-gapped-install) · [Verify downloads](#verify-what-you-downloaded) · [From source](#from-source) · [64-bit Python](#getting-64-bit-python) · [Standalone exe and winget](#standalone-exe-and-winget-planned-for-020) · [Recommended terminal](#recommended-terminal)
 
 The examples below use `py`, the standard Windows Python Launcher (`py.exe`) included with official [python.org](https://www.python.org/downloads/windows/) installers, which selects your installed 64-bit Python without needing `python.exe` on `PATH`.
 
@@ -139,10 +139,10 @@ Check that your active Python is 64-bit (prints `64`):
 py -c "import struct; print(struct.calcsize('P')*8)"
 ```
 
-## Standalone exe and winget (planned for 0.1.1)
+## Standalone exe and winget (planned for 0.2.0)
 
 > [!NOTE]
-> **Not yet available — planned for 0.1.1:** A standalone `win-llmtop.exe` binary (requiring no Python installation on the machine), code-signed through [SignPath Foundation](https://signpath.org/), and a `winget` package are planned for the `0.1.1` release.
+> **Not yet available — planned for 0.2.0:** A standalone `win-llmtop.exe` binary (requiring no Python installation on the machine), code-signed through [SignPath Foundation](https://signpath.org/), and a `winget` package are planned for the `0.2.0` release.
 
 ## Recommended terminal
 

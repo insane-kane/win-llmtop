@@ -28,13 +28,14 @@ The code is developed in the maintainer's private repository and published here.
 
 | Branch | Purpose | Who pushes |
 | :--- | :--- | :--- |
-| `main` | always releasable; every commit pushed to it must have passed all of CI and CodeQL and be signed, and the history is linear (no merge commits, no force-push, never deleted) | the maintainer (fast-forward), or GitHub merging an approved PR (squash) |
-| `staging` | the maintainer's pre-`main` gate: a commit goes here first, CI runs, then the same commit is fast-forwarded to `main` | the maintainer only |
-| `dependabot/…` | Dependabot's update branches | Dependabot |
-| anything else | not created in this repo: contributors work on a branch in their fork (`fix/…`, `feat/…`, `docs/…`, `ci/…`) and open a PR against `main` | — |
+| `main` | releases only: every commit is a tagged release, fast-forwarded from `staging`, and holds the `release-gate`, `ci-ok` and `Analyze (Python)` checks | the maintainer only (fast-forward from `staging`) |
+| `staging` | the integration branch: pull requests target it; signed, linear, never force-pushed | the maintainer, or GitHub merging an approved PR (squash) |
+| `dependabot/…` | Dependabot's update branches (targeting `staging`) | Dependabot |
+| anything else | not created in this repo: contributors work on a branch in their fork (`fix/…`, `feat/…`, `docs/…`, `ci/…`) and open a PR against `staging` | — |
 
 ## Pull requests
 
+- Target `staging` when opening a pull request (`main` holds releases only).
 - A pull request needs CI (the `ci-ok` check) and CodeQL green.
 - It needs one approving review from the code owner (`@insane-kane`), and every review thread resolved.
 - A new push dismisses earlier approvals.
@@ -59,7 +60,7 @@ The maintainer aims to respond to a pull request within 7 days.
 
 ## Releases
 
-Releases are cut only from `main`, by a signed `v*` tag that only the maintainer can create. The release workflow re-runs all of CI on the tagged commit, and publishing to PyPI waits for the maintainer's approval in the `pypi` environment. Releases are immutable once published. Versions follow Semantic Versioning, and `CHANGELOG.md` follows Keep a Changelog.
+To cut a release, the maintainer bumps the version in `pyproject.toml` and `CITATION.cff` and adds the dated heading in `CHANGELOG.md` on `staging`; once `release-gate`, `ci-ok` and `Analyze (Python)` pass, `main` is fast-forwarded to `staging` and the signed `v*` tag is pushed. On ordinary `staging` commits, `release-gate` shows red because they aren't releases. The release workflow re-runs all of CI on the tagged commit, and publishing to PyPI waits for the maintainer's approval in the `pypi` environment. Releases are immutable once published. Versions follow Semantic Versioning, and `CHANGELOG.md` follows Keep a Changelog.
 
 ## Labels
 

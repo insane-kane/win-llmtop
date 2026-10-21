@@ -46,7 +46,7 @@ See the [full installation guide (`docs/install.md`)](https://github.com/insane-
 | **[pip](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#pip-virtual-environment-or-user-site)** | `py -m pip install win-llmtop` | Existing virtual environments or `--user` installs |
 | **[GitHub release wheel](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#offline-or-air-gapped-install)** | `py -m pip install win_llmtop-*.whl` | Offline or air-gapped Windows machines |
 | **[From source](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#from-source)** | `py llmtop.py` | Running directly from a git checkout (zero dependencies) |
-| **[Standalone `.exe` and `winget`](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#standalone-exe-and-winget-planned-for-011)** | *Planned for 0.1.1* | Machines without Python installed (SignPath-signed `win-llmtop.exe`) |
+| **[Standalone `.exe` and `winget`](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#standalone-exe-and-winget-planned-for-020)** | *Planned for 0.2.0* | Machines without Python installed (SignPath-signed `win-llmtop.exe`) |
 
 ## Requirements
 

@@ -1,3 +1,5 @@
+> **Target branch:** Please target `staging` (`main` holds releases only).
+
 ## Summary
 
 <!-- A short description of what this change does and why. -->

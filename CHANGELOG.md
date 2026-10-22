@@ -7,8 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-22
+
 ### Added
 
+- `d` on the Events page and `--once --page events --detail` show each event's detail lines.
+- `--graph-style coarse` and `--graph-style ascii`, and the `s` key cycles all four styles; the classic console now gets `coarse` by default.
+- `--check` prints a `terminal` line saying which console was detected and which chart style it uses.
+- The Requests page marks a prompt that spanned a compaction as `compacted` (`compacted ×N`).
 - Atheris fuzz targets for the log, GGUF, fit-output and argument parsers, run in CI.
 
 ### Changed

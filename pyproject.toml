@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "win-llmtop"
-version = "0.2.0"
+version = "0.3.0"
 description = "A live terminal panel for llama.cpp's llama-server on Windows: GPU and shared memory, RAM, requests"
 readme = "README.md"
 requires-python = ">=3.11"

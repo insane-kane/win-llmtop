@@ -26,6 +26,7 @@ class View:
 		self.page, self.win, self.scroll, self.msel, self.rsel, self.level, self.paused, self.msg = 0, window, 0, 0, 0, 0, False, ""
 		self.gh, self.tmode, self.dev, self.turns = 0, 0, 0, False  # graph height (0 = fit the terminal), tensor view mode, tensor device filter, nested turns
 		self.live_prompts = False  # the Live page's bottom table: recent prompts instead of recent turns
+		self.detail = False  # the Events page's detail toggle: show each event's detail line(s)
 		self.cache, self.cache_sec = {}, 0
 
 	@property
@@ -249,9 +250,7 @@ def banner(c, snap, n, W=120):
 	for _key, a in alerts[:n]:
 		icon, col = ICON[a["level"]]
 		prefix = " %s%s %s%s %s%5s%s  " % (color(col), icon, a["level"].upper().ljust(4), C.reset, C.grey, ago(snap["t"] - a["since"]), C.reset)
-		words = textwrap.wrap(a["msg"], max(30, W - 18))
-		out.append(prefix + words[0])
-		out += [" " * 17 + w for w in words[1:3]]
+		out.append(prefix + a["msg"])  # the headline only, one line, never wrapped
 	if len(alerts) > n:
 		out.append("%s   … %d more alert(s)%s" % (C.grey, len(alerts) - n, C.reset))
 	return out
@@ -270,7 +269,7 @@ def notice_lines(snap, n=4):
 def footer(view, W):
 	page = View.PAGES[view.page]
 	keys = "1-6 or ←/→ page   [ ] time window   g graph height   s graph style   p pause   ↑↓ PgUp PgDn scroll"
-	keys += {"Live": "   t prompts/turns", "Memory": "   m next model", "System": "", "Requests": "   m preset   t turns", "Events": "   f level filter", "Tensors": "   t layers/tensors   d device   m next model"}[page]
+	keys += {"Live": "   t prompts/turns", "Memory": "   m next model", "System": "", "Requests": "   m preset   t turns", "Events": "   f level filter   d detail", "Tensors": "   t layers/tensors   d device   m next model"}[page]
 	return "%s %s   q quit%s%s" % (C.bold, keys, C.reset, "   " + view.msg if view.msg else "")
 
 
@@ -1028,17 +1027,21 @@ LEVEL_FILTER = (("all", 0), ("warnings and errors", 1), ("errors only", 2))
 def events(c, snap, view, W, H):
 	label, lvl = LEVEL_FILTER[view.level % 3]
 	evs = [e for e in c.events if S.LEVELS[e["level"]] >= lvl][::-1]
-	head = [section("EVENTS", W, "%d shown · %s   (f: change filter)" % (len(evs), label)), ""]
+	head = [section("EVENTS", W, "%d shown · %s   (f: filter, d: detail)" % (len(evs), label)), ""]
 	head += notice_lines(snap, None)  # every notice, untruncated
 	if not evs:
 		return head + ["  %snothing yet%s" % (C.grey, C.reset)]
 
-	def row(i):
-		e = evs[i]
+	dw = max(20, W - 9)  # wrap width for the detail continuation lines
+	lines = list(head)
+	for e in evs:
 		icon, col = ICON[e["level"]]
-		return " %s  %s%s%s  %s  %s" % (pad(clock(e["wall"], True), 11), color(col), icon, C.reset, pad(e["kind"], 7), e["msg"])
-
-	return paged(view, head, len(evs), row, H)
+		lines.append(" %s  %s%s%s  %s  %s" % (pad(clock(e["wall"], True), 11), color(col), icon, C.reset, pad(e["kind"], 7), e["msg"]))
+		if view.detail and e.get("detail"):
+			lines += ["    %s%s%s" % (C.grey, w, C.reset) for w in textwrap.wrap(e["detail"], dw)]
+	# scrolled by line, so a detail line and its headline stay together in the visible window
+	view.scroll = max(0, min(view.scroll, max(0, len(lines) - H)))
+	return lines[view.scroll:view.scroll + H]
 
 
 # ---- page 6: tensors ---------------------------------------------------------------------------------------------------------

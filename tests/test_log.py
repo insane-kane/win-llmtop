@@ -235,6 +235,70 @@ def test_keep_and_slot():
 	assert reqs[3]["sel"] == "LCP" and reqs[3]["sim"] == 0.500 and reqs[3]["keep"] == 1.0 and reqs[3]["slot"] is None
 
 
+def test_log_we_levels():
+	lines = [
+		"0.00.100.000 I srv  llama_server: initializing ...",
+		"0.01.000.000 E srv  failed to allocate 1024 MiB",
+		"0.02.000.000 E srv  some other error",
+		"0.03.000.000 W srv  security: something",
+		"0.04.000.000 W srv  some warning",
+	]
+	_, _, evs = feed(lines)
+	logs = {e["msg"]: e for e in evs if e["kind"] == "log"}
+	assert len(logs) == 4, evs
+	assert logs["preset: failed to allocate 1024 MiB"]["level"] == "crit"  # E with a crit pattern
+	assert logs["preset: some other error"]["level"] == "warn"  # E without a crit pattern
+	assert logs["preset: security: something"]["level"] == "info"  # W that is a known notice
+	assert logs["preset: some warning"]["level"] == "warn"  # W that is not a known notice
+
+
+def test_log_long_line_headline_and_detail():
+	long = "the model failed to load because " + "of a very long reason " * 10
+	lines = ["0.00.100.000 I srv  llama_server: initializing ...", "0.01.000.000 E srv  " + long]
+	_, _, evs = feed(lines)
+	logs = [e for e in evs if e["kind"] == "log"]
+	assert len(logs) == 1, evs
+	e = logs[0]
+	assert len(e["msg"]) <= 72 and e["msg"].endswith("…"), e["msg"]  # capped at a word boundary
+	assert e["detail"] == ("srv  " + long)[:400], e["detail"]  # the detail is the full line, up to 400
+	assert e["level"] == "warn"  # E but no crit pattern
+
+
+def test_log_headline_prefix_trim():
+	assert log.log_headline("srv  failed to allocate 1024 MiB") == "failed to allocate 1024 MiB"
+	assert log.log_headline("slot  some message") == "some message"
+	assert log.log_headline("no prefix here") == "no prefix here"
+
+
+def test_trunc_is_crit():
+	lines = [
+		"0.00.100.000 I srv  llama_server: initializing ...",
+		"0.01.000.000 I srv  llama_server: model loaded",
+		"0.02.001.000 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0",
+		"0.03.000.000 I slot      release: id  0 | task 0 | stop processing: n_tokens = 100, truncated = 1",
+	]
+	_, reqs, evs = feed(lines)
+	truncs = [e for e in evs if e["kind"] == "trunc"]
+	assert len(truncs) == 1, evs
+	assert truncs[0]["level"] == "crit", truncs[0]
+	assert truncs[0]["msg"] == "preset: task 0: prompt cut off", truncs[0]
+	assert truncs[0]["detail"] == "the log reports truncated = 1", truncs[0]
+	assert reqs[0]["trunc"] is True
+
+
+def test_request_failed_is_crit_with_detail():
+	msg = "the context was too long for the available memory and the server could not continue processing the request"
+	lines = ['I srv  got exception: some prefix "message":"%s"' % msg]
+	evs = log.parse_router(lines, router_start=1000.0)
+	errs = [e for e in evs if e["kind"] == "error"]
+	assert len(errs) == 1, evs
+	e = errs[0]
+	assert e["level"] == "crit", e
+	assert e["msg"].startswith("request failed: "), e["msg"]
+	assert len(e["msg"]) <= 72, e["msg"]
+	assert e["detail"] == msg[:400], e["detail"]
+
+
 CASES = [
 	("b11669_with_timestamps", test_b11669_with_timestamps),
 	("no_timestamps", test_no_timestamps),
@@ -248,6 +312,11 @@ CASES = [
 	("parse_router_forwarded_no_timestamps", test_parse_router_forwarded_no_timestamps),
 	("router_log_start_and_router_logs", test_router_log_start_and_router_logs),
 	("keep_and_slot", test_keep_and_slot),
+	("log_we_levels", test_log_we_levels),
+	("log_long_line_headline_and_detail", test_log_long_line_headline_and_detail),
+	("log_headline_prefix_trim", test_log_headline_prefix_trim),
+	("trunc_is_crit", test_trunc_is_crit),
+	("request_failed_is_crit_with_detail", test_request_failed_is_crit_with_detail),
 ]
 
 

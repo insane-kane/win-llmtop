@@ -87,6 +87,8 @@ def handle(key, c, view, snap, H):
 		view.live_prompts = not view.live_prompts
 	elif key == "f" and page == "Events":
 		view.level, view.scroll = (view.level + 1) % 3, 0
+	elif key == "d" and page == "Events":
+		view.detail, view.scroll = not view.detail, 0
 	elif key == "t" and page == "Tensors":
 		view.tmode, view.scroll = (view.tmode + 1) % 2, 0
 	elif key == "d" and page == "Tensors":
@@ -426,6 +428,7 @@ def main():
 	ap.add_argument("--check", action="store_true", help="report on prerequisites and reachable sources, then exit")
 	ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
 	ap.add_argument("--page", choices=PAGE_NAMES + ["all"], default="live", help="page for --once")
+	ap.add_argument("--detail", action="store_true", help="with --once --page events, show each event's detail line(s) (the d key in the interactive Events page)")
 	ap.add_argument("--plan", nargs="?", const="all", metavar="PRESET", help="project VRAM per preset against the OS budget")
 	ap.add_argument("--window", choices=list(WINDOWS), default="5m", help="initial history window")
 	ap.add_argument("--router", default=os.environ.get("LLMTOP_ROUTER") or None, metavar="URL", help="llama-server URL (default: find it; env LLMTOP_ROUTER)")
@@ -484,6 +487,7 @@ def main():
 	if not args.check:
 		c.load_history()
 	view = pages.View(WINDOWS[args.window])
+	view.detail = args.detail
 	width = args.width or shutil.get_terminal_size((140, 40)).columns
 	try:
 		if args.check:

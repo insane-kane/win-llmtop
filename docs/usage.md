@@ -43,7 +43,7 @@ Run `win-llmtop` with no arguments for the interactive full-screen view (sampled
 | `2` | **Memory** | For one preset (`m` cycles presets, loaded or unloaded): VRAM by component (weights, KV cache, recurrent state, compute buffers, draft, overhead) against the OS budget; `llama-server` host RAM breakdown; layer placement overview |
 | `3` | **System** | CPU model, core and thread counts, per-core load, L1/L2/L3 cache topology, and CPU load and clock trend charts; system RAM by consumer (`llama-server`, other processes, kernel remainder, file cache, free) with top working sets; page file size, use, peak and commit limit; RAM and paging trend charts |
 | `4` | **Requests** | Per-preset prompt and turn volume, busy time, loads and issues; median, slow-10% and sample-count speeds; prefill and decode t/s by context depth (`<8k`, `8–32k`, `32–64k`, `64k+`); per-turn charts; and every prompt with nested turns, each with its cache hit and draft acceptance (`m` filters by preset, `t` toggles nested turns) |
-| `5` | **Events** | Threshold alerts raised and cleared, model loads, request queueing, preset evictions, prompt-cache misses, request errors and context truncation (`f` filters by severity level) |
+| `5` | **Events** | Threshold alerts raised and cleared, model loads, request queueing, preset evictions, prompt-cache misses, request errors and context truncation. Each event is a short headline; `f` filters by severity level and `d` toggles the detail line(s) (the comparisons, thresholds and deductions the headline leaves out) |
 | `6` | **Tensors** | Every layer (`t` toggles individual tensors) with GGUF type, shape, size, `■ GPU` / `■ CPU` badge, and the flag or rule that placed CPU tensors (`d` filters by device) |
 
 ### Keyboard controls
@@ -61,6 +61,7 @@ Run `win-llmtop` with no arguments for the interactive full-screen view (sampled
 | `t` | **Live** | Switch the bottom table between recent turns and recent prompts |
 | `t` | **Requests** | Show or hide individual turns nested under each prompt |
 | `f` | **Events** | Cycle the event severity filter (`all`, `warn+`, `crit`) |
+| `d` | **Events** | Toggle the detail line(s) under each event (the comparisons, thresholds and deductions the headline leaves out) |
 | `t` | **Tensors** | Switch between per-layer summary and every individual tensor |
 | `d` | **Tensors** | Filter tensors by device (`all`, `GPU`, `CPU`) |
 | `q` or `Esc` | All pages | Quit `win-llmtop` |
@@ -105,7 +106,7 @@ Point [`--router-log`](llmtop.1.md#options) directly at the router's log file, o
 
 ## Snapshots and VRAM planning
 
-- **Single snapshot ([`--once`](llmtop.1.md#options)):** `win-llmtop --once` collects four warmup samples (so rate counters have two points) and prints the **Live** page once to standard output. Combine with [`--page`](llmtop.1.md#options) (`live`, `memory`, `system`, `requests`, `events`, `tensors`, or `all` for every page), [`--width`](llmtop.1.md#options) to fix the column width, and [`--no-color`](llmtop.1.md#options) when piping to a file.
+- **Single snapshot ([`--once`](llmtop.1.md#options)):** `win-llmtop --once` collects four warmup samples (so rate counters have two points) and prints the **Live** page once to standard output. Combine with [`--page`](llmtop.1.md#options) (`live`, `memory`, `system`, `requests`, `events`, `tensors`, or `all` for every page), [`--detail`](llmtop.1.md#options) to show each event's detail line(s) on the Events page, [`--width`](llmtop.1.md#options) to fix the column width, and [`--no-color`](llmtop.1.md#options) when piping to a file.
 - **VRAM projection ([`--plan`](llmtop.1.md#options)):** `win-llmtop --plan` inspects every preset's GGUF header and runs `llama-fit-params` to project weights, KV cache and recurrent state, compute buffers, draft model and learned VRAM overhead against the DXGI OS budget without loading any model. Pass a preset name (`win-llmtop --plan <PRESET>`) to print the full **Memory** page map for that preset.
 
 ---

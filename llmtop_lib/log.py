@@ -32,6 +32,29 @@ RE_SPAWN = re.compile(rb"^(\d+)\.(\d\d)\.(\d{3})\.(\d{3}) I srv\s+load: spawning
 # warnings that llama.cpp prints on every load; listed as info rather than warnings
 LRU_EVENT_TOKENS = 1000  # an LRU slot pick that replaced at least this many held tokens is listed as an event
 NOTICE = re.compile(r"security: |control-looking token|removing it from EOG|override 'tokenizer|sharing with layer|chat template (does NOT )?support")
+# an error line that means the server or a request is failing now: out of memory, allocation and load failures, aborts, fatals
+CRIT = re.compile(r"out of memory|failed to allocate|GGML_ASSERT|ggml_abort|failed to load model|fatal|unable to allocate")
+# a leading llama.cpp prefix in a log line: a `component:` tag or a `component  ` (double-space) tag
+RE_LOG_PREFIX = re.compile(r"^(?:\S+:\s+|[A-Za-z_][A-Za-z0-9_]*\s{2,})")
+
+
+def cap(text, limit=72):
+	"""Cap `text` at `limit` characters, cutting at a word boundary and marking the cut with …."""
+	if len(text) <= limit:
+		return text
+	cut = text[:limit - 1]
+	sp = cut.rfind(" ")
+	if sp > 0:
+		cut = cut[:sp]
+	return cut + "…"
+
+
+def log_headline(text, limit=72):
+	"""A log line's headline: the text trimmed of its leading llama.cpp prefix, capped at `limit` characters at a word boundary with …."""
+	base = RE_LOG_PREFIX.sub("", text.strip(), count=1)
+	if not base:
+		base = text.strip()
+	return cap(base, limit)
 
 
 def rel_seconds(m):
@@ -136,10 +159,11 @@ class Assembler:
 			return done, events
 		if "llama_server: model loaded" in text and self.sessions:
 			self.sessions[-1]["load_s"] = t
-			events.append(self._event(t, wall, "info", "loaded", "%s ready in %.1f s" % (self.preset, t)))
+			events.append(self._event(t, wall, "info", "loaded", log_headline("%s ready in %.1f s" % (self.preset, t))))
 			return done, events
 		if lvl in "WE":
-			events.append(self._event(t, wall, "crit" if lvl == "E" else "info" if NOTICE.search(text) else "warn", "log", text[:200]))
+			level = "crit" if (lvl == "E" and CRIT.search(text)) else "info" if (lvl == "W" and NOTICE.search(text)) else "warn"
+			events.append(self._event(t, wall, level, "log", log_headline(text), detail=text[:400] if len(text) > 72 else None))
 			return done, events
 		if m := RE_LCP.search(text):
 			sm = RE_SLOT.search(text)
@@ -149,7 +173,8 @@ class Assembler:
 			sm = RE_SLOT.search(text)
 			self.sel = {"sel": "LRU", "sim": 0.0, "evicted": int(m.group(1)), "keep": 1.0, "slot": int(sm.group(1)) if sm else None}
 			if int(m.group(1)) >= LRU_EVENT_TOKENS:
-				events.append(self._event(t, wall, "info", "slot", "slot chosen by LRU (no prefix match above the similarity threshold); it held %s tokens" % format(int(m.group(1)), ",")))
+				events.append(self._event(t, wall, "info", "slot", log_headline("slot chosen by LRU, held %s tokens" % format(int(m.group(1)), ",")),
+					detail="no prefix match above the similarity threshold"))
 			return done, events
 		tm = RE_TASK.search(text)
 		if not tm or int(tm.group(1)) < 0:
@@ -174,7 +199,8 @@ class Assembler:
 		elif m := RE_REALLOC.search(body):
 			r["reallocs"], r["reallocs_same"] = int(m.group(2)), int(m.group(1))  # the log labels the two figures "(same size) / (changed size)"
 			if int(m.group(2)):
-				events.append(self._event(t, wall, "info", "alloc", "task %d: compute graph reallocated with changed buffer sizes %d time(s) (log: %d same-size, %d changed-size)" % (task, int(m.group(2)), int(m.group(1)), int(m.group(2)))))
+				events.append(self._event(t, wall, "info", "alloc", log_headline("task %d: compute graph reallocated" % task),
+					detail="changed buffer sizes %d time(s) (log: %d same-size, %d changed-size)" % (int(m.group(2)), int(m.group(1)), int(m.group(2)))))
 		elif m := RE_DRAFT.search(body):
 			r.update(acc=float(m.group(1)), dacc=int(m.group(2)), dgen=int(m.group(3)), mlen=float(m.group(4)) if m.group(4) is not None else None)
 		elif m := RE_RELEASE.search(body):
@@ -183,14 +209,17 @@ class Assembler:
 			r.update(t=t, wall=wall, kv=int(m.group(1)), trunc=bool(int(m.group(2))) if m.group(2) is not None else False)
 			r["cached"] = max(0, r["kv"] - r["tn"] - r["pn"]) if "pn" in r and "tn" in r else None  # derived: tokens in the slot at release, minus generated, minus newly evaluated
 			if r["trunc"]:
-				events.append(self._event(t, wall, "warn", "trunc", "task %d: the log reports truncated = 1" % task))
+				events.append(self._event(t, wall, "crit", "trunc", log_headline("task %d: prompt cut off" % task), detail="the log reports truncated = 1"))
 			done.append(r)
 		return done, events
 
-	def _event(self, t, wall, level, kind, msg):
+	def _event(self, t, wall, level, kind, msg, detail=None):
 		if kind in ("log", "slot", "alloc", "trunc"):
-			msg = "%s: %s" % (self.preset, msg)
-		return {"t": t, "wall": wall, "level": level, "kind": kind, "msg": msg, "preset": self.preset, "session": len(self.sessions) - 1}
+			msg = cap("%s: %s" % (self.preset, msg))  # the preset names the model; the full headline stays within 72
+		ev = {"t": t, "wall": wall, "level": level, "kind": kind, "msg": msg, "preset": self.preset, "session": len(self.sessions) - 1}
+		if detail:
+			ev["detail"] = detail
+		return ev
 
 
 def parse_router(lines, router_start=None):
@@ -209,19 +238,24 @@ def parse_router(lines, router_start=None):
 		wall = router_start + t if router_start else time.time()
 		ev = None
 		if mm := re.search(r"join: request for name=(\S+) queued at position (\d+)", text):
-			ev = ("info", "queue", "request for %s queued (position %s)" % mm.groups())
+			ev = ("info", "queue", log_headline("request for %s queued (position %s)" % mm.groups()), None)
 		elif mm := re.search(r"ensure_model: slot available, loading queued model name=(\S+)", text):
-			ev = ("info", "load", "loading %s" % mm.group(1))
+			ev = ("info", "load", log_headline("loading %s" % mm.group(1)), None)
 		elif mm := re.search(r"tick: evicting idle LRU name=(\S+)", text):
-			ev = ("info", "unload", "router evicts idle model %s for a queued request" % mm.group(1))
+			ev = ("info", "unload", log_headline("router evicts idle model %s" % mm.group(1)), "for a queued request")
 		elif mm := re.search(r"run: instance name=(\S+) exited with status (-?\d+)", text):
-			ev = ("info" if mm.group(2) == "0" else "crit", "exit", "%s exited with status %s" % mm.groups())
+			ev = ("info" if mm.group(2) == "0" else "crit", "exit", log_headline("%s exited with status %s" % mm.groups()), None)
 		elif mm := re.search(r"got exception: .*?\"message\":\"(.*?)\"", text):
-			ev = ("warn", "error", "request failed: " + mm.group(1)[:160])
+			base = "request failed: " + mm.group(1)
+			ev = ("crit", "error", log_headline(base), mm.group(1)[:400] if len(base) > 72 else None)
 		elif lvl in "WE" and "got exception" not in text:
-			ev = ("crit" if lvl == "E" else "info" if NOTICE.search(text) else "warn", "router", text[:200])
+			level = "crit" if (lvl == "E" and CRIT.search(text)) else "info" if (lvl == "W" and NOTICE.search(text)) else "warn"
+			ev = (level, "router", log_headline(text), text[:400] if len(text) > 72 else None)
 		if ev:
-			events.append({"t": t, "wall": wall, "level": ev[0], "kind": ev[1], "msg": ev[2], "preset": None, "session": None, "port": port})
+			e = {"t": t, "wall": wall, "level": ev[0], "kind": ev[1], "msg": ev[2], "preset": None, "session": None, "port": port}
+			if ev[3]:
+				e["detail"] = ev[3]
+			events.append(e)
 	return events
 
 

@@ -13,6 +13,7 @@ import pathlib
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -258,10 +259,10 @@ class TestState(unittest.TestCase):
 				self.assertEqual(p1["slot_error"], "HTTP 401")
 				self.assertIsNone(p1["slot"])
 				self.assertIn("slots:preset-a", c.alerts.active)
-				alert_msg = c.alerts.active["slots:preset-a"]["msg"]
-				self.assertIn("HTTP 401", alert_msg)
-				self.assertIn("--api-key", alert_msg)
-				self.assertIn("LLAMA_API_KEY", alert_msg)
+				alert = c.alerts.active["slots:preset-a"]
+				self.assertIn("HTTP 401", alert["msg"])  # the headline names the error
+				self.assertIn("--api-key", alert["detail"])  # the fix moved to the detail
+				self.assertIn("LLAMA_API_KEY", alert["detail"])
 
 				c.cfg["api_key"] = "test-token-123"
 				snap2 = c.tick(1700000100.5)
@@ -445,7 +446,8 @@ class TestState(unittest.TestCase):
 				self.assertIn("Access is denied.", snap["llama"]["pm_error"])
 				self.assertIn("Access is denied.", snap["vm_error"])
 				self.assertEqual(snap["presets"]["p1"]["slot_error"], "HTTP 501")
-				self.assertIn("--slots", c.alerts.active["slots:p1"]["msg"])
+				self.assertIn("HTTP 501", c.alerts.active["slots:p1"]["msg"])
+				self.assertIn("--slots", c.alerts.active["slots:p1"]["detail"])
 				self.assertTrue(any("calibration is paused" in n for n in snap["notices"]), snap["notices"])
 		finally:
 			srv.close()
@@ -574,6 +576,132 @@ class TestState(unittest.TestCase):
 			srv.close()
 
 
+class _Emit:
+	"""A stand-in for Collector.emit: records each event it is called with."""
+
+	def __init__(self):
+		self.events = []
+
+	def __call__(self, level, kind, msg, wall=None, preset=None, detail=None):
+		self.events.append({"level": level, "kind": kind, "msg": msg, "detail": detail})
+
+
+def _snap(**over):
+	"""A snapshot that triggers no alert; `over` replaces whole sections."""
+	s = {
+		"t": 1700000100.0,
+		"router_up": True,
+		"router_error": "",
+		"router_auth_error": None,
+		"presets": {},
+		"gpu": {"name": "Stub GPU", "vram": 24576.0, "shared": 32768.0, "budget": 20000.0, "ded": 4500.0, "shr": 200.0, "uma": False},
+		"llama": {
+			"present": True, "pids": [2000], "ded": 4096.0, "shr": 128.0, "com": 4224.0, "ws": 1024.0, "commit": 1100.0,
+			"age": 1000.0, "floor": 0.0, "floor_known": False, "allow": 0.0, "allow_known": False, "allow_src": "",
+			"over": 0.0, "ws_drop": 0.0, "commit_drop": 0.0, "vm": None, "vm_error": None,
+		},
+		"ram": {"total": 65536.0, "avail": 32768.0, "commit": 20000.0, "commit_limit": 81920.0, "commit_max": 98304.0, "pagefiles": []},
+		"others": [],
+		"busy": False,
+		"new_events": [],
+		"notices": [],
+	}
+	for k, v in over.items():
+		s[k] = v
+	return s
+
+
+class TestAlertHeadlines(unittest.TestCase):
+	def _alerts(self, snaps):
+		"""Run Alerts.evaluate over `snaps` in order; return (alerts, emit)."""
+		emit = _Emit()
+		a = state.Alerts(dict(state.CFG, router="http://127.0.0.1:8080"), emit)
+		for s in snaps:
+			a.evaluate(s, None)
+		return a, emit
+
+	def _one(self, key, snaps):
+		a, emit = self._alerts(snaps)
+		self.assertIn(key, a.active, "alert %r did not fire" % key)
+		return a.active[key], emit
+
+	def test_every_alert_headline_fits_in_72_chars(self):
+		# (name, key, snapshots) for every alert rule in Alerts.evaluate
+		ll = lambda **kw: dict(_snap()["llama"], **kw)
+		cases = [
+			("router auth", "router", [_snap(router_up=False, router_auth_error="HTTP 401")]),
+			("router unreachable", "router", [_snap(router_up=False, router_error="connection refused")]),
+			("slots", "slots:preset-a", [_snap(presets={"preset-a": {"slot_error": "HTTP 401"}})]),
+			("spill excess", "spill", [_snap(llama=ll(shr=428.0, allow=128.0, over=300.0, allow_known=True))]),
+			("spill grew", "spill", [_snap(llama=ll(shr=512.0, floor=128.0, floor_known=True))]),
+			("burst crit", "burst", [_snap(t=1700000000.0, llama=ll(shr=128.0, ded=4096.0)), _snap(t=1700000002.0, llama=ll(shr=328.0, ded=3946.0))]),
+			("burst warn", "burst", [_snap(t=1700000000.0, llama=ll(shr=128.0, ded=4096.0)), _snap(t=1700000002.0, llama=ll(shr=328.0, ded=4096.0))]),
+			("return", "return", [_snap(t=1700000000.0, llama=ll(shr=528.0, ded=4096.0)), _snap(t=1700000002.0, llama=ll(shr=328.0, ded=4096.0))]),
+			("paged", "paged", [_snap(llama=ll(com=4600.0))]),
+			("budget", "budget", [_snap(llama=ll(ded=19980.0))]),
+			("rival", "rival", [_snap(others=[{"exe": "chrome.exe", "eng": 45.0, "ded": 100.0}], busy=True)]),
+			("full", "full", [_snap(gpu=dict(_snap()["gpu"], ded=24000.0))]),
+			("ram crit", "ram", [_snap(ram=dict(_snap()["ram"], avail=1000.0))]),
+			("ram warn", "ram", [_snap(ram=dict(_snap()["ram"], avail=3000.0))]),
+			("commit crit", "commit", [_snap(ram=dict(_snap()["ram"], commit=96000.0))]),
+			("commit warn", "commit", [_snap(ram=dict(_snap()["ram"], commit=92000.0))]),
+			("commit info", "commit", [_snap(ram=dict(_snap()["ram"], commit=75000.0))]),
+			("pagefile", "pagefile", [_snap(ram=dict(_snap()["ram"], pagefiles=[{"name": "C:\\pagefile.sys", "size": 16384.0, "used": 9000.0}]))]),
+			("trim info", "trim", [_snap(llama=ll(ws_drop=2048.0, commit_drop=1024.0))]),
+			("trim warn", "trim", [_snap(llama=ll(ws_drop=2048.0, commit_drop=100.0))]),
+			("exit", "exit", [_snap(new_events=[{"kind": "exit", "level": "crit", "msg": "model-a exited with status 1"}])]),
+		]
+		for name, key, snaps in cases:
+			with self.subTest(name=name):
+				alert, _ = self._one(key, snaps)
+				self.assertLessEqual(len(alert["msg"]), 72, alert["msg"])
+
+	def test_detail_carried_through_flag_and_emit(self):
+		emit = _Emit()
+		a = state.Alerts(dict(state.CFG, router="http://127.0.0.1:8080"), emit)
+		a.flag("test", "warn", "a headline", 1000.0, detail="the detail")
+		self.assertEqual(a.active["test"]["detail"], "the detail")  # kept on the active alert
+		self.assertEqual(emit.events[0]["detail"], "the detail")  # carried into the emitted event
+		a.flag("test", "warn", "a headline", 1010.0, detail="a new detail")  # a refresh updates it
+		self.assertEqual(a.active["test"]["detail"], "a new detail")
+		self.assertEqual(len(emit.events), 1)  # ... without re-emitting
+		a.flag("plain", "info", "no detail here", 1020.0)
+		self.assertIsNone(emit.events[1]["detail"])
+
+	def test_detail_persisted_and_loaded(self):
+		with tempfile.TemporaryDirectory() as tmp:
+			h = state.History(tmp)
+			ev = {"wall": 1700000100.0, "t": 0, "level": "warn", "kind": "alert", "msg": "a headline", "detail": "the detail", "preset": None, "session": None}
+			h.write_event(ev)
+			h.close()
+			samples, events = state.History(tmp).load(0)
+			self.assertEqual(len(events), 1)
+			self.assertEqual(events[0]["detail"], "the detail")
+			self.assertEqual(events[0]["msg"], "a headline")
+
+	def test_old_format_event_line_without_detail_loads(self):
+		with tempfile.TemporaryDirectory() as tmp:
+			day = time.strftime("%Y%m%d", time.localtime(1700000100.0))
+			with open(os.path.join(tmp, "samples-%s.jsonl" % day), "w", encoding="utf-8") as f:
+				f.write('{"t":1700000100,"e":{"level":"warn","kind":"alert","msg":"an old headline"}}\n')
+			samples, events = state.History(tmp).load(0)
+			self.assertEqual(len(events), 1)
+			self.assertEqual(events[0]["msg"], "an old headline")
+			self.assertNotIn("detail", events[0])  # no detail key: old lines still load and render
+
+	def test_paged_is_info_during_load_grace_and_crit_after(self):
+		alert, _ = self._one("paged", [_snap(llama=dict(_snap()["llama"], com=4600.0, age=10.0))])
+		self.assertEqual(alert["level"], "info")  # within load_grace_s of the load
+		alert, _ = self._one("paged", [_snap(llama=dict(_snap()["llama"], com=4600.0, age=1000.0))])
+		self.assertEqual(alert["level"], "crit")  # still paged well after the load
+
+	def test_spill_is_info_when_only_excess_and_warn_when_grew(self):
+		alert, _ = self._one("spill", [_snap(llama=dict(_snap()["llama"], shr=428.0, allow=128.0, over=300.0, allow_known=True))])
+		self.assertEqual(alert["level"], "info")  # over the expected allowance, but not grown past the floor
+		alert, _ = self._one("spill", [_snap(llama=dict(_snap()["llama"], shr=512.0, floor=128.0, floor_known=True))])
+		self.assertEqual(alert["level"], "warn")  # grown past the resident minimum
+
+
 CASES = [
 	("router_mode_preset_loaded_and_flags_parsed", TestState("test_router_mode_preset_loaded_and_flags_parsed")),
 	("single_model_mode_process_counted", TestState("test_single_model_mode_process_counted")),
@@ -586,6 +714,12 @@ CASES = [
 	("discovery_gpu_selection_errors_and_multi_resident", TestState("test_discovery_gpu_selection_errors_and_multi_resident")),
 	("models_401_discovery_and_auth_alert", TestState("test_models_401_discovery_and_auth_alert")),
 	("multiple_independent_servers_and_single_model_pid_matching", TestState("test_multiple_independent_servers_and_single_model_pid_matching")),
+	("every_alert_headline_fits_in_72_chars", TestAlertHeadlines("test_every_alert_headline_fits_in_72_chars")),
+	("detail_carried_through_flag_and_emit", TestAlertHeadlines("test_detail_carried_through_flag_and_emit")),
+	("detail_persisted_and_loaded", TestAlertHeadlines("test_detail_persisted_and_loaded")),
+	("old_format_event_line_without_detail_loads", TestAlertHeadlines("test_old_format_event_line_without_detail_loads")),
+	("paged_is_info_during_load_grace_and_crit_after", TestAlertHeadlines("test_paged_is_info_during_load_grace_and_crit_after")),
+	("spill_is_info_when_only_excess_and_warn_when_grew", TestAlertHeadlines("test_spill_is_info_when_only_excess_and_warn_when_grew")),
 ]
 
 

@@ -22,6 +22,7 @@ Options, with their environment variables and defaults:
 | `--check` | — | off | report on prerequisites and reachable sources, then exit |
 | `--once` | — | off | print one snapshot and exit |
 | `--page {live,memory,system,requests,events,tensors,all}` | — | `live` | page for `--once` |
+| `--detail` | — | off | with `--once --page events`, show each event's detail line(s); the `d` key does this in the interactive Events page |
 | `--plan [PRESET]` | — | off | project VRAM per preset against the OS budget |
 | `--window {1m,5m,15m,1h,6h,24h}` | — | `5m` | initial history window |
 | `--router URL` | `LLMTOP_ROUTER` | find it | `llama-server` URL |
@@ -59,10 +60,10 @@ Notices are grey `· ` lines that say why a figure is missing or a source is abs
 | **Memory** | For one preset (`m` cycles presets, loaded or not): VRAM by component against the OS budget, with what would fit; llama-server's own RAM as a short table (working set, commit by kind, mapped files, heap against the `cache-ram` and checkpoint ceilings); layer overview. |
 | **System** | CPU (model, cores and threads, per-core load, L1/L2/L3 cache topology, load and clock trends); system RAM by consumer (llama-server, other processes, kernel, file cache, free) with the largest working sets; llama-server working set and private commit; page file size, use and peak with the commit limit; RAM and paging trends. |
 | **Requests** | Per preset: volume (prompts, turns, busy time, input/new/cached/output tokens, cache hit, loads with mean load time, issues), speed (prefill and decode median, slow 10% and sample count `n`, draft acceptance and mean length), prefill and decode t/s by context depth (`<8k`, `8–32k`, `32–64k`, `64k+`; coloured by rank within each column, green fastest and red slowest), per-turn charts for qualifying turns, and every prompt newest first with its cache hit and draft acceptance (`m` filters by preset, `t` toggles nested turns). |
-| **Events** | Alerts raised and cleared, model loads, queueing, evictions, prompt-cache misses, request errors, truncation (`f` filters by level). |
+| **Events** | Alerts raised and cleared, model loads, queueing, evictions, prompt-cache misses, request errors, truncation. Each event is a short headline; `f` filters by level and `d` toggles the detail line(s) under each event (the comparisons, thresholds and deductions the headline leaves out). |
 | **Tensors** | Every layer (`t` switches to every tensor) with type, shape, size and device as a ■ GPU / ■ CPU badge, plus a short tag where something deliberate placed it on the CPU; `d` filters by device. |
 
-Keys: `[` `]` change the history window; `g` sets the graph height (auto, 1–4 lines); `s` switches the graph style; `↑` `↓` `PgUp` `PgDn` `Home` `End` scroll every page except Live; on Live `t` switches the bottom table between recent turns and recent prompts; `p` or `Space` pauses the display (collection continues); `q` quits.
+Keys: `[` `]` change the history window; `g` sets the graph height (auto, 1–4 lines); `s` switches the graph style; `↑` `↓` `PgUp` `PgDn` `Home` `End` scroll every page except Live; on Live `t` switches the bottom table between recent turns and recent prompts; on Events `f` filters by level and `d` toggles the detail line(s); on Tensors `d` filters by device; `p` or `Space` pauses the display (collection continues); `q` quits.
 
 ### Prompts, turns and notes
 - **Turn:** one `llama-server` request.
@@ -123,7 +124,7 @@ Some lines are deductions from those figures; each says so and gives its basis:
 - *Working set fell*: commit that falls with it means the process released the memory (commit only falls when memory is released); commit that stays means the pages left the working set while staying committed, which is what reclaiming by Windows looks like.
 - *Prompt cache bound*: private commit left after GPU resident, shared, and llama.cpp's projected host weights and buffers is compared with `cache-ram`, which `--help` defines as the maximum cache size. Above it, at least the excess is something other than prompt cache; within it, the figure is consistent with being all cache, which does not prove it.
 - *Commit limit*: when headroom is below the critical threshold the alert says Windows fails commit requests beyond the limit, a documented rule.
-- *Near the OS budget*: the shared-memory alert is critical when resident VRAM is within `near_budget_mib` of the budget, the condition under which Windows documents demoting allocations. The message states the condition, not that demotion happened.
+- *Near the OS budget*: the shared-memory alert's detail states how near resident VRAM is to the OS budget (`near_budget_mib`), the condition under which Windows documents demoting allocations. The message states the condition, not that demotion happened.
 
 The Memory page says whether the derived weights, KV and state agree with `llama-fit-params` (within 3%) and lists anything assumed, for example a flag left on *auto* that the analysis had to give a value.
 
@@ -143,18 +144,18 @@ Two baselines are shown against the shared figure, because neither alone settles
 - **When the model became resident.** CPU-side buffers are allocated when the model loads, so the shared figure at that moment (lowest seen since) is what this process held before any request. Growth beyond it is what the alert reports. This is measured for the process, but it is unknown if llmtop first saw the process after it had already grown.
 - **llama.cpp's projection of CPU-side buffers** (see `--no-host`), or, if llmtop has measured one, the lowest shared figure seen on an earlier load of the same configuration while resident plus shared memory was at least 1 GiB under the budget (so nothing could have been demoted). It is labelled unverified when projected.
 
-The page also states what share of all processes' shared GPU memory belongs to llama-server. A **demotion** is reported (critical) only when it is observed: shared memory rose and resident VRAM fell by at least half as much within the window. Growth of shared memory without that exchange, or shared memory above a baseline while VRAM is near the budget, is a warning, never a conclusion. The OS budget is the DXGI figure for llmtop itself; Microsoft documents it as the amount of video memory the process can use before the video memory manager may demote its allocations.
+The page also states what share of all processes' shared GPU memory belongs to llama-server. A **demotion** is reported (critical) only when it is observed: shared memory rose and resident VRAM fell by at least half as much within the window. Growth of shared memory without that exchange is a warning; shared memory above a baseline, without that growth, is informational. Neither is a conclusion. The OS budget is the DXGI figure for llmtop itself; Microsoft documents it as the amount of video memory the process can use before the video memory manager may demote its allocations.
 
 ### Alerts
 Each rule holds while its condition is true and clears after 10 s of quiet. Every threshold is in `CFG` in `llmtop_lib/state.py` and can be set with `--threshold NAME=VALUE` (including `prompt_gap_s`, `30` s, for grouping turns into prompts). Six of them scale with the machine unless set: `avail_warn` = the smaller of 4 GiB and 7% of installed RAM, `avail_crit` = 2 GiB or 3.5%, `commit_warn` = 8 GiB or 10% of the commit limit at the page file's configured maximum, `commit_crit` = 3 GiB or 4% of it, `near_budget_mib` = 512 MiB or 3% of the VRAM budget, `idle_headroom_mib` = 1 GiB or 6% of it; the table shows those caps. Messages state the counter values; none states a cause.
 
 | Alert | Level | Condition (threshold name) |
 | :--- | :--- | :--- |
-| shared GPU memory | warn | shared memory is ≥ `spill_mib` (256 MiB) above the figure it held when the model became resident, or above the CPU-side baseline; the message states both comparisons and how near resident VRAM is to the OS budget (`near_budget_mib`, 512 MiB) |
+| shared GPU memory | info / warn | above the CPU-side baseline by ≥ `spill_mib` (256 MiB): info; grown by ≥ `spill_mib` above the figure it held when the model became resident: warn; the detail states both comparisons and how near resident VRAM is to the OS budget (`near_budget_mib`, 512 MiB) |
 | memory moved to shared | crit | shared memory rose by ≥ `burst_mib` (128 MiB) within `burst_window_s` (4 s), more than `load_grace_s` (90 s) after the model loaded, and resident VRAM fell by at least half as much; held `hold_s` (30 s) |
 | shared memory rose | warn | the same rise without a matching fall in resident VRAM |
 | shared memory fell | info | shared memory fell by ≥ `burst_mib` within the same window |
-| committed, not resident | crit | committed minus resident minus shared ≥ `spill_mib` |
+| committed, not resident | info / crit | committed minus resident minus shared ≥ `spill_mib`; info within `load_grace_s` (90 s) of the load, crit after |
 | near the OS budget | warn | resident VRAM within `at_budget_mib` (64 MiB) of the budget, no excess |
 | GPU used by another process | warn | another process uses ≥ `rival_gpu_pct` (30%) of the GPU while a request runs |
 | GPU memory used | warn | adapter dedicated memory ≥ `card_full_pct` (97%) of capacity |

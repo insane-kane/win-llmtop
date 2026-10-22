@@ -163,7 +163,10 @@ class History:
 		self._write(sec, {"t": sec, "v": {k: round(v, 1) for k, v in vals.items()}})
 
 	def write_event(self, ev):
-		self._write(ev["wall"], {"t": int(ev["wall"]), "e": {k: ev[k] for k in ("level", "kind", "msg")}})
+		e = {k: ev[k] for k in ("level", "kind", "msg")}
+		if ev.get("detail"):
+			e["detail"] = ev["detail"]
+		self._write(ev["wall"], {"t": int(ev["wall"]), "e": e})
 
 	def load(self, since):
 		"""(samples, events) recorded after `since` (epoch)."""
@@ -267,13 +270,13 @@ class Alerts:
 	def __init__(self, cfg, emit):
 		self.cfg, self.emit, self.active, self.prev = cfg, emit, {}, deque(maxlen=40)
 
-	def flag(self, key, level, msg, now, hold=0):
+	def flag(self, key, level, msg, now, hold=0, detail=None):
 		a = self.active.get(key)
 		if a is None:
-			self.active[key] = {"level": level, "msg": msg, "since": now, "last": now + hold}
-			self.emit(level, "alert", msg)
+			self.active[key] = {"level": level, "msg": msg, "detail": detail, "since": now, "last": now + hold}
+			self.emit(level, "alert", msg, detail=detail)
 		else:
-			a.update(level=level, msg=msg, last=max(a["last"], now + hold))
+			a.update(level=level, msg=msg, detail=detail, last=max(a["last"], now + hold))
 
 	def sweep(self, now):
 		for key in [k for k, a in self.active.items() if now - a["last"] > self.cfg["clear_s"]]:
@@ -284,20 +287,20 @@ class Alerts:
 		return sorted(self.active.items(), key=lambda kv: (-LEVELS[kv[1]["level"]], kv[1]["since"]))
 
 	def evaluate(self, snap, mem):
-		"""Every message states counter values and the threshold that was crossed; none states a cause."""
+		"""Every alert is a short headline (msg) plus an optional detail; the detail carries the comparisons, thresholds and deductions."""
 		now, c, g, ll, rm = snap["t"], self.cfg, snap["gpu"], snap["llama"], snap["ram"]
 		if not snap["router_up"]:
 			if snap.get("router_auth_error"):
-				self.flag("router", "crit", "server at %s returned %s: pass --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY" % (c["router"], snap["router_auth_error"]), now)
+				self.flag("router", "crit", headline("%s: pass --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY" % snap["router_auth_error"]), now,
+					detail="server at %s returned %s" % (c["router"], snap["router_auth_error"]))
 			else:
-				self.flag("router", "crit", "router unreachable at %s: %s" % (c["router"], snap["router_error"]), now)
+				self.flag("router", "crit", headline("router unreachable at %s" % c["router"]), now, detail=snap["router_error"] or None)
 		for preset, p in snap["presets"].items():
 			err = p.get("slot_error")
 			if err:
 				fix = ("pass --api-key or set LLAMA_API_KEY" if err in ("HTTP 401", "HTTP 403") else
 					"the server's /slots endpoint is off (start it with --slots)" if err in ("HTTP 404", "HTTP 501") else None)
-				msg = ("/slots for %s returned %s: %s" % (preset, err, fix)) if fix else ("/slots for %s returned %s" % (preset, err))
-				self.flag("slots:" + preset, "warn", msg, now)
+				self.flag("slots:" + preset, "info", headline("/slots for %s returned %s" % (preset, err)), now, detail=fix)
 			else:
 				self.active.pop("slots:" + preset, None)
 		if g and ll["present"]:
@@ -315,50 +318,66 @@ class Alerts:
 					facts.append("%s the %s it held once the model was resident (lowest seen since)" % ("up %s from" % mib(ll["shr"] - ll["floor"]) if ll["shr"] - ll["floor"] >= 1 else "unchanged from", mib(ll["floor"])))
 				if ll["allow_known"]:
 					facts.append("%s %s the %s of CPU-side buffers %s" % (mib(abs(ll["shr"] - ll["allow"])), "more than" if ll["shr"] >= ll["allow"] else "less than", mib(ll["allow"]), src))
-				self.flag("spill", "warn", "llama-server's shared GPU memory is %s: %s.%s Resident VRAM %s is %s" % (mib(ll["shr"]), "; ".join(facts), share, mib(ll["ded"]), where), now)
+				if ll["allow_known"]:
+					msg = "shared memory %s, %s over expected" % (mib(ll["shr"]), mib(ll["over"]))
+				else:
+					msg = "shared memory %s, %s above the resident minimum" % (mib(ll["shr"]), mib(ll["shr"] - ll["floor"]))
+				self.flag("spill", "warn" if grew else "info", headline(msg), now,
+					detail="%s.%s Resident VRAM %s is %s" % ("; ".join(facts), share, mib(ll["ded"]), where))
 			if old and ll["age"] > c["load_grace_s"] and ll["shr"] - old[1] >= c["burst_mib"]:
 				rose, fell = ll["shr"] - old[1], old[2] - ll["ded"]
 				if fell >= 0.5 * rose:
-					self.flag("burst", "crit", "memory moved from VRAM to shared: shared rose by %s and resident VRAM fell by %s within %.0f s (total %+.0f MiB)" % (mib(rose), mib(fell), now - old[0], rose - fell), now, hold=c["hold_s"])
+					self.flag("burst", "crit", headline("memory moved from VRAM to shared: +%s in %.0f s" % (mib(rose), now - old[0])), now, hold=c["hold_s"],
+						detail="shared rose by %s and resident VRAM fell by %s within %.0f s (total %+.0f MiB)" % (mib(rose), mib(fell), now - old[0], rose - fell))
 				else:
-					self.flag("burst", "warn", "llama-server's shared GPU memory rose by %s in %.0f s without a matching fall in resident VRAM (resident %+.0f MiB)" % (mib(rose), now - old[0], ll["ded"] - old[2]), now, hold=c["hold_s"])
+					self.flag("burst", "warn", headline("shared memory rose %s in %.0f s" % (mib(rose), now - old[0])), now, hold=c["hold_s"],
+						detail="without a matching fall in resident VRAM (resident %+.0f MiB)" % (ll["ded"] - old[2]))
 			if old and old[1] - ll["shr"] >= c["burst_mib"]:
-				self.flag("return", "info", "llama-server's shared GPU memory fell by %s in %.0f s (resident VRAM %+.0f MiB)" % (mib(old[1] - ll["shr"]), now - old[0], ll["ded"] - old[2]), now, hold=c["hold_s"] / 2)
+				self.flag("return", "info", headline("shared memory fell %s in %.0f s" % (mib(old[1] - ll["shr"]), now - old[0])), now, hold=c["hold_s"] / 2,
+					detail="resident VRAM %+.0f MiB" % (ll["ded"] - old[2]))
 			if ll["com"] - ll["ded"] - ll["shr"] >= c["spill_mib"]:
-				self.flag("paged", "crit", "%s of llama-server's committed GPU memory is neither resident in VRAM nor in shared memory (committed %s, resident %s, shared %s)"
-					% (mib(ll["com"] - ll["ded"] - ll["shr"]), mib(ll["com"]), mib(ll["ded"]), mib(ll["shr"])), now)
+				self.flag("paged", "info" if ll["age"] < c["load_grace_s"] else "crit",
+					headline("%s of committed GPU memory not in VRAM or shared" % mib(ll["com"] - ll["ded"] - ll["shr"])), now,
+					detail="committed %s, resident %s, shared %s" % (mib(ll["com"]), mib(ll["ded"]), mib(ll["shr"])))
 			if g["budget"] and ll["ded"] >= g["budget"] - c["at_budget_mib"] and ll["over"] < c["spill_mib"]:
-				self.flag("budget", "warn", "llama-server's resident VRAM %s is within %s of the OS budget %s" % (mib(ll["ded"]), mib(c["at_budget_mib"]), mib(g["budget"])), now)
+				self.flag("budget", "warn", headline("resident VRAM %s, within %s of the OS budget" % (mib(ll["ded"]), mib(c["at_budget_mib"]))), now,
+					detail="OS budget %s" % mib(g["budget"]))
 			rival = sorted((o for o in snap["others"] if o["eng"] >= c["rival_gpu_pct"]), key=lambda o: -o["eng"])
 			if rival and snap["busy"]:
-				self.flag("rival", "warn", "%s is using %.0f%% of the GPU while a llama-server request is running" % (rival[0]["exe"], rival[0]["eng"]), now)
+				self.flag("rival", "warn", headline("%s is using %.0f%% of the GPU" % (rival[0]["exe"], rival[0]["eng"])), now,
+					detail="while a llama-server request is running")
 			if not g.get("uma") and g["vram"] > 0 and g["ded"] >= c["card_full_pct"] / 100.0 * g["vram"] and ll["over"] < c["spill_mib"]:
-				self.flag("full", "warn", "GPU memory is %.0f%% used (%s of %s)" % (100 * g["ded"] / g["vram"], mib(g["ded"]), mib(g["vram"])), now)
+				self.flag("full", "warn", headline("GPU memory is %.0f%% used" % (100 * g["ded"] / g["vram"])), now,
+					detail="%s of %s" % (mib(g["ded"]), mib(g["vram"])))
 		if rm:
 			if rm["avail"] < c["avail_crit"]:
-				self.flag("ram", "crit", "available RAM is %s" % mib(rm["avail"]), now)
+				self.flag("ram", "crit", headline("available RAM %s" % mib(rm["avail"])), now)
 			elif rm["avail"] < c["avail_warn"]:
-				self.flag("ram", "warn", "available RAM is %s" % mib(rm["avail"]), now)
+				self.flag("ram", "warn", headline("available RAM %s" % mib(rm["avail"])), now)
 			room, room_now = rm["commit_max"] - rm["commit"], rm["commit_limit"] - rm["commit"]
 			if room < c["commit_crit"]:
-				self.flag("commit", "crit", "commit charge %s leaves %s before the limit with the page file at its configured maximum (%s); deduced: Windows fails commit requests beyond the limit" % (mib(rm["commit"]), mib(room), mib(rm["commit_max"])), now)
+				self.flag("commit", "crit", headline("commit charge %s, %s before the limit" % (mib(rm["commit"]), mib(room))), now,
+					detail="page file at its configured maximum (%s); deduced: Windows fails commit requests beyond the limit" % mib(rm["commit_max"]))
 			elif room < c["commit_warn"]:
-				self.flag("commit", "warn", "commit charge %s leaves %s before the limit with the page file at its configured maximum (%s)" % (mib(rm["commit"]), mib(room), mib(rm["commit_max"])), now)
+				self.flag("commit", "warn", headline("commit charge %s, %s before the limit" % (mib(rm["commit"]), mib(room))), now,
+					detail="page file at its configured maximum (%s)" % mib(rm["commit_max"]))
 			elif room_now < c["commit_warn"]:
-				self.flag("commit", "info", "commit charge %s is within %s of the current commit limit %s; the page file is below its configured maximum" % (mib(rm["commit"]), mib(room_now), mib(rm["commit_limit"])), now)
+				self.flag("commit", "info", headline("commit charge %s, %s under the current limit" % (mib(rm["commit"]), mib(room_now))), now,
+					detail="current commit limit %s; the page file is below its configured maximum" % mib(rm["commit_limit"]))
 			for pf in rm["pagefiles"]:
 				if pf["size"] and pf["used"] / pf["size"] * 100 >= c["pagefile_pct"]:
-					self.flag("pagefile", "warn", "page file %s is %.0f%% used (%s of %s)" % (pf["name"], 100 * pf["used"] / pf["size"], mib(pf["used"]), mib(pf["size"])), now)
+					self.flag("pagefile", "warn", headline("page file %s is %.0f%% used" % (basename(pf["name"]), 100 * pf["used"] / pf["size"])), now,
+						detail="%s of %s (%s)" % (mib(pf["used"]), mib(pf["size"]), pf["name"]))
 		if ll["present"] and ll["ws_drop"] >= c["ws_drop_mib"]:
 			if ll["commit_drop"] >= 0.5 * ll["ws_drop"]:
-				self.flag("trim", "info", "llama-server's working set fell by %s within 10 s and its commit fell by %s: the process released memory (deduced: commit only falls when memory is released)"
-					% (mib(ll["ws_drop"]), mib(ll["commit_drop"])), now, hold=c["hold_s"])
+				self.flag("trim", "info", headline("working set fell %s, commit fell %s" % (mib(ll["ws_drop"]), mib(ll["commit_drop"]))), now, hold=c["hold_s"],
+					detail="the process released memory (deduced: commit only falls when memory is released)")
 			else:
-				self.flag("trim", "warn", "llama-server's working set fell by %s within 10 s but its commit fell by only %s: the pages left the working set and stayed committed (deduced: Windows reclaimed them, llama-server did not free them)"
-					% (mib(ll["ws_drop"]), mib(ll["commit_drop"])), now, hold=c["hold_s"])
+				self.flag("trim", "warn", headline("working set fell %s, commit did not" % mib(ll["ws_drop"])), now, hold=c["hold_s"],
+					detail="commit fell by only %s: the pages left the working set and stayed committed (deduced: Windows reclaimed them, llama-server did not free them)" % mib(ll["commit_drop"]))
 		for ev in snap["new_events"]:
 			if ev["kind"] == "exit" and ev["level"] == "crit":
-				self.flag("exit", "crit", ev["msg"], now, hold=60)
+				self.flag("exit", "crit", ev["msg"], now, hold=60, detail=ev.get("detail"))
 		self.sweep(now)
 
 
@@ -565,8 +584,10 @@ class Collector:
 		return None
 
 	# ---- events -----------------------------------------------------------------------------------------------------
-	def emit(self, level, kind, msg, wall=None, preset=None):
+	def emit(self, level, kind, msg, wall=None, preset=None, detail=None):
 		ev = {"wall": wall or time.time(), "t": 0, "level": level, "kind": kind, "msg": msg, "preset": preset, "session": None}
+		if detail:
+			ev["detail"] = detail
 		self.add_events([ev])
 		if self.hist and self.cfg["persist"] and kind == "alert":
 			self.hist.write_event(ev)
@@ -1156,6 +1177,23 @@ class Collector:
 
 def mib(x):
 	return "%.1f GiB" % (x / 1024) if abs(x) >= 10240 else "{:,.0f} MiB".format(x)
+
+
+def headline(text, limit=72):
+	"""One line of at most `limit` characters; longer text is cut at a word boundary and marked with …"""
+	text = " ".join(str(text).split())
+	if len(text) <= limit:
+		return text
+	cut = text[:limit - 1]
+	sp = cut.rfind(" ")
+	if sp > 0:
+		cut = cut[:sp]
+	return cut + "…"
+
+
+def basename(path):
+	"""The last component of a Windows or POSIX path."""
+	return str(path).replace("\\", "/").rsplit("/", 1)[-1]
 
 
 def hms(seconds):

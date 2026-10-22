@@ -385,6 +385,69 @@ def test_live_shows_recent_prompts_when_toggled():
 	assert not any("recent turns" in ln for ln in toggled), toggled
 
 
+class _OrderedAlerts:
+	def __init__(self, items):
+		self.items = items
+
+	def ordered(self):
+		return self.items
+
+
+def _alert(level, msg, since=990.0):
+	return {"level": level, "msg": msg, "since": since}
+
+
+def test_banner_one_line_per_alert_at_each_width():
+	items = [
+		("a", _alert("crit", "router unreachable at http://127.0.0.1:8080")),
+		("b", _alert("warn", "shared memory 1.5 GiB, 300 MiB over expected")),
+		("c", _alert("info", "loading model-a")),
+	]
+	c = collector([])
+	c.alerts = _OrderedAlerts(items)
+	for W in (80, 100, 140):
+		lines = plain(pages.banner(c, {"t": 1000.0}, 4, W))
+		assert len(lines) == 3, (W, lines)  # one line per alert, never wrapped
+		assert "router unreachable at http://127.0.0.1:8080" in lines[0], lines
+		assert "shared memory 1.5 GiB, 300 MiB over expected" in lines[1], lines
+		assert "loading model-a" in lines[2], lines
+		assert not any(ln.rstrip().endswith("…") for ln in lines), lines
+
+
+def test_banner_caps_alerts_with_more_line():
+	items = [(k, _alert("warn", "alert number %d" % i)) for i, k in enumerate("abcdef")]
+	c = collector([])
+	c.alerts = _OrderedAlerts(items)
+	lines = plain(pages.banner(c, {"t": 1000.0}, 4, 100))
+	assert len(lines) == 5, lines  # four alerts plus the "more" line
+	assert "… 2 more alert(s)" in lines[4], lines
+
+
+def test_events_page_detail_toggle():
+	c = collector([])
+	c.events = [
+		{"wall": 1000.0, "level": "warn", "kind": "alert", "msg": "shared memory 1.5 GiB, 300 MiB over expected",
+		 "detail": "up 300 MiB from the 1.0 GiB it held once the model was resident. llama-server holds 5% of all shared GPU memory. Resident VRAM 4.0 GiB is 64 MiB under the OS budget 8.0 GiB"},
+		{"wall": 1001.0, "level": "info", "kind": "loaded", "msg": "model-a ready in 2.5 s"},
+	]
+	snap = {"t": 1002.0, "notices": []}
+	view = pages.View()
+	off = "\n".join(plain(pages.events(c, snap, view, 100, 40)))
+	assert "(f: filter, d: detail)" in off, off  # the section title names the keys
+	assert "shared memory 1.5 GiB, 300 MiB over expected" in off, off
+	assert "model-a ready in 2.5 s" in off, off
+	assert "up 300 MiB from" not in off, off  # the detail is hidden by default
+
+	view.detail = True
+	rows = plain(pages.events(c, snap, view, 100, 40))
+	detail_lines = [ln for ln in rows if ln.startswith("    ")]  # the indented continuation lines
+	assert len(detail_lines) >= 2, rows  # the long detail wraps to several lines
+	assert any("up 300 MiB from" in ln for ln in detail_lines), rows
+	assert "model-a ready in 2.5 s" in "\n".join(rows), rows
+	raw = pages.events(c, snap, view, 100, 40)
+	assert any(pages.C.grey in ln for ln in raw if ln.startswith("    ")), raw  # the detail lines are dim
+
+
 CASES = [
 	("summary_short_requests_fall_back", test_summary_short_requests_fall_back),
 	("summary_long_cutoffs_when_reached", test_summary_long_cutoffs_when_reached),
@@ -415,6 +478,9 @@ CASES = [
 	("prompt_table_has_no_cached_column", test_prompt_table_has_no_cached_column),
 	("prompt_row_compared_turn_by_turn", test_prompt_row_compared_turn_by_turn),
 	("live_shows_recent_prompts_when_toggled", test_live_shows_recent_prompts_when_toggled),
+	("banner_one_line_per_alert_at_each_width", test_banner_one_line_per_alert_at_each_width),
+	("banner_caps_alerts_with_more_line", test_banner_caps_alerts_with_more_line),
+	("events_page_detail_toggle", test_events_page_detail_toggle),
 ]
 
 

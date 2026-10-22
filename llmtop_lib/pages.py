@@ -462,7 +462,15 @@ def ktok(n):
 
 def row_notes(c, turns):
 	notes = []
-	ev = max((r.get("evicted", 0) for r in turns if r.get("sel") == "LRU" and r.get("evicted", 0) > 0), default=0)
+	compactions = 0
+	ev = 0
+	for i, r in enumerate(turns):
+		if i > 0 and prompts.is_compaction(turns[i - 1], r):
+			compactions += 1
+		elif r.get("sel") == "LRU" and (r.get("evicted") or 0) > 0:
+			ev = max(ev, r.get("evicted", 0))  # a compaction's eviction is by design, not a cache reset
+	if compactions:
+		notes.append("%scompacted%s%s" % (C.grey, " ×%d" % compactions if compactions > 1 else "", C.reset))
 	if ev > 0:
 		notes.append("%scache reset %s%s" % (C.byellow, ktok(ev), C.reset))
 	if any(r.get("trunc") for r in turns):

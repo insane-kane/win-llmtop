@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Events page shows the headlines; `d` toggles the detail line(s) under each event (dim, wrapped to the width), and `--once --page events --detail` shows them in a snapshot.
 - Alert levels now follow the consequence: `committed, not resident` is info within `load_grace_s` of a load and crit after; `shared GPU memory` is info when only above the CPU-side baseline and warn when grown past the resident minimum; a log `E` line is crit only for a known failure pattern (out of memory, allocation and load failures, aborts, fatals) and warn otherwise; a prompt cut off (`truncated = 1`) and a failed request (`got exception`) are crit.
 - `/slots` unavailable (HTTP 404, 501, 401 or 403) is info, not a warning: the server is fine, llmtop only loses live slot progress.
+- The Requests page no longer treats a compaction (the conversation summarised and restarted from the summary) as a new prompt: the turn continues the prompt and gets a `compacted` note instead of a `cache reset` one.
 
 ### Fixed
 

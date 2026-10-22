@@ -459,7 +459,7 @@ class TestCLI(unittest.TestCase):
 		cycle = ("braille", "blocks", "coarse", "ascii")
 		old = llmtop.ui.STYLE["mode"]
 		try:
-			for cur, nxt in zip(cycle, cycle[1:] + cycle[:1]):
+			for cur, nxt in zip(cycle, cycle[1:] + cycle[:1], strict=True):
 				llmtop.ui.STYLE["mode"] = cur
 				view = SimpleNamespace(page=0, msg="")
 				llmtop.handle("s", None, view, None, 40)

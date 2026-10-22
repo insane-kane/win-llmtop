@@ -305,8 +305,8 @@ def _parse(b, file_size):
 		if et == 8:
 			for _ in range(n):
 				o += 8 + struct.unpack_from("<Q", b, o)[0]
-			if o > len(b):
-				raise IndexError
+				if o > len(b):  # check inside the loop: a huge length would make the next unpack_from raise OverflowError
+					raise IndexError
 			return None, o
 		raise ValueError("unsupported GGUF array type %d" % et)
 
@@ -328,7 +328,9 @@ def _parse(b, file_size):
 	gap = {}
 	for a, c in zip(order, order[1:], strict=False):
 		gap[a] = raw[c][3] - raw[a][3]
-	alignment = int(meta.get("general.alignment", 32))
+	alignment = _int(meta.get("general.alignment", 32), default=32)
+	if alignment <= 0:
+		raise ValueError("invalid GGUF alignment")
 	data_start = o + (alignment - (o % alignment)) % alignment
 	if order:
 		last_idx = order[-1]

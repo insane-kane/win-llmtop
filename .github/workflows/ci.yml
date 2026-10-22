@@ -318,11 +318,33 @@ jobs:
               sys.exit(f'win-llmtop --check failed with rc={c.returncode}')
           PY
 
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          architecture: x64
+      - name: Install Atheris
+        run: "python -m pip install --require-hashes --no-deps --only-binary :all: -r .github/requirements/fuzz.txt"
+      - name: Run fuzz harnesses
+        run: |
+          python fuzz/fuzz_log.py -max_total_time=30 -timeout=5 -rss_limit_mb=1024 fuzz/corpus/log
+          python fuzz/fuzz_gguf.py -max_total_time=30 -timeout=5 -rss_limit_mb=1024 fuzz/corpus/gguf
+          python fuzz/fuzz_fit_output.py -max_total_time=30 -timeout=5 -rss_limit_mb=1024 fuzz/corpus/fit_output
+          python fuzz/fuzz_args.py -max_total_time=30 -timeout=5 -rss_limit_mb=1024 fuzz/corpus/args
+
   # Single check required by the repository ruleset before fast-forwarding to main.
   ci-ok:
     runs-on: windows-2025
     timeout-minutes: 5
-    needs: [lint, audit, dependency-review, test, e2e, package]
+    needs: [lint, audit, dependency-review, test, e2e, package, fuzz]
     if: always()
     steps:
       - name: Require all CI jobs to succeed
@@ -335,6 +357,7 @@ jobs:
           TEST_RESULT: ${{ needs.test.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
+          FUZZ_RESULT: ${{ needs.fuzz.result }}
         run: |
           python - <<'PY'
           import os
@@ -343,7 +366,7 @@ jobs:
           event = os.environ["EVENT_NAME"]
           req = {
             k: os.environ[k]
-            for k in ("LINT_RESULT", "AUDIT_RESULT", "TEST_RESULT", "E2E_RESULT", "PACKAGE_RESULT")
+            for k in ("LINT_RESULT", "AUDIT_RESULT", "TEST_RESULT", "E2E_RESULT", "PACKAGE_RESULT", "FUZZ_RESULT")
           }
           dep = os.environ["DEP_REVIEW_RESULT"]
           print({"event": event, **req, "DEP_REVIEW_RESULT": dep})

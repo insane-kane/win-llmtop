@@ -266,6 +266,12 @@ class TestModelAnalysis(unittest.TestCase):
 		self.assertEqual(res3["host"]["self"], 1928)
 		self.assertEqual(res3["host"]["model"], 919)
 
+	def test_gguf_invalid_alignment(self):
+		"""GGUF header with general.alignment <= 0 raises ValueError, not ZeroDivisionError."""
+		raw = make_gguf({"general.alignment": 0}, [])
+		with self.assertRaises(ValueError):
+			model._parse(raw, len(raw))
+
 
 CASES = [
 	("small_model_attn_kv", "test_small_model_attn_kv"),
@@ -275,6 +281,7 @@ CASES = [
 	("parse_args_and_flag_precedence", "test_parse_args_and_flag_precedence"),
 	("draft_path_each_flag", "test_draft_path_each_flag"),
 	("fit_projection_output_parser", "test_fit_projection_output_parser"),
+	("gguf_invalid_alignment", "test_gguf_invalid_alignment"),
 ]
 
 

@@ -1,0 +1,2 @@
+common_memory_breakdown_print: | memory breakdown [MiB]          | total   free    self    model   context compute unaccounted |
+common_memory_breakdown_print: | - Host                          | 1928 = 919 + 4 + 1004

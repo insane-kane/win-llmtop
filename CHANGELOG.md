@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Atheris fuzz targets for the log, GGUF, fit-output and argument parsers, run in CI.
+
+### Fixed
+
+- A malformed GGUF model header now fails with a clear `ValueError` or `IndexError` in the memory map, as the parser promises, instead of `ZeroDivisionError` (a zero `general.alignment`) or `OverflowError` (a string array with an oversized length).
+
 ### Removed
 
 - The install guide and README no longer announce a standalone `.exe` or a `winget` package: neither is planned.

@@ -1,0 +1,5 @@
+0.00.001.000 I join: request for name=modelA queued at position 0
+0.00.002.000 I ensure_model: slot available, loading queued model name=modelA
+0.00.003.000 I tick: evicting idle LRU name=modelB
+0.00.004.000 I run: instance name=modelA exited with status 0
+0.00.005.000 W got exception: {"message":"request failed"}

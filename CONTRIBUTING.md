@@ -50,6 +50,7 @@ The maintainer aims to respond to a pull request within 7 days.
 - No dependencies: clone the repository, then run `py llmtop.py`.
 - Tests: `py -I tests/run_all.py` runs every `tests/test_*.py`; each file also runs on its own.
 - Lint: `ruff check .` (rules E9, F, B, set in `pyproject.toml`), and `editorconfig-checker`.
+- Run `ruff check .` in the repository root at the version pinned in `.github/requirements/lint.txt` (CI's lint job); `uvx ruff@<pin> check .` does it without installing anything.
 
 ## Coding conventions
 

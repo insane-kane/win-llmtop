@@ -36,7 +36,7 @@ class Rings:
 
 
 def collector(requests, cfg=None):
-	return types.SimpleNamespace(requests=requests, follow={}, flags={}, events=[], cfg=cfg or {}, rings=Rings(), allow=0.0, allow_known=False)
+	return types.SimpleNamespace(requests=requests, follow={}, flags={}, events=[], cfg=cfg or {}, rings=Rings(), allow=0.0, allow_known=False, alerts=types.SimpleNamespace(active={}), mem={}, calib={}, calib_key=lambda k: k, ensure_map=lambda name: None)
 
 
 def gpu_snap(vram, budget, ded=1000.0):
@@ -106,7 +106,7 @@ def test_requests_subtitle_single_cutoff():
 
 
 def test_requests_empty_message():
-	assert "no finished requests yet" in "\n".join(plain_requests(collector([], cfg=dict(CFG))))
+	assert "no finished requests yet" in "\n".join(plain_requests(collector([], cfg=dict(S.CFG))))
 	cfg = dict(CFG)
 	cfg["log_dir"] = "logs"
 	assert "no finished requests in logs yet" in "\n".join(plain_requests(collector([], cfg=cfg)))
@@ -400,7 +400,7 @@ def _alert(level, msg, since=990.0):
 def test_banner_one_line_per_alert_at_each_width():
 	items = [
 		("a", _alert("crit", "router unreachable at http://127.0.0.1:8080")),
-		("b", _alert("warn", "shared memory 1.5 GiB, 300 MiB over expected")),
+		("b", _alert("warn", "shared 1.5 GiB, 300 MiB beyond expected")),
 		("c", _alert("info", "loading model-a")),
 	]
 	c = collector([])
@@ -409,7 +409,7 @@ def test_banner_one_line_per_alert_at_each_width():
 		lines = plain(pages.banner(c, {"t": 1000.0}, 4, W))
 		assert len(lines) == 3, (W, lines)  # one line per alert, never wrapped
 		assert "router unreachable at http://127.0.0.1:8080" in lines[0], lines
-		assert "shared memory 1.5 GiB, 300 MiB over expected" in lines[1], lines
+		assert "shared 1.5 GiB, 300 MiB beyond expected" in lines[1], lines
 		assert "loading model-a" in lines[2], lines
 		assert not any(ln.rstrip().endswith("…") for ln in lines), lines
 
@@ -426,15 +426,15 @@ def test_banner_caps_alerts_with_more_line():
 def test_events_page_detail_toggle():
 	c = collector([])
 	c.events = [
-		{"wall": 1000.0, "level": "warn", "kind": "alert", "msg": "shared memory 1.5 GiB, 300 MiB over expected",
-		 "detail": "up 300 MiB from the 1.0 GiB it held once the model was resident. llama-server holds 5% of all shared GPU memory. Resident VRAM 4.0 GiB is 64 MiB under the OS budget 8.0 GiB"},
+		{"wall": 1000.0, "level": "warn", "kind": "alert", "msg": "shared 1.5 GiB, 300 MiB beyond expected",
+		 "detail": "up 300 MiB from the 1.0 GiB it held once the model was resident (lowest seen since); expected 525 MiB (measured with no VRAM pressure). Resident VRAM 4.0 GiB is 64 MiB under the OS budget 8.0 GiB"},
 		{"wall": 1001.0, "level": "info", "kind": "loaded", "msg": "model-a ready in 2.5 s"},
 	]
 	snap = {"t": 1002.0, "notices": []}
 	view = pages.View()
 	off = "\n".join(plain(pages.events(c, snap, view, 100, 40)))
 	assert "(f: filter, d: detail)" in off, off  # the section title names the keys
-	assert "shared memory 1.5 GiB, 300 MiB over expected" in off, off
+	assert "shared 1.5 GiB, 300 MiB beyond expected" in off, off
 	assert "model-a ready in 2.5 s" in off, off
 	assert "up 300 MiB from" not in off, off  # the detail is hidden by default
 
@@ -446,6 +446,166 @@ def test_events_page_detail_toggle():
 	assert "model-a ready in 2.5 s" in "\n".join(rows), rows
 	raw = pages.events(c, snap, view, 100, 40)
 	assert any(pages.C.grey in ln for ln in raw if ln.startswith("    ")), raw  # the detail lines are dim
+
+
+
+
+def make_test_snap(ll_kw=None, gpu_kw=None):
+	g = {"name": "Test GPU", "vram": 24000.0, "budget": 20000.0, "ded": 17000.0, "shr": 2000.0, "uma": False}
+	if gpu_kw:
+		g.update(gpu_kw)
+	ll = {
+		"present": True, "pids": [2000], "ded": 16000.0, "shr": 1735.0, "com": 16000.0, "ws": 1024.0, "pws": 512.0, "commit": 1100.0,
+		"age": 1000.0, "floor": 525.0, "floor_known": True, "allow": 525.0, "allow_known": True, "allow_src": "measured",
+		"over": 1210.0, "ws_drop": 0.0, "commit_drop": 0.0, "vm": None, "vm_error": None,
+		"eng": {"3D": 50.0},
+	}
+	if ll_kw:
+		ll.update(ll_kw)
+	return {
+		"t": 1000.0, "router_up": True, "router_error": "", "router_auth_error": None, "presets": {},
+		"gpu": g, "llama": ll,
+		"ram": {"total": 65536.0, "avail": 32768.0, "commit": 20000.0, "commit_limit": 81920.0, "commit_max": 98304.0, "pagefiles": []},
+		"others": [], "busy": False, "new_events": [], "notices": [],
+	}
+
+
+def test_shared_row_measured_and_overage():
+	snap = make_test_snap({"shr": 1735.0, "allow": 525.0, "allow_known": True, "allow_src": "measured", "over": 1210.0})
+	view = pages.View()
+	text = "\n".join(plain(pages.gpu_block(collector([], cfg=dict(S.CFG)), snap, view, 140, 2)))
+	assert "llama-server shared" in text, text
+	assert "525 MiB expected" in text, text
+	assert "+1,210 MiB beyond" in text, text
+
+
+def test_shared_row_projected_expectation():
+	snap = make_test_snap({"shr": 1735.0, "allow": 525.0, "allow_known": True, "allow_src": "projected", "over": 1210.0})
+	view = pages.View()
+	text = "\n".join(plain(pages.gpu_block(collector([], cfg=dict(S.CFG)), snap, view, 140, 2)))
+	assert "llama-server shared" in text, text
+	assert "525 MiB projected" in text, text
+	assert "+1,210 MiB beyond" in text, text
+
+
+def test_shared_row_unknown_expectation():
+	snap = make_test_snap({"shr": 1735.0, "allow": 0.0, "allow_known": False, "allow_src": "", "over": 0.0})
+	view = pages.View()
+	text = "\n".join(plain(pages.gpu_block(collector([], cfg=dict(S.CFG)), snap, view, 140, 2)))
+	assert "llama-server shared" in text, text
+	assert "expected: unknown" in text, text
+
+
+def test_shared_row_over_zero_no_beyond_term():
+	snap = make_test_snap({"shr": 525.0, "allow": 525.0, "allow_known": True, "allow_src": "measured", "over": 0.0})
+	view = pages.View()
+	text = "\n".join(plain(pages.gpu_block(collector([], cfg=dict(S.CFG)), snap, view, 140, 2)))
+	assert "llama-server shared" in text, text
+	assert "525 MiB expected" in text, text
+	assert "beyond" not in text, text
+
+
+def test_no_percent_of_all_shared_anywhere():
+	snap = make_test_snap({"shr": 1735.0, "allow": 525.0, "allow_known": True, "allow_src": "measured", "over": 1210.0, "ws": 1024.0, "pws": 512.0, "commit": 2048.0, "cpu": 1.0, "vm": None}, {"shr": 2000.0})
+	view = pages.View()
+	# Live row
+	live_text = "\n".join(plain(pages.gpu_block(collector([], cfg=dict(S.CFG)), snap, view, 140, 2)))
+	assert "of all shared" not in live_text, live_text
+	# Memory page
+	from llmtop_lib import state
+	c = collector([], cfg=dict(state.CFG))
+	m = {
+		"name": "test-model", "arch": "llama", "n_layer": 1, "layers": {0: {"kind": "full", "mib": 100.0, "gpu": 100.0}}, "verified": True,
+		"ctx": 4096, "cache_k": "q8_0", "cache_v": "q8_0",
+		"checks": [], "assumed": [], "groups": {},
+		"kv": {"layers": {"full": 0, "swa": 0}, "gpu": 0, "mtp": 0, "full": 0, "swa": 0, "per_token": 0},
+		"rec": {"total": 0, "layers": 0, "per_layer": 0},
+		"mtp_mib": 0, "draft": None, "fit": None,
+		"weights": {"cpu": 0.0}, "roster": [], "ckpt_max": 0, "cache_ram": 0,
+		"n_expert": 0, "n_expert_used": 0,
+	}
+	c.mem = {"test-model": {"state": "ready", "map": m, "key": "k"}}
+	c.flags = {"test-model": ({}, "")}
+	snap_mem = dict(snap, presets={"test-model": {"status": "loaded"}})
+	mem_text = "\n".join(plain(pages.memory(c, snap_mem, view, 140, 40)))
+	assert "of all shared" not in mem_text, mem_text
+	assert "525 MiB expected" in mem_text, mem_text
+	assert "+1,210 MiB beyond" in mem_text, mem_text
+	# Alert detail
+	from llmtop_lib import state
+	a = state.Alerts(dict(state.CFG, router="http://127.0.0.1:8080"), lambda *args, **kw: None)
+	a.evaluate(snap, None)
+	self_alert = a.active.get("spill")
+	assert self_alert is not None, a.active
+	assert "of all shared" not in (self_alert.get("detail") or ""), self_alert
+
+
+def test_shared_row_widths_live_and_memory():
+	base_snap = {
+		"t": 1000.0, "router_up": True, "router_error": "", "router_auth_error": None,
+		"presets": {},
+		"gpu": {"name": "Test GPU", "vram": 24564.0, "budget": 20000.0, "ded": 17000.0, "shr": 1877.0, "uma": False},
+		"llama": {
+			"present": True, "pids": [2000], "ded": 16000.0, "shr": 1877.0, "com": 16000.0, "ws": 1024.0, "pws": 512.0, "commit": 1100.0,
+			"age": 1000.0, "floor": 1877.0, "floor_known": True, "allow": 525.0, "allow_known": True, "allow_src": "measured",
+			"over": 1352.0, "ws_drop": 0.0, "commit_drop": 0.0, "vm": None, "vm_error": None,
+			"eng": {"3D": 50.0}, "cpu": 1.0,
+		},
+		"ram": {"total": 65536.0, "avail": 32768.0, "standby": 16384.0, "commit": 20000.0, "commit_limit": 81920.0, "commit_max": 98304.0, "pagefiles": [], "pages_in": 0.0, "pages_out": 0.0},
+		"cpu": {"pct": 10.0, "cores": 16, "threads": 32, "freq": 3500.0, "top": []},
+		"others": [], "busy": False, "new_events": [], "notices": [],
+	}
+
+	widths = [80, 100, 120, 140, 180]
+	for page_idx, page_name in [(0, "Live"), (1, "Memory")]:
+		view = pages.View()
+		view.page = page_idx
+		snap_over = dict(base_snap)
+		if page_name == "Memory":
+			snap_over["presets"] = {"test-model": {"status": "loaded"}}
+		snap_zero = dict(snap_over, llama=dict(snap_over["llama"], shr=525.0, floor=525.0, over=0.0))
+
+		# 1. With overage fixture: line with beyond figure has no '…' and contains '+1,352 MiB beyond'
+		for w in widths:
+			c = collector([], cfg=dict(S.CFG))
+			c.alerts.ordered = lambda: []
+			m = {
+				"name": "test-model", "arch": "llama", "n_layer": 1, "layers": {0: {"kind": "full", "mib": 100.0, "gpu": 100.0}}, "verified": True,
+				"ctx": 4096, "cache_k": "q8_0", "cache_v": "q8_0",
+				"checks": [], "assumed": [], "groups": {},
+				"kv": {"layers": {"full": 0, "swa": 0}, "gpu": 0, "mtp": 0, "full": 0, "swa": 0, "per_token": 0},
+				"rec": {"total": 0, "layers": 0, "per_layer": 0},
+				"mtp_mib": 0, "draft": None, "fit": None,
+				"weights": {"cpu": 0.0}, "roster": [], "ckpt_max": 0, "cache_ram": 0,
+				"n_expert": 0, "n_expert_used": 0,
+			}
+			c.mem = {"test-model": {"state": "ready", "map": m, "key": "k"}}
+			c.flags = {"test-model": ({}, "")}
+			rendered = pages.render(c, snap_over, view, w, 40)
+			beyond_lines = [ln for ln in rendered if "+1,352 MiB beyond" in ln]
+			assert len(beyond_lines) == 1, (page_name, w, beyond_lines)
+			ln = beyond_lines[0]
+			assert "…" not in ln, (page_name, w, ln)
+			assert "+1,352 MiB beyond" in ln, (page_name, w, ln)
+
+		# 2. With over == 0: no 'beyond' term
+		for w in widths:
+			c = collector([], cfg=dict(S.CFG))
+			c.alerts.ordered = lambda: []
+			m = {
+				"name": "test-model", "arch": "llama", "n_layer": 1, "layers": {0: {"kind": "full", "mib": 100.0, "gpu": 100.0}}, "verified": True,
+				"ctx": 4096, "cache_k": "q8_0", "cache_v": "q8_0",
+				"checks": [], "assumed": [], "groups": {},
+				"kv": {"layers": {"full": 0, "swa": 0}, "gpu": 0, "mtp": 0, "full": 0, "swa": 0, "per_token": 0},
+				"rec": {"total": 0, "layers": 0, "per_layer": 0},
+				"mtp_mib": 0, "draft": None, "fit": None,
+				"weights": {"cpu": 0.0}, "roster": [], "ckpt_max": 0, "cache_ram": 0,
+				"n_expert": 0, "n_expert_used": 0,
+			}
+			c.mem = {"test-model": {"state": "ready", "map": m, "key": "k"}}
+			c.flags = {"test-model": ({}, "")}
+			rendered = pages.render(c, snap_zero, view, w, 40)
+			assert not any("beyond" in ln for ln in rendered), (page_name, w, [ln for ln in rendered if "beyond" in ln])
 
 
 CASES = [
@@ -481,6 +641,12 @@ CASES = [
 	("banner_one_line_per_alert_at_each_width", test_banner_one_line_per_alert_at_each_width),
 	("banner_caps_alerts_with_more_line", test_banner_caps_alerts_with_more_line),
 	("events_page_detail_toggle", test_events_page_detail_toggle),
+	("shared_row_measured_and_overage", test_shared_row_measured_and_overage),
+	("shared_row_projected_expectation", test_shared_row_projected_expectation),
+	("shared_row_unknown_expectation", test_shared_row_unknown_expectation),
+	("shared_row_over_zero_no_beyond_term", test_shared_row_over_zero_no_beyond_term),
+	("no_percent_of_all_shared_anywhere", test_no_percent_of_all_shared_anywhere),
+	("shared_row_widths_live_and_memory", test_shared_row_widths_live_and_memory),
 ]
 
 

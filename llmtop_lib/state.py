@@ -307,8 +307,6 @@ class Alerts:
 			self.prev.append((now, ll["shr"], ll["ded"]))
 			old = next((p for p in self.prev if now - p[0] <= c["burst_window_s"]), None)
 			near = bool(g["budget"]) and ll["ded"] >= g["budget"] - c["near_budget_mib"]
-			src = "measured on an earlier load with no VRAM pressure" if ll["allow_src"] == "measured" else "projected by llama.cpp, not verified for this preset"
-			share = " llama-server holds %.0f%% of all shared GPU memory (%s)." % (100 * ll["shr"] / g["shr"], mib(g["shr"])) if g["shr"] > 0 else ""
 			where = "within %s of the OS budget %s, the condition under which Windows documents demoting allocations" % (mib(c["near_budget_mib"]), mib(g["budget"])) if near else "%s under the OS budget %s" % (mib(g["budget"] - ll["ded"]), mib(g["budget"]))
 			grew = ll["floor_known"] and ll["shr"] - ll["floor"] >= c["spill_mib"]
 			excess = ll["allow_known"] and ll["over"] >= c["spill_mib"]
@@ -317,13 +315,14 @@ class Alerts:
 				if ll["floor_known"]:
 					facts.append("%s the %s it held once the model was resident (lowest seen since)" % ("up %s from" % mib(ll["shr"] - ll["floor"]) if ll["shr"] - ll["floor"] >= 1 else "unchanged from", mib(ll["floor"])))
 				if ll["allow_known"]:
-					facts.append("%s %s the %s of CPU-side buffers %s" % (mib(abs(ll["shr"] - ll["allow"])), "more than" if ll["shr"] >= ll["allow"] else "less than", mib(ll["allow"]), src))
+					src = "measured with no VRAM pressure" if ll["allow_src"] == "measured" else "projected by llama.cpp"
+					facts.append("expected %s (%s)" % (mib(ll["allow"]), src))
 				if ll["allow_known"]:
-					msg = "shared memory %s, %s over expected" % (mib(ll["shr"]), mib(ll["over"]))
+					msg = "shared %s, %s beyond expected" % (mib(ll["shr"]), mib(ll["over"]))
 				else:
-					msg = "shared memory %s, %s above the resident minimum" % (mib(ll["shr"]), mib(ll["shr"] - ll["floor"]))
+					msg = "shared %s, %s above the resident minimum" % (mib(ll["shr"]), mib(ll["shr"] - ll["floor"]))
 				self.flag("spill", "warn" if grew else "info", headline(msg), now,
-					detail="%s.%s Resident VRAM %s is %s" % ("; ".join(facts), share, mib(ll["ded"]), where))
+					detail="%s. Resident VRAM %s is %s" % ("; ".join(facts), mib(ll["ded"]), where))
 			if old and ll["age"] > c["load_grace_s"] and ll["shr"] - old[1] >= c["burst_mib"]:
 				rose, fell = ll["shr"] - old[1], old[2] - ll["ded"]
 				if fell >= 0.5 * rose:

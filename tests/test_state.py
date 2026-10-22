@@ -695,6 +695,16 @@ class TestAlertHeadlines(unittest.TestCase):
 		alert, _ = self._one("paged", [_snap(llama=dict(_snap()["llama"], com=4600.0, age=1000.0))])
 		self.assertEqual(alert["level"], "crit")  # still paged well after the load
 
+	def test_spill_headline_and_detail_wording(self):
+		alert, _ = self._one("spill", [_snap(llama=dict(_snap()["llama"], shr=1735.0, allow=525.0, over=1210.0, allow_known=True, allow_src="measured", floor=525.0, floor_known=True))])
+		self.assertEqual(alert["msg"], "shared 1,735 MiB, 1,210 MiB beyond expected")
+		self.assertIn("expected 525 MiB (measured with no VRAM pressure)", alert["detail"])
+		self.assertNotIn("% of all shared", alert["detail"])
+		alert_proj, _ = self._one("spill", [_snap(llama=dict(_snap()["llama"], shr=1735.0, allow=525.0, over=1210.0, allow_known=True, allow_src="projected", floor=525.0, floor_known=True))])
+		self.assertEqual(alert_proj["msg"], "shared 1,735 MiB, 1,210 MiB beyond expected")
+		self.assertIn("expected 525 MiB (projected by llama.cpp)", alert_proj["detail"])
+		self.assertNotIn("% of all shared", alert_proj["detail"])
+
 	def test_spill_is_info_when_only_excess_and_warn_when_grew(self):
 		alert, _ = self._one("spill", [_snap(llama=dict(_snap()["llama"], shr=428.0, allow=128.0, over=300.0, allow_known=True))])
 		self.assertEqual(alert["level"], "info")  # over the expected allowance, but not grown past the floor
@@ -719,6 +729,7 @@ CASES = [
 	("detail_persisted_and_loaded", TestAlertHeadlines("test_detail_persisted_and_loaded")),
 	("old_format_event_line_without_detail_loads", TestAlertHeadlines("test_old_format_event_line_without_detail_loads")),
 	("paged_is_info_during_load_grace_and_crit_after", TestAlertHeadlines("test_paged_is_info_during_load_grace_and_crit_after")),
+	("spill_headline_and_detail_wording", TestAlertHeadlines("test_spill_headline_and_detail_wording")),
 	("spill_is_info_when_only_excess_and_warn_when_grew", TestAlertHeadlines("test_spill_is_info_when_only_excess_and_warn_when_grew")),
 ]
 

@@ -137,21 +137,21 @@ Every tensor is placed from the preset's flags: `--override-tensor` rules, `--cp
 - **Page file**: size, use and peak per file, the configured initial and maximum size, the commit limit now, and the commit limit if the page file reaches its configured maximum.
 
 ### Shared GPU memory
-Windows reports, per process, *dedicated* memory (resident in VRAM), *shared* memory (resident in system RAM) and *committed* memory. llmtop reports all three and alerts on thresholds. It does not state why memory is shared. The counters cannot say which allocation or tensor is in shared memory.
+Windows reports, per process, *dedicated* memory (resident in VRAM), *shared* memory (resident in system RAM) and *committed* memory. llmtop reports all three and alerts on thresholds. The Live row (`llama-server shared`) reports the GPU memory backed by system RAM that `llama-server` holds, its expected share, and what is beyond it (along with growth since the model became resident when known). It does not state why memory is shared; the counters cannot say which allocation or tensor is in shared memory.
 
 Two baselines are shown against the shared figure, because neither alone settles what it is:
 
 - **When the model became resident.** CPU-side buffers are allocated when the model loads, so the shared figure at that moment (lowest seen since) is what this process held before any request. Growth beyond it is what the alert reports. This is measured for the process, but it is unknown if llmtop first saw the process after it had already grown.
 - **llama.cpp's projection of CPU-side buffers** (see `--no-host`), or, if llmtop has measured one, the lowest shared figure seen on an earlier load of the same configuration while resident plus shared memory was at least 1 GiB under the budget (so nothing could have been demoted). It is labelled unverified when projected.
 
-The page also states what share of all processes' shared GPU memory belongs to llama-server. A **demotion** is reported (critical) only when it is observed: shared memory rose and resident VRAM fell by at least half as much within the window. Growth of shared memory without that exchange is a warning; shared memory above a baseline, without that growth, is informational. Neither is a conclusion. The OS budget is the DXGI figure for llmtop itself; Microsoft documents it as the amount of video memory the process can use before the video memory manager may demote its allocations.
+A **demotion** is reported (critical) only when it is observed: shared memory rose and resident VRAM fell by at least half as much within the window. Growth of shared memory without that exchange is a warning; shared memory above a baseline, without that growth, is informational (headline: `shared X, Y beyond expected`). Neither is a conclusion. The OS budget is the DXGI figure for llmtop itself; Microsoft documents it as the amount of video memory the process can use before the video memory manager may demote its allocations.
 
 ### Alerts
 Each rule holds while its condition is true and clears after 10 s of quiet. Every threshold is in `CFG` in `llmtop_lib/state.py` and can be set with `--threshold NAME=VALUE` (including `prompt_gap_s`, `30` s, for grouping turns into prompts). Six of them scale with the machine unless set: `avail_warn` = the smaller of 4 GiB and 7% of installed RAM, `avail_crit` = 2 GiB or 3.5%, `commit_warn` = 8 GiB or 10% of the commit limit at the page file's configured maximum, `commit_crit` = 3 GiB or 4% of it, `near_budget_mib` = 512 MiB or 3% of the VRAM budget, `idle_headroom_mib` = 1 GiB or 6% of it; the table shows those caps. Messages state the counter values; none states a cause.
 
 | Alert | Level | Condition (threshold name) |
 | :--- | :--- | :--- |
-| shared GPU memory | info / warn | above the CPU-side baseline by ≥ `spill_mib` (256 MiB): info; grown by ≥ `spill_mib` above the figure it held when the model became resident: warn; the detail states both comparisons and how near resident VRAM is to the OS budget (`near_budget_mib`, 512 MiB) |
+| shared GPU memory | info / warn | above the CPU-side baseline by ≥ `spill_mib` (256 MiB): info; grown by ≥ `spill_mib` above the figure it held when the model became resident: warn; headline reports amount beyond expected and detail states both comparisons and how near resident VRAM is to the OS budget (`near_budget_mib`, 512 MiB) |
 | memory moved to shared | crit | shared memory rose by ≥ `burst_mib` (128 MiB) within `burst_window_s` (4 s), more than `load_grace_s` (90 s) after the model loaded, and resident VRAM fell by at least half as much; held `hold_s` (30 s) |
 | shared memory rose | warn | the same rise without a matching fall in resident VRAM |
 | shared memory fell | info | shared memory fell by ≥ `burst_mib` within the same window |

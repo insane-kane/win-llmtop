@@ -286,6 +286,26 @@ def render(c, snap, view, W, H):
 
 # ---- page 1: live --------------------------------------------------------------------------------------------------------
 
+def shared_note(ll, width=None):
+	"""Sub-text for the llama-server shared row: expected, beyond, since loaded."""
+	src = "expected" if ll.get("allow_src") == "measured" else "projected"
+	exp = ("%s MiB %s" % (num(ll["allow"]), src)) if ll.get("allow_known") else "expected: unknown"
+	beyond = ("+%s MiB beyond" % num(ll["over"])) if ll.get("over", 0) > 0 else ""
+	since = ("{:+,.0f} since loaded".format(round(ll["shr"] - ll["floor"]))) if ll.get("floor_known") else ""
+
+	terms = [x for x in (exp, beyond, since) if x]
+	line = "  ·  ".join(terms)
+	if width is None or len(line) <= width:
+		return line
+	terms = [x for x in (exp, beyond) if x]
+	line = "  ·  ".join(terms)
+	if len(line) <= width:
+		return line
+	exp_short = ("%s MiB" % num(ll["allow"])) if ll.get("allow_known") else "unknown"
+	terms = [x for x in (exp_short, beyond) if x]
+	return "  ·  ".join(terms)
+
+
 def gpu_block(c, snap, view, W, gh):
 	g, ll = snap["gpu"], snap["llama"]
 	if not g:
@@ -310,9 +330,10 @@ def gpu_block(c, snap, view, W, gh):
 		moving = any(k == "burst" and a["level"] == "crit" for k, a in c.alerts.active.items())
 		out += ["", thead(view, G)]
 		out += block(c, view, snap, "vram_llama", G, gh, "llama-server VRAM", num(ll["ded"]) + " MiB", num, " MiB", None, 512.0, C.bcyan)
-		out += block(c, view, snap, "spill", G, gh, "shared (system RAM)", "%s%s MiB%s" % (C.bred + C.bold if moving else C.byellow + C.bold if grown else "", num(ll["shr"]), C.reset), num, " MiB", None, 512.0, C.bred if moving else C.byellow, False,
-			" · ".join(x for x in ("%s MiB when resident, %+d since" % (num(ll["floor"]), round(ll["shr"] - ll["floor"])) if ll["floor_known"] else "", ("CPU-side buffers %s MiB, %s" % (num(ll["allow"]), "measured with no VRAM pressure" if ll["allow_src"] == "measured" else "projected by llama.cpp")) if ll["allow_known"] else "",
-			"llama-server holds %.0f%% of all shared" % (100 * ll["shr"] / g["shr"]) if g["shr"] > 0 else "") if x))
+		out += block(c, view, snap, "spill", G, gh, "llama-server shared", "%s%s MiB%s" % (C.bred + C.bold if moving else C.byellow + C.bold if grown else "", num(ll["shr"]), C.reset), num, " MiB", None, 512.0, C.bred if moving else C.byellow, False)
+		note = shared_note(ll, max(0, W - 3))
+		if note:
+			out.append("%s  %s%s" % (C.grey, note, C.reset))
 		eng = "  ".join("%s %.0f%%" % (k, v) for k, v in sorted(ll["eng"].items(), key=lambda kv: -kv[1]) if v >= 0.5)
 		out += block(c, view, snap, "gpu_llama", G, gh, "GPU load", "%.0f%%" % max(ll["eng"].values(), default=0.0), num, "%", 0.0, 100.0, C.bgreen, True, eng or "idle")
 	if snap["others"]:
@@ -786,13 +807,32 @@ def memory(c, snap, view, W, H):
 		excess = ll["over"] if on and ll["allow_known"] else 0
 		if on:
 			bits = ["shared %s" % mib(ll["shr"])]
-			if ll["floor_known"]:
-				bits.append("%s when the model became resident (lowest since), %+d since" % (mib(ll["floor"]), round(growth)))
 			if ll["allow_known"]:
-				bits.append("CPU-side buffers %s (%s)" % (mib(ll["allow"]), "measured on an earlier load with resident + shared at least %s under the budget" % mib(c.cfg["idle_headroom_mib"]) if ll["allow_src"] == "measured" else "projected by llama.cpp, not verified for this preset"))
-			if g["shr"] > 0:
-				bits.append("llama-server holds %.0f%% of all shared GPU memory" % (100 * ll["shr"] / g["shr"]))
-			out.append("  " + "  ·  ".join(bits))
+				src_word = "expected" if ll["allow_src"] == "measured" else "projected"
+				bits.append("%s %s" % (mib(ll["allow"]), src_word))
+			else:
+				bits.append("expected: unknown")
+			if ll["over"] > 0:
+				bits.append("+%s beyond" % mib(ll["over"]))
+			if ll["floor_known"]:
+				bits.append("{:+,.0f} since loaded".format(round(growth)))
+			max_w = max(0, W - 3)
+			line = "  ·  ".join(bits)
+			if len(line) > max_w:
+				bits_no_since = [b for b in bits if not b.endswith("since loaded")]
+				line = "  ·  ".join(bits_no_since)
+				if len(line) > max_w:
+					bits_short = []
+					for b in bits_no_since:
+						if ll["allow_known"] and b == "%s %s" % (mib(ll["allow"]), src_word):
+							bits_short.append(mib(ll["allow"]))
+						else:
+							bits_short.append(b)
+					line = "  ·  ".join(bits_short)
+			out.append("  " + line)
+			if ll["allow_known"]:
+				src_expl = "measured on an earlier load with resident + shared at least %s under the budget" % mib(c.cfg["idle_headroom_mib"]) if ll["allow_src"] == "measured" else "projected by llama.cpp, not verified for this preset"
+				out.append("%s  %s%s" % (C.grey, src_expl, C.reset))
 		if left < c.cfg["near_budget_mib"] or excess >= c.cfg["spill_mib"] or growth >= c.cfg["spill_mib"]:
 			parts = freeable(m, held)
 			if parts:

@@ -192,6 +192,171 @@ class TestCLI(unittest.TestCase):
 		finally:
 			stub.close()
 
+	def test_once_flagless_model_pages_render_no_crash(self):
+		# a router whose /models lists a loaded model with no status.args and no matching process
+		models_data = [
+			{
+				"id": "flagless-preset",
+				"object": "model",
+				"status": {"value": "loaded"},
+			}
+		]
+		stub = _StubServer(models_data)
+		try:
+			with tempfile.TemporaryDirectory() as tmpdir:
+				for page in ("memory", "tensors", "live"):
+					cmd = [
+						sys.executable, "-I", LLMTOP_PY,
+						"--once",
+						"--page", page,
+						"--no-persist",
+						"--router", stub.url,
+						"--state-dir", tmpdir,
+					]
+					proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+					self.assertEqual(proc.returncode, 0, "page %s stderr: %s" % (page, proc.stderr))
+					self.assertNotIn("traceback", (proc.stdout + proc.stderr).lower())
+					self.assertNotIn("render error", proc.stdout.lower())
+					if page in ("memory", "tensors"):
+						self.assertIn("could not analyse", proc.stdout)
+		finally:
+			stub.close()
+
+	def test_check_flagless_model_no_crash(self):
+		models_data = [
+			{
+				"id": "flagless-preset",
+				"object": "model",
+				"status": {"value": "loaded"},
+			}
+		]
+		stub = _StubServer(models_data)
+		try:
+			with tempfile.TemporaryDirectory() as tmpdir:
+				cmd = [
+					sys.executable, "-I", LLMTOP_PY,
+					"--check",
+					"--router", stub.url,
+					"--state-dir", tmpdir,
+				]
+				proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+				combined = proc.stdout + proc.stderr
+				self.assertNotIn("traceback", combined.lower())
+				self.assertNotIn("render error", combined.lower())
+		finally:
+			stub.close()
+
+	def test_plan_flagless_model_no_crash(self):
+		models_data = [
+			{
+				"id": "flagless-preset",
+				"object": "model",
+				"status": {"value": "loaded"},
+			}
+		]
+		stub = _StubServer(models_data)
+		try:
+			with tempfile.TemporaryDirectory() as tmpdir:
+				cmd = [
+					sys.executable, "-I", LLMTOP_PY,
+					"--plan",
+					"--no-persist",
+					"--router", stub.url,
+					"--state-dir", tmpdir,
+				]
+				proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+				self.assertEqual(proc.returncode, 0, "stderr: %s" % proc.stderr)
+				self.assertNotIn("traceback", (proc.stdout + proc.stderr).lower())
+		finally:
+			stub.close()
+
+	def test_frame_text_render_error_frame_and_log(self):
+		import os
+		import llmtop
+		from llmtop_lib import pages
+		from types import SimpleNamespace
+		with tempfile.TemporaryDirectory() as tmpdir:
+			state_dir = os.path.join(tmpdir, "state")
+			c = SimpleNamespace(
+				alerts=SimpleNamespace(ordered=lambda: []),
+				state_dir=state_dir,
+				state_error=None,
+			)
+			snap = {"t": 1000.0, "router_up": True, "mode": "router"}
+			view = pages.View()
+			view.page = 1  # Memory
+			llmtop._last_render_error_text = None
+			def boom_a(*a, **k):
+				raise RuntimeError("A119 forced render failure")
+			def boom_b(*a, **k):
+				raise ValueError("A119 a different forced failure")
+			orig = pages.memory
+			pages.memory = boom_a
+			try:
+				with mock.patch.object(os, "makedirs", wraps=os.makedirs) as makedirs_mock:
+					lines = llmtop.frame_text(c, snap, view, 200, 40)
+					text = "\n".join(lines)
+					self.assertIn("llmtop", text)  # header
+					self.assertIn("Memory", text)  # the page tab
+					self.assertIn("q quit", text)  # footer keys
+					self.assertIn("this page failed to render", text)  # body
+					self.assertIn("RuntimeError", text)
+					self.assertIn("press 1-6 to try another page; details:", text)
+					log_path = os.path.join(state_dir, "llmtop-error.log")
+					self.assertTrue(os.path.isfile(log_path))
+					with open(log_path, encoding="utf-8") as f:
+						log1 = f.read()
+					self.assertIn("RuntimeError", log1)
+					self.assertIn("page: Memory", log1)
+					self.assertIn("version:", log1)
+					self.assertIn("python:", log1)
+					self.assertIn("platform:", log1)
+					self.assertEqual(makedirs_mock.call_count, 1)  # written once
+					# the same error is not re-written every tick
+					llmtop.frame_text(c, snap, view, 200, 40)
+					self.assertEqual(makedirs_mock.call_count, 1)  # not re-written
+					# a different error re-writes the log
+					pages.memory = boom_b
+					llmtop.frame_text(c, snap, view, 200, 40)
+					self.assertEqual(makedirs_mock.call_count, 2)  # re-written
+					with open(log_path, encoding="utf-8") as f:
+						log3 = f.read()
+					self.assertIn("ValueError", log3)
+					# page change still works after a render error
+					llmtop.handle("1", c, view, snap, 40)
+					self.assertEqual(view.page, 0)
+			finally:
+				pages.memory = orig
+
+	def test_live_key_loop_keeps_working_after_render_error(self):
+		import contextlib
+		import io
+		import llmtop
+		from llmtop_lib import pages
+		from types import SimpleNamespace
+		snap = {"t": 1000.0, "router_up": True, "mode": "router"}
+		c = SimpleNamespace(
+			cfg={"hz": 1.0},
+			tick=lambda t0=None: snap,
+			alerts=SimpleNamespace(ordered=lambda: []),
+			state_dir=None,
+			state_error="no state folder",
+		)
+		view = pages.View()
+		view.page = 1  # Memory
+		llmtop._last_render_error_text = None
+		def boom(*a, **k):
+			raise RuntimeError("A119 forced render failure")
+		orig = pages.memory
+		pages.memory = boom
+		buf = io.StringIO()
+		try:
+			with mock.patch.object(llmtop, "read_key", side_effect=["1", "q"]), contextlib.redirect_stdout(buf):
+				llmtop.live(c, view)
+		finally:
+			pages.memory = orig
+		self.assertEqual(view.page, 0)  # the "1" key changed the page after the render error
+
 	def test_removed_pagein_warn_threshold_accepted_with_note(self):
 		models_data = [
 			{
@@ -342,6 +507,11 @@ CASES = [
 	("check_with_stub_server", TestCLI("test_check_with_stub_server")),
 	("check_unused_port_server_unreachable", TestCLI("test_check_unused_port_server_unreachable")),
 	("once_page_all_runs_cleanly", TestCLI("test_once_page_all_runs_cleanly")),
+	("once_flagless_model_pages_render_no_crash", TestCLI("test_once_flagless_model_pages_render_no_crash")),
+	("check_flagless_model_no_crash", TestCLI("test_check_flagless_model_no_crash")),
+	("plan_flagless_model_no_crash", TestCLI("test_plan_flagless_model_no_crash")),
+	("frame_text_render_error_frame_and_log", TestCLI("test_frame_text_render_error_frame_and_log")),
+	("live_key_loop_keeps_working_after_render_error", TestCLI("test_live_key_loop_keeps_working_after_render_error")),
 	("removed_pagein_warn_threshold_accepted_with_note", TestCLI("test_removed_pagein_warn_threshold_accepted_with_note")),
 	("read_key_case_insensitivity", TestCLI("test_read_key_case_insensitivity")),
 	("detect_style_from_env", TestCLI("test_detect_style_from_env")),

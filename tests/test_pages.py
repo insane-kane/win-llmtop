@@ -727,6 +727,60 @@ def test_ascii_charts_and_bars_printable_ascii():
 		ui.STYLE["mode"] = old
 
 
+def test_pick_model_cycles_over_flagless_model():
+	c = collector([], cfg=dict(S.CFG))
+	c.flags = {}
+	c.mem = {}
+	def ensure_map(name):
+		if name not in c.flags:
+			c.mem[name] = {"key": None, "state": "error", "error": "the server did not report this model's command line (/models has no status.args) and no llama-server process was found for it"}
+	c.ensure_map = ensure_map
+	snap = {"t": 1000.0, "presets": {"flagless": {"status": "loaded"}}}
+	view = pages.View()
+	name, order, loaded = pages.pick_model(c, snap, view)
+	assert name == "flagless" and order == ["flagless"] and loaded == ["flagless"], (name, order, loaded)
+	assert c.mem["flagless"]["state"] == "error"
+	view.msel = 1  # m wraps around; the flagless model is still listed and reachable
+	assert pages.pick_model(c, snap, view)[0] == "flagless"
+
+
+def test_memory_page_flagless_model_shows_could_not_analyse():
+	c = collector([], cfg=dict(S.CFG))
+	c.flags = {}
+	c.mem = {}
+	def ensure_map(name):
+		if name not in c.flags:
+			c.mem[name] = {"key": None, "state": "error", "error": "the server did not report this model's command line (/models has no status.args) and no llama-server process was found for it"}
+	c.ensure_map = ensure_map
+	snap = {
+		"t": 1000.0, "router_up": True, "mode": "router",
+		"presets": {"flagless": {"status": "loaded"}},
+		"gpu": {"name": "Test GPU", "vram": 24564.0, "budget": 20000.0, "ded": 0.0, "shr": 0.0, "uma": False},
+		"llama": {"present": False, "ded": 0.0, "shr": 0.0},
+	}
+	view = pages.View()
+	view.page = 1
+	text = "\n".join(re.sub(r"\x1b\[[0-9;]*m", "", ln) for ln in pages.memory(c, snap, view, 120, 40))
+	assert "could not analyse" in text, text
+	assert "no status.args" in text, text
+
+
+def test_tensors_page_flagless_model_shows_could_not_analyse():
+	c = collector([], cfg=dict(S.CFG))
+	c.flags = {}
+	c.mem = {}
+	def ensure_map(name):
+		if name not in c.flags:
+			c.mem[name] = {"key": None, "state": "error", "error": "the server did not report this model's command line (/models has no status.args) and no llama-server process was found for it"}
+	c.ensure_map = ensure_map
+	snap = {"t": 1000.0, "router_up": True, "mode": "router", "presets": {"flagless": {"status": "loaded"}}}
+	view = pages.View()
+	view.page = 5
+	text = "\n".join(re.sub(r"\x1b\[[0-9;]*m", "", ln) for ln in pages.tensors(c, snap, view, 120, 40))
+	assert "could not analyse" in text, text
+	assert "no status.args" in text, text
+
+
 CASES = [
 	("summary_short_requests_fall_back", test_summary_short_requests_fall_back),
 	("summary_long_cutoffs_when_reached", test_summary_long_cutoffs_when_reached),
@@ -769,6 +823,9 @@ CASES = [
 	("coarse_pages_only_allowed_glyphs", test_coarse_pages_only_allowed_glyphs),
 	("bar_fractions_all_styles", test_bar_fractions_all_styles),
 	("ascii_charts_and_bars_printable_ascii", test_ascii_charts_and_bars_printable_ascii),
+	("pick_model_cycles_over_flagless_model", test_pick_model_cycles_over_flagless_model),
+	("memory_page_flagless_model_shows_could_not_analyse", test_memory_page_flagless_model_shows_could_not_analyse),
+	("tensors_page_flagless_model_shows_could_not_analyse", test_tensors_page_flagless_model_shows_could_not_analyse),
 ]
 
 

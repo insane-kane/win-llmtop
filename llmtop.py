@@ -109,14 +109,89 @@ def handle(key, c, view, snap, H):
 		view.scroll = 10**9
 
 
+_last_render_error_text = None  # the exception text last written to llmtop-error.log, so the same error is not re-written every tick
+
+
+def _llmtop_version():
+	"""The installed win-llmtop version, or the one in pyproject.toml when run from a source tree, or 'unknown'."""
+	try:
+		from importlib.metadata import version
+
+		return version("win-llmtop")
+	except Exception:
+		pass
+	try:
+		import re
+
+		p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pyproject.toml")
+		if os.path.isfile(p):
+			with open(p, encoding="utf-8") as f:
+				m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', f.read())
+			if m:
+				return m.group(1)
+	except (OSError, ValueError):
+		pass
+	return "unknown"
+
+
+def _error_log_path(c):
+	"""llmtop-error.log in the state folder, or None when the folder is unavailable."""
+	d = getattr(c, "state_dir", None)
+	if not d or getattr(c, "state_error", None):
+		return None
+	return os.path.join(d, "llmtop-error.log")
+
+
+def _write_error_log(c, page, e, text, tb):
+	"""Write the traceback to llmtop-error.log (created only on error, overwritten per error, once per distinct exception text). Returns the path, or None when the folder is unavailable or the write failed."""
+	global _last_render_error_text
+	path = _error_log_path(c)
+	if path is None:
+		return None
+	if text == _last_render_error_text:
+		return path  # already recorded; the file still holds this error
+	try:
+		os.makedirs(c.state_dir, exist_ok=True)
+		with open(path, "w", encoding="utf-8") as f:
+			f.write("llmtop render error\n")
+			f.write("version: %s\n" % _llmtop_version())
+			f.write("python: %s\n" % platform.python_version())
+			f.write("platform: %s\n" % platform.platform())
+			f.write("page: %s\n" % page)
+			f.write("exception: %s\n" % text)
+			f.write("\n".join(tb) + "\n")
+		_last_render_error_text = text
+		return path
+	except OSError:
+		return None
+
+
+def _render_error_frame(c, snap, view, W, H, e):
+	"""A page raised while rendering. Keep the header and footer so the keys stay usable; the body names the error and where its traceback went."""
+	tb = traceback.format_exc().splitlines()
+	text = "%s: %s" % (type(e).__name__, e)
+	path = _write_error_log(c, pages.View.PAGES[view.page], e, text, tb)
+	body = ["  llmtop: this page failed to render (%s)" % text]
+	if path is not None:
+		body.append("  press 1-6 to try another page; details: %s" % path)
+	else:
+		body.append("  press 1-6 to try another page")
+		body += tb[-8:]
+	lines = [pages.header(c, snap, view, W)]
+	body_h = H - len(lines) - 1
+	body = body[:max(0, body_h)]
+	lines += body + [""] * max(0, body_h - len(body))
+	lines.append(pages.footer(view, W))
+	return [ui.clip(ln, W - 1) for ln in lines[:H]]
+
+
 def frame_text(c, snap, view, W, H):
 	if snap is None:
 		return ["llmtop: collector error (press q to quit)", view.msg or "collector error"]
 	try:
 		return pages.render(c, snap, view, W, H)
-	except Exception:
-		tb = traceback.format_exc().splitlines()
-		return ["llmtop: render error (press q to quit)"] + tb[-(H - 2):]
+	except Exception as e:
+		return _render_error_frame(c, snap, view, W, H, e)
 
 
 def live(c, view):

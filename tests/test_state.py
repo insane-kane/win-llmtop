@@ -240,6 +240,64 @@ class TestState(unittest.TestCase):
 		finally:
 			srv.close()
 
+	def test_router_flagless_loaded_model_no_crash_and_notice(self):
+		# a router whose /models lists a loaded model with no status.args and no matching process
+		models_data = [
+			{
+				"id": "flagless-preset",
+				"object": "model",
+				"status": {"value": "loaded"},
+			}
+		]
+		srv = _StubServer(models_data)
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win(procs={}):
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				snap = c.tick(1700000100.0)
+				self.assertEqual(snap["mode"], "router")
+				self.assertEqual(snap["presets"]["flagless-preset"]["status"], "loaded")
+				self.assertNotIn("flagless-preset", c.flags)  # no status.args, no process
+				self.assertFalse(snap["llama"]["present"])
+				self.assertTrue(any("no process named llama-server* found" in n for n in snap["notices"]))
+				# the crash path: pick_model calls ensure_map for the loaded model
+				c.ensure_map("flagless-preset")  # must not raise
+				entry = c.mem["flagless-preset"]
+				self.assertEqual(entry["state"], "error")
+				self.assertIsNone(entry["key"])
+				self.assertEqual(entry["error"], state.Collector.NO_FLAGS_ERROR)
+				c.ensure_map("flagless-preset")  # a second call must not raise or rewrite
+				self.assertEqual(c.mem["flagless-preset"]["state"], "error")
+		finally:
+			srv.close()
+
+	def test_single_model_process_not_found_notice_and_no_crash(self):
+		models_data = [
+			{
+				"id": "local-single.gguf",
+				"object": "model",
+				"owned_by": "llamacpp",
+				"meta": {"n_params": 8000000000},
+			}
+		]
+		srv = _StubServer(models_data)
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win(procs={}):
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				snap = c.tick(1700000100.0)
+				self.assertEqual(snap["mode"], "single")
+				self.assertIn("single-model mode", snap["notices"])
+				self.assertEqual(snap["presets"]["local-single.gguf"]["status"], "loaded")
+				self.assertNotIn("local-single.gguf", c.flags)  # no process to find flags from
+				self.assertFalse(snap["llama"]["present"])
+				self.assertTrue(any("no process named llama-server* found" in n for n in snap["notices"]))
+				c.ensure_map("local-single.gguf")  # must not raise
+				self.assertEqual(c.mem["local-single.gguf"]["state"], "error")
+				self.assertEqual(c.mem["local-single.gguf"]["error"], state.Collector.NO_FLAGS_ERROR)
+		finally:
+			srv.close()
+
 	def test_slots_401_and_api_key_header(self):
 		models_data = [
 			{
@@ -715,6 +773,8 @@ class TestAlertHeadlines(unittest.TestCase):
 CASES = [
 	("router_mode_preset_loaded_and_flags_parsed", TestState("test_router_mode_preset_loaded_and_flags_parsed")),
 	("single_model_mode_process_counted", TestState("test_single_model_mode_process_counted")),
+	("router_flagless_loaded_model_no_crash_and_notice", TestState("test_router_flagless_loaded_model_no_crash_and_notice")),
+	("single_model_process_not_found_notice_and_no_crash", TestState("test_single_model_process_not_found_notice_and_no_crash")),
 	("slots_401_and_api_key_header", TestState("test_slots_401_and_api_key_header")),
 	("uma_zero_vram_adapter", TestState("test_uma_zero_vram_adapter")),
 	("high_page_in_rate_raises_no_alert", TestState("test_high_page_in_rate_raises_no_alert")),

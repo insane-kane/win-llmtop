@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The classic Windows console (`conhost.exe`) no longer draws boxes in the trend charts: `win-llmtop` now defaults to a new `coarse` glyph style there (code page 437 only — `▄`/`█` charts, whole- and half-cell bars), detected from the terminal like the existing `braille` and `blocks` styles. `--graph-style` and the `s` key cycle all four, including a plain-ascii style.
 - A malformed GGUF model header now fails with a clear `ValueError` or `IndexError` in the memory map, as the parser promises, instead of `ZeroDivisionError` (a zero `general.alignment`) or `OverflowError` (a string array with an oversized length).
+- A loaded model whose command line is unknown (a router whose `/models` entry has no `status.args`, or a single-model server whose process is not found) no longer crashes the Memory and Tensors pages with a `KeyError`: the pages show `could not analyse: …`, the state is recorded once instead of retried every frame, and `m` still cycles over the model.
+- When a `loaded` or `loading` model is reported but no process named `llama-server*` is found, a notice is printed — `llama-server: no process named llama-server* found, so its GPU and RAM figures read 0 (a renamed or wrapped server is not recognised)` — and `--check` agrees.
+- A page that fails to render no longer locks the display: the header (tabs and clock) and footer keys keep rendering, the body shows `llmtop: this page failed to render (<type>: <message>)` and `press 1-6 to try another page`, and the traceback is written to `llmtop-error.log` in the state folder (created only on error, overwritten per error, with the version, Python and platform). The same error is written once, not every tick; if the state folder is unavailable the last traceback lines are shown in the body.
 
 ### Removed
 

@@ -863,6 +863,8 @@ class Collector:
 		if self.gpu_notice:
 			notices.append(self.gpu_notice)
 		loaded = [n for n, p in presets.items() if p["status"] == "loaded"]
+		if any(p["status"] in ("loaded", "loading") for p in presets.values()) and not kids:
+			notices.append("llama-server: no process named llama-server* found, so its GPU and RAM figures read 0 (a renamed or wrapped server is not recognised)")
 		if len(kids) > 1 or len(loaded) > 1:
 			notices.append("%d model processes resident: VRAM calibration is paused" % max(len(kids), len(loaded)))
 		for name in loaded:
@@ -1150,8 +1152,20 @@ class Collector:
 						self._fail_state_dir(err)
 
 	# ---- memory maps (computed off-thread: llama-fit-params takes about a second) ------------------------------------------
+	NO_FLAGS_ERROR = "the server did not report this model's command line (/models has no status.args) and no llama-server process was found for it"
+
 	def ensure_map(self, preset):
-		flags, exe = self.flags[preset]
+		fe = self.flags.get(preset)
+		if fe is None:
+			# No known flags: the server did not report the model's command line and no matching
+			# llama-server process was found, so there is nothing to analyse. Record it as a state
+			# the Memory and Tensors pages already render ("could not analyse: …"), not an exception.
+			cur = self.mem.get(preset, {})
+			if cur.get("key") is None and cur.get("state") == "error":
+				return  # already recorded; do not rewrite it every frame
+			self.mem[preset] = {"key": None, "state": "error", "error": self.NO_FLAGS_ERROR}
+			return
+		flags, exe = fe
 		key = json.dumps({k: flags.get(k) for k in model.FIT_FLAGS + ("model-draft", "cache-ram", "swa-checkpoints", "ctx-checkpoints")}, sort_keys=True)
 		if self.mem.get(preset, {}).get("key") == key:
 			return

@@ -1,6 +1,6 @@
 # Troubleshooting win-llmtop
 
-**Contents:** [32-bit Python or older Python (`windows FAIL`)](#32-bit-python-or-older-python) · [No GPU counters or adapter not matched (`gpu FAIL`)](#no-gpu-counters-or-adapter-not-matched) · [No server found or unreachable (`server FAIL`)](#no-server-found-or-server-unreachable) · [Several llama-servers running](#several-llama-servers-running) · [`/slots` endpoint is off (`HTTP 404` / `HTTP 501`)](#slots-endpoint-is-off) · [Server or `/slots` authentication error (`HTTP 401` / `HTTP 403`)](#server-or-slots-authentication-error) · [Missing per-model log, unrecognised format or missing timestamps](#missing-per-model-log-unrecognised-format-or-missing-timestamps) · [Router log not found](#router-log-not-found) · [State folder not writable (`state FAIL`)](#state-folder-not-writable-or-unavailable) · [`llama-fit-params` not found](#llama-fit-params-not-found) · [Informational notices](#informational-notices) · [Unknown threshold or collector error](#unknown-threshold-or-collector-error) · [Garbled display or boxes in the charts](#garbled-display-or-boxes-in-the-charts)
+**Contents:** [32-bit Python or older Python (`windows FAIL`)](#32-bit-python-or-older-python) · [No GPU counters or adapter not matched (`gpu FAIL`)](#no-gpu-counters-or-adapter-not-matched) · [No server found or unreachable (`server FAIL`)](#no-server-found-or-server-unreachable) · [Several llama-servers running](#several-llama-servers-running) · ["llama-server 0 MiB", a missing RAM row, or "no memory map"](#llama-server-0-mib-a-missing-ram-row-or-no-memory-map) · [`/slots` endpoint is off (`HTTP 404` / `HTTP 501`)](#slots-endpoint-is-off) · [Server or `/slots` authentication error (`HTTP 401` / `HTTP 403`)](#server-or-slots-authentication-error) · [Missing per-model log, unrecognised format or missing timestamps](#missing-per-model-log-unrecognised-format-or-missing-timestamps) · [Router log not found](#router-log-not-found) · [State folder not writable (`state FAIL`)](#state-folder-not-writable-or-unavailable) · [`llama-fit-params` not found](#llama-fit-params-not-found) · [Informational notices](#informational-notices) · [Unknown threshold or collector error](#unknown-threshold-or-collector-error) · [Garbled display or boxes in the charts](#garbled-display-or-boxes-in-the-charts)
 
 Each entry lists the exact message printed by `win-llmtop` or `win-llmtop --check` (see [`usage.md`](usage.md#first-run)), its cause, and how to fix it. Every command-line option links to [`llmtop.1.md#options`](llmtop.1.md#options).
 
@@ -89,6 +89,36 @@ Each entry lists the exact message printed by `win-llmtop` or `win-llmtop --chec
 **Cause:** More than one independent `llama-server` process is running (not counting worker child processes spawned by a router). Single-model mode matches process flags and logs to the process whose `--host` and `--port` correspond to the watched URL; discovery tries `http://127.0.0.1:8080` first, then each process's command line.
 
 **Fix:** Pass [`--router`](llmtop.1.md#options) `<URL>` (or set `LLMTOP_ROUTER`) to select the exact server URL you want to monitor.
+
+---
+
+## "llama-server 0 MiB", a missing RAM row, or "no memory map"
+
+**Symptom:**
+
+- A model is reported as `loaded` or `loading`, but the **Live** page shows the `llama-server` shared row reading `0 MiB` (with its GPU figures at 0), and the **Memory** page has no per-model RAM row.
+- The **Memory** and/or **Tensors** page shows:
+	```text
+	could not analyse: the server did not report this model's command line (/models has no status.args) and no llama-server process was found for it
+	```
+- A notice prints:
+	```text
+	llama-server: no process named llama-server* found, so its GPU and RAM figures read 0 (a renamed or wrapped server is not recognised)
+	```
+
+**Cause:** `win-llmtop` measures GPU and RAM by walking the `llama-server` process address space, and it finds that process by matching an executable name that starts with `llama-server`. The figures read 0 and no memory map is built when either:
+
+1. no process whose name starts with `llama-server` is running — for example the binary was renamed, is launched through a wrapper or launcher, or runs inside a container or WSL whose process name is not visible in the Windows process list — so the server answers over HTTP but its process is not recognised; or
+2. a router serves the model and its `/models` entry has no `status.args` (no command line reported), and no matching process can be found, so `win-llmtop` has neither a command line to parse nor a process to walk.
+
+In both cases the model still appears in the preset list and `m` still cycles over it; only the per-process figures are unavailable.
+
+**Fix:**
+
+- If the binary was renamed or wrapped, run it as `llama-server` (or `llama-server-<suffix>`) so its process name is recognised, and run `win-llmtop` on the same machine that hosts the process.
+- If a router is in use, make sure the router reports each preset's command line in `/models` (`status.args`), or run `llama-server` as a normal (non-renamed) local process.
+- To diagnose, run `win-llmtop --check` and send its full output together with a `/models` response (with any API keys or other secrets removed).
+- If a page still fails to render, the last traceback is written to `llmtop-error.log` in the state folder (`%LOCALAPPDATA%\win-llmtop` by default, or the path passed to [`--state-dir`](llmtop.1.md#options) / `LLMTOP_STATE_DIR`).
 
 ---
 

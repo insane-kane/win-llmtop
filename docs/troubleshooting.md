@@ -1,6 +1,6 @@
 # Troubleshooting win-llmtop
 
-**Contents:** [32-bit Python or older Python (`windows FAIL`)](#32-bit-python-or-older-python) · [No GPU counters or adapter not matched (`gpu FAIL`)](#no-gpu-counters-or-adapter-not-matched) · [No server found or unreachable (`server FAIL`)](#no-server-found-or-server-unreachable) · [Several llama-servers running](#several-llama-servers-running) · [`/slots` endpoint is off (`HTTP 404` / `HTTP 501`)](#slots-endpoint-is-off) · [Server or `/slots` authentication error (`HTTP 401` / `HTTP 403`)](#server-or-slots-authentication-error) · [Missing per-model log, unrecognised format or missing timestamps](#missing-per-model-log-unrecognised-format-or-missing-timestamps) · [Router log not found](#router-log-not-found) · [State folder not writable (`state FAIL`)](#state-folder-not-writable-or-unavailable) · [`llama-fit-params` not found](#llama-fit-params-not-found) · [Informational notices](#informational-notices) · [Unknown threshold or collector error](#unknown-threshold-or-collector-error) · [Garbled display in the classic console](#garbled-display-or-missing-braille-in-the-classic-console)
+**Contents:** [32-bit Python or older Python (`windows FAIL`)](#32-bit-python-or-older-python) · [No GPU counters or adapter not matched (`gpu FAIL`)](#no-gpu-counters-or-adapter-not-matched) · [No server found or unreachable (`server FAIL`)](#no-server-found-or-server-unreachable) · [Several llama-servers running](#several-llama-servers-running) · [`/slots` endpoint is off (`HTTP 404` / `HTTP 501`)](#slots-endpoint-is-off) · [Server or `/slots` authentication error (`HTTP 401` / `HTTP 403`)](#server-or-slots-authentication-error) · [Missing per-model log, unrecognised format or missing timestamps](#missing-per-model-log-unrecognised-format-or-missing-timestamps) · [Router log not found](#router-log-not-found) · [State folder not writable (`state FAIL`)](#state-folder-not-writable-or-unavailable) · [`llama-fit-params` not found](#llama-fit-params-not-found) · [Informational notices](#informational-notices) · [Unknown threshold or collector error](#unknown-threshold-or-collector-error) · [Garbled display or boxes in the charts](#garbled-display-or-boxes-in-the-charts)
 
 Each entry lists the exact message printed by `win-llmtop` or `win-llmtop --check` (see [`usage.md`](usage.md#first-run)), its cause, and how to fix it. Every command-line option links to [`llmtop.1.md#options`](llmtop.1.md#options).
 
@@ -249,14 +249,14 @@ Each entry lists the exact message printed by `win-llmtop` or `win-llmtop --chec
 
 ---
 
-## Garbled display or missing braille in the classic console
+## Garbled display or boxes in the charts
 
-**Symptom:** Trend charts show empty boxes (`▯` / `?`) instead of braille dots, or raw ANSI escape codes appear on screen.
+**Symptom:** Trend charts show empty boxes (`▯` / `?`) instead of block characters, or raw ANSI escape codes appear on screen.
 
-**Cause:** The classic Windows console (`conhost.exe`) with a legacy raster font lacks Unicode braille characters (`U+2800`–`U+28FF`), or virtual terminal processing is disabled in the console host.
+**Cause:** The classic Windows console (`conhost.exe`) with a legacy raster font lacks the one-eighth block characters (`▁`–`▇`) and the braille dots used by the finer chart styles, or virtual terminal processing is disabled in the console host.
 
 **Fix:**
 
-- Run `win-llmtop` in **Windows Terminal** (`wt.exe`) with a Unicode monospace font such as Cascadia Mono (see [`install.md#recommended-terminal`](install.md#recommended-terminal)).
-- Press `s` (or pass [`--graph-style`](llmtop.1.md#options) `blocks`) to draw charts with standard block characters instead of braille.
+- Run `win-llmtop` in **Windows Terminal** (`wt.exe`) with a Unicode monospace font such as Cascadia Mono (see [`install.md#recommended-terminal`](install.md#recommended-terminal)); it draws the finest `braille` charts.
+- In the classic console, `win-llmtop` now defaults to the `coarse` style (`▄`/`█`), which the raster font draws. If you still see boxes, press `s` or pass [`--graph-style`](llmtop.1.md#options) `coarse` to force it.
 - Pass [`--no-color`](llmtop.1.md#options) to turn off ANSI colour escape sequences.

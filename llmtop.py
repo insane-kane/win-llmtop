@@ -72,7 +72,9 @@ def handle(key, c, view, snap, H):
 	elif key in ("p", " "):
 		view.paused = not view.paused
 	elif key == "s":
-		ui.STYLE["mode"] = "blocks" if ui.STYLE["mode"] == "braille" else "braille"
+		cycle = ("braille", "blocks", "coarse", "ascii")
+		i = cycle.index(ui.STYLE["mode"]) if ui.STYLE["mode"] in cycle else -1
+		ui.STYLE["mode"] = cycle[(i + 1) % len(cycle)]
 		view.msg = "graph style: %s" % ui.STYLE["mode"]
 	elif key == "g":
 		view.gh = (view.gh + 1) % 5
@@ -241,6 +243,12 @@ def check(c, args):
 	print("%-18s %-5s %s" % ("windows", "ok" if win_ok else "FAIL", "%s, %s" % (win_ver, py_ver)))
 	if tick_error:
 		print("%-18s %-5s %s" % ("collector", "FAIL", tick_error))
+
+	# 1b. the terminal: which console this is, and which chart style it will use (informational; does not affect the exit code)
+	kind = ui.terminal_kind(os.environ)
+	style = ui.STYLE["mode"]
+	note = " (Windows Terminal draws finer charts; s or --graph-style changes it)" if style in ("coarse", "ascii") and not args.style_explicit else ""
+	print("%-18s %-5s %s" % ("terminal", "--", "%s: charts use the %s style%s" % (kind, style, note)))
 
 	# 2. GPU: DXGI adapters, watched adapter, PDH GPU counters
 	dx = c.dx
@@ -442,7 +450,7 @@ def main():
 	ap.add_argument("--spill-mib", type=int, default=state.CFG["spill_mib"], help="excess shared GPU memory (MiB) that raises an alert")
 	ap.add_argument("--threshold", action="append", default=[], metavar="NAME=VALUE", help="override an alert threshold (see CFG in llmtop_lib/state.py); repeatable")
 	ap.add_argument("--no-persist", action="store_true", help="do not mirror history to disk")
-	ap.add_argument("--graph-style", choices=("braille", "blocks"), default=None, help="braille line plots, or block-character charts if the font lacks braille")
+	ap.add_argument("--graph-style", choices=("braille", "blocks", "coarse", "ascii"), default=None, help="braille line plots, block-character charts, a code-page-437 coarse style for the classic console, or plain ascii")
 	ap.add_argument("--no-color", action="store_true")
 	ap.add_argument("--width", type=int, default=0, help="line width for --once and --plan")
 	args = ap.parse_args()
@@ -450,8 +458,9 @@ def main():
 		sys.exit("llmtop reads Windows performance counters and runs on Windows only.")
 	if not win.IS_64:
 		sys.exit("win-llmtop needs 64-bit Python (32-bit Python cannot read a 64-bit llama-server's memory)")
-	if args.graph_style is None:
-		args.graph_style = "braille" if "WT_SESSION" in os.environ else "blocks"
+	args.style_explicit = args.graph_style is not None
+	if not args.style_explicit:
+		args.graph_style = ui.detect_style(os.environ)
 	ui.STYLE["mode"] = args.graph_style
 	vt_ok = win.enable_vt()
 	for stream in (sys.stdout, sys.stderr):

@@ -9,7 +9,7 @@
 ```shell
 win-llmtop [--window 1m|5m|15m|1h|6h|24h] [--hz N] [--no-persist] [--no-color]
 win-llmtop --check
-win-llmtop --once [--page live|memory|system|requests|events|tensors|all] [--graph-style braille|blocks]
+win-llmtop --once [--page live|memory|system|requests|events|tensors|all] [--graph-style braille|blocks|coarse|ascii]
 win-llmtop --plan [PRESET]
 ```
 
@@ -36,7 +36,7 @@ Options, with their environment variables and defaults:
 | `--spill-mib SPILL_MIB` | — | `256` | excess shared GPU memory (MiB) that raises an alert |
 | `--threshold NAME=VALUE` | — | (none) | override an alert or grouping threshold (see `CFG` in `llmtop_lib/state.py`); repeatable |
 | `--no-persist` | — | off | do not mirror history to disk |
-| `--graph-style {braille,blocks}` | — | braille in Windows Terminal, blocks otherwise | braille line plots, or block-character charts if the font lacks braille |
+| `--graph-style {braille,blocks,coarse,ascii}` | — | detected: braille in Windows Terminal, blocks in other modern terminals, coarse in the classic console | braille line plots, block-character charts, a code-page-437 coarse style for the classic console, or plain ascii |
 | `--no-color` | — | off | disable ANSI colour escapes |
 | `--width WIDTH` | — | the terminal width | line width for `--once` and `--plan` |
 
@@ -63,7 +63,7 @@ Notices are grey `· ` lines that say why a figure is missing or a source is abs
 | **Events** | Alerts raised and cleared, model loads, queueing, evictions, prompt-cache misses, request errors, truncation. Each event is a short headline; `f` filters by level and `d` toggles the detail line(s) under each event (the comparisons, thresholds and deductions the headline leaves out). |
 | **Tensors** | Every layer (`t` switches to every tensor) with type, shape, size and device as a ■ GPU / ■ CPU badge, plus a short tag where something deliberate placed it on the CPU; `d` filters by device. |
 
-Keys: `[` `]` change the history window; `g` sets the graph height (auto, 1–4 lines); `s` switches the graph style; `↑` `↓` `PgUp` `PgDn` `Home` `End` scroll every page except Live; on Live `t` switches the bottom table between recent turns and recent prompts; on Events `f` filters by level and `d` toggles the detail line(s); on Tensors `d` filters by device; `p` or `Space` pauses the display (collection continues); `q` quits.
+Keys: `[` `]` change the history window; `g` sets the graph height (auto, 1–4 lines); `s` cycles the graph style (braille, blocks, coarse, ascii); `↑` `↓` `PgUp` `PgDn` `Home` `End` scroll every page except Live; on Live `t` switches the bottom table between recent turns and recent prompts; on Events `f` filters by level and `d` toggles the detail line(s); on Tensors `d` filters by device; `p` or `Space` pauses the display (collection continues); `q` quits.
 
 ### Prompts, turns and notes
 - **Turn:** one `llama-server` request.
@@ -82,7 +82,7 @@ Keys: `[` `]` change the history window; `g` sets the graph height (auto, 1–4 
 	- `resized`: compute buffers were reallocated with changed sizes.
 
 ### Graphs
-Each chart is a frame: labels and the current value sit beside the first line, the scale's high is printed on the top border and its low on the bottom border, and ticks on the borders mark quarters of the time window (the header says how far back the left edge is). The default style is a braille line trace (two samples per character, four dot rows per line); rate series are filled. `--graph-style blocks` or the `s` key uses block characters for fonts without braille. Each chart is scaled to what its series did in the window, so a steady value is a flat line at mid-height; charts anchored at zero (rates, context tokens) say so with a low of 0. A missing stretch of data is blank inside the frame. Auto height picks 3 lines, then 2, then a single line per chart, whichever leaves room for the request table. On the Requests page, the per-turn charts plot only qualifying turns (`256+` new tokens for prefill, `20+` generated for decode) without gaps, and the shared-memory chart is hidden when no turn in the window exceeded the baseline by `spill_mib`.
+Each chart is a frame: labels and the current value sit beside the first line, the scale's high is printed on the top border and its low on the bottom border, and ticks on the borders mark quarters of the time window (the header says how far back the left edge is). The default style is picked from the terminal: a braille line trace (two samples per character, four dot rows per line) in Windows Terminal, block characters (`▁`–`▇`) in other modern terminals, and the `coarse` style (`▄`/`█`, two steps per line) in the classic console, whose raster font has no one-eighth steps. Rate series are filled. `--graph-style` forces a style, and the `s` key cycles braille, blocks, coarse and ascii (plain ascii for terminals that draw nothing else); the message line shows the current one. Each chart is scaled to what its series did in the window, so a steady value is a flat line at mid-height; charts anchored at zero (rates, context tokens) say so with a low of 0. A missing stretch of data is blank inside the frame. Auto height picks 3 lines, then 2, then a single line per chart, whichever leaves room for the request table. On the Requests page, the per-turn charts plot only qualifying turns (`256+` new tokens for prefill, `20+` generated for decode) without gaps, and the shared-memory chart is hidden when no turn in the window exceeded the baseline by `spill_mib`.
 
 ### Colour of t/s
 Every prefill and decode t/s value in the prompt and turn tables is coloured against the **same preset's median at a similar context depth** (`<8k`, `8–32k`, `32–64k`, `64k+`; prefill buckets by context `cached + pn`, decode by `kv`), from ≥ 3 qualifying turns: blue is 120% or more of that median, green 80–120%, yellow 50–80%, red under 50%. A turn is compared against the median for its own bucket. A prompt is compared against the time its turns would usually take — each turn's new (or generated) tokens over that turn's own bucket median, summed, over the same turns' time — so a long prompt is not judged at its final depth; it is dim grey when the turns with a reference hold under half its new (or generated) tokens. Prefill is compared only for turns with `pn` ≥ 256 (smaller prefills are dominated by fixed overhead) and decode only for `tn` ≥ 20; anything not compared (below those cutoffs or fewer than three qualifying turns in the bucket) is dim grey, never the default terminal colour. In the bucket tables, the presets with 3+ turns in a column are ranked fastest first and grouped into near-tie clusters (a cell stays in a cluster while within 5% of that cluster's fastest value), and every cell in a cluster takes the colour its fastest member would get by rank: the fastest clusters are green, the slowest red, the middle yellow; cells with fewer turns and `-` cells are dim grey, and a column with a single ranked preset is plain.

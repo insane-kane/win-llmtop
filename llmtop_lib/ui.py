@@ -5,8 +5,35 @@ import re
 
 RE_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 RE_TOKEN = re.compile(r"(\x1b\[[0-9;?]*[A-Za-z])|(.)")
-SPARK = "▁▂▃▄▅▆▇"
-PARTIAL = " ▏▎▍▌▋▊▉"
+
+# The chart and bar glyphs, one table per style. Every glyph in the `coarse` tables is in code page 437 (so it draws in
+# the classic console and in every console font); the `ascii` tables are printable ASCII only, as insurance for a console
+# that draws even the cp437 blocks wrong. A page never names a chart or bar glyph directly: the full cell, the partial
+# cells, the empty cell, the stack marker, the chart's missing-data dot and the chart frame all come from here, selected
+# by STYLE["mode"]. `chart_partials` holds the glyphs for k = 1..n-1 of a row's n steps (k = n is the full cell);
+# `bar_partials` is indexed 0..n-1 with 0 the empty cell; `core` is the eight-slot per-core bar.
+TABLES = {
+	"braille": {
+		"full": "█", "empty": "░", "marker": "┃", "nan": "·",
+		"chart_partials": "▁▂▃▄▅▆▇", "bar_partials": " ▏▎▍▌▋▊▉", "core": "▁▂▃▄▅▆▇█",
+		"frame": {"tl": "┌", "h": "─", "tm": "┬", "tr": "┐", "v": "│", "bl": "└", "bm": "┴", "br": "┘"},
+	},
+	"blocks": {
+		"full": "█", "empty": "░", "marker": "┃", "nan": "·",
+		"chart_partials": "▁▂▃▄▅▆▇", "bar_partials": " ▏▎▍▌▋▊▉", "core": "▁▂▃▄▅▆▇█",
+		"frame": {"tl": "┌", "h": "─", "tm": "┬", "tr": "┐", "v": "│", "bl": "└", "bm": "┴", "br": "┘"},
+	},
+	"coarse": {
+		"full": "█", "empty": "░", "marker": "│", "nan": "·",
+		"chart_partials": "▄", "bar_partials": " ▌", "core": " ▄▄▄████",
+		"frame": {"tl": "┌", "h": "─", "tm": "┬", "tr": "┐", "v": "│", "bl": "└", "bm": "┴", "br": "┘"},
+	},
+	"ascii": {
+		"full": "#", "empty": " ", "marker": "|", "nan": ".",
+		"chart_partials": "=", "bar_partials": " =", "core": " ===####",
+		"frame": {"tl": "+", "h": "-", "tm": "+", "tr": "+", "v": "|", "bl": "+", "bm": "+", "br": "+"},
+	},
+}
 
 
 class _Colors:
@@ -53,54 +80,88 @@ def rpad(s, width):
 
 
 def bar(frac, width, color=""):
-	"""Horizontal bar with eighth-cell resolution."""
+	"""Horizontal bar; the partial-cell resolution comes from the style's table (eighths in blocks, a half cell in coarse and ascii)."""
 	frac = 0.0 if frac != frac else min(1.0, max(0.0, frac))
+	t = TABLES[STYLE["mode"]]
 	cells = frac * width
 	full = int(cells)
-	part = int((cells - full) * 8) if full < width else 0
-	fill = "█" * full + (PARTIAL[part] if part else "")
-	return "%s%s%s%s%s" % (color, fill, C.grey, "░" * (width - len(fill)), C.reset)
+	part = int((cells - full) * len(t["bar_partials"])) if full < width else 0
+	fill = t["full"] * full + (t["bar_partials"][part] if part else "")
+	return "%s%s%s%s%s" % (color, fill, C.grey, t["empty"] * (width - len(fill)), C.reset)
 
 
 def stack(parts, total, width, marker=None):
-	"""Stacked bar: parts is [(value, colour)], total is the full scale; `marker` draws a ┃ at that value."""
+	"""Stacked bar: parts is [(value, colour)], total is the full scale; `marker` draws the style's marker glyph at that value."""
+	t = TABLES[STYLE["mode"]]
 	cells, used, acc = [], 0, 0.0
 	for value, color in parts:
 		acc += max(0.0, value)
 		end = min(width, round(acc / total * width)) if total else 0
-		cells += [color + "█"] * (end - used)
+		cells += [color + t["full"]] * (end - used)
 		used = max(used, end)
-	cells += [C.grey + "░"] * (width - used)
+	cells += [C.grey + t["empty"]] * (width - used)
 	if marker is not None and total and 0 <= marker <= total:
-		cells[min(width - 1, int(marker / total * width))] = C.bold + C.bred + "┃"
+		cells[min(width - 1, int(marker / total * width))] = C.bold + C.bred + t["marker"]
 	return "".join(c + C.reset for c in cells)
 
 
+def core_glyph(u):
+	"""The per-core load glyph for a percentage `u` (0-100), from the style's eight-slot core table."""
+	return TABLES[STYLE["mode"]]["core"][min(7, int(u * 8 / 100.0))]
+
+
+def frame():
+	"""The chart frame glyphs for the current style (box-drawing in braille, blocks and coarse, ASCII in ascii)."""
+	return TABLES[STYLE["mode"]]["frame"]
+
+
 def chart(vals, lo, hi, rows, color="", dim_floor=False):
-	"""`rows` lines (top first) of a column chart with eight steps per row. NaN is blank with a dim dot on the bottom line. The tallest column
-	stops an eighth short of the top, so charts stacked above one another never touch."""
+	"""`rows` lines (top first) of a column chart. The steps per row and the partial and full glyphs come from the style's table (eight eighths
+	in blocks, a half and a full in coarse and ascii). NaN is blank with a dim dot on the bottom line. The tallest column stops one step short
+	of the top, so charts stacked above one another never touch."""
+	t = TABLES[STYLE["mode"]]
+	per = len(t["chart_partials"]) + 1
 	span = (hi - lo) or 1.0
-	steps = rows * 8 - 1
+	steps = rows * per - 1
 	levels = [None if v != v else min(steps, max(1, int((v - lo) / span * steps + 0.5))) for v in vals]
 	lines = []
 	for r in range(rows):
-		below = (rows - 1 - r) * 8
+		below = (rows - 1 - r) * per
 		cells = []
 		for lv in levels:
 			if lv is None:
-				cells.append(C.grey + "·" + C.reset if r == rows - 1 else " ")
+				cells.append(C.grey + t["nan"] + C.reset if r == rows - 1 else " ")
 				continue
 			k = lv - below
 			if k <= 0:
 				cells.append(" ")
 			else:
-				cells.append((C.grey if dim_floor and lv <= 1 else color) + ("█" if k >= 8 else SPARK[k - 1]) + C.reset)
+				cells.append((C.grey if dim_floor and lv <= 1 else color) + (t["full"] if k >= per else t["chart_partials"][k - 1]) + C.reset)
 		lines.append("".join(cells))
 	return lines
 
 
 STYLE = {"mode": "braille"}
 DOTS = ((0x01, 0x02, 0x04, 0x40), (0x08, 0x10, 0x20, 0x80))  # braille dot bit by [column][row from the top]
+
+
+def detect_style(env):
+	"""The graph style for this terminal, from environment variables alone (no font probing): braille in Windows Terminal, blocks in other
+	modern terminals that set a recognisable variable, coarse (code page 437 only) in the classic console and anything unknown."""
+	if env.get("WT_SESSION"):
+		return "braille"
+	if env.get("TERM_PROGRAM") or env.get("ConEmuANSI") == "ON":
+		return "blocks"
+	return "coarse"
+
+
+def terminal_kind(env):
+	"""Which console this is, for the --check line: Windows Terminal, some other recognisable terminal, or the classic console."""
+	if env.get("WT_SESSION"):
+		return "Windows Terminal"
+	if env.get("TERM_PROGRAM") or env.get("ConEmuANSI") == "ON":
+		return "other"
+	return "classic console"
 
 
 def braille(vals, lo, hi, rows, color="", fill=False):
@@ -122,9 +183,12 @@ def braille(vals, lo, hi, rows, color="", fill=False):
 
 
 def plot(vals, lo, hi, rows, color="", dim_floor=False, fill=False):
-	"""Braille line or area plot, or the block-character chart when the style is set to blocks."""
+	"""Braille line or area plot, or the block-character chart. The coarse and ascii charts get a row taller to make up for their coarser
+	steps per row."""
 	if STYLE["mode"] == "braille":
 		return braille(vals, lo, hi, rows, color, fill)
+	if STYLE["mode"] in ("coarse", "ascii"):
+		rows += 1
 	return chart(vals, lo, hi, rows, color, dim_floor)
 
 

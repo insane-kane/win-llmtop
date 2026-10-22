@@ -141,10 +141,14 @@ py -c "import struct; print(struct.calcsize('P')*8)"
 
 ## Recommended terminal
 
-**Windows Terminal** (`wt.exe`) is strongly recommended:
+**Windows Terminal** (`wt.exe`) is strongly recommended: it draws the finest charts.
 
-- When `win-llmtop` detects Windows Terminal (`WT_SESSION`), [`--graph-style`](llmtop.1.md#options) defaults to `braille`, plotting two time samples per character column with four vertical dot rows per line.
-- In the classic Windows console host (`conhost.exe`), [`--graph-style`](llmtop.1.md#options) automatically falls back to `blocks` (`▁▂▃▄▅▆▇█`) because legacy raster fonts lack Unicode braille glyphs.
-- You can toggle between `braille` and `blocks` live with the `s` key, force a style at startup with [`--graph-style`](llmtop.1.md#options), or disable ANSI colour codes with [`--no-color`](llmtop.1.md#options).
+`win-llmtop` picks a chart style from the terminal it runs in:
+
+- **Windows Terminal** (`WT_SESSION` set): `braille` — two time samples per character column, four vertical dot rows per line.
+- **Other modern terminals** (`TERM_PROGRAM` set, or `ConEmuANSI=ON`): `blocks` (`▁▂▃▄▅▆▇█`), eight steps per line.
+- **Classic console** (`conhost.exe`, no other signal): `coarse` (`▄`/`█`), two steps per line. The classic console's raster font has no one-eighth steps, so `blocks` would draw boxes there.
+
+You can cycle the style live with the `s` key (it steps through `braille`, `blocks`, `coarse` and `ascii`), force one at startup with [`--graph-style`](llmtop.1.md#options), or disable ANSI colour codes with [`--no-color`](llmtop.1.md#options). If charts show boxes in the default style, press `s` or start with `--graph-style coarse` — the classic console needs the `coarse` style.
 
 See [`usage.md`](usage.md) for your first run and [`llmtop.1.md`](llmtop.1.md#options) for all command-line options.

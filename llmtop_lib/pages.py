@@ -9,10 +9,9 @@ from collections import defaultdict
 from . import model, prompts
 from . import state as S
 from .state import mib
-from .ui import STYLE, C, ago, bar, clip, gib, num, pad, plot, rate, rpad, shade, stack, tok, vlen
+from .ui import STYLE, C, ago, bar, clip, core_glyph, frame, gib, num, pad, plot, rate, rpad, shade, stack, tok, vlen
 
 NAN = float("nan")
-CORE_BAR = "▁▂▃▄▅▆▇█"
 ICON = {"crit": ("◆", "bred"), "warn": ("▲", "byellow"), "info": ("●", "bcyan")}
 DEC_EDGES, DEC_LABELS = (8000, 32000, 64000), ("<8k", "8-32k", "32-64k", "64k+")
 DEVICES = ("all", "GPU", "CPU")
@@ -118,18 +117,19 @@ def block(c, view, snap, key, G, rows, label, now, fmt=num, unit="", floor=None,
 		G = (len(vals) + 1) // 2 if STYLE["mode"] == "braille" else len(vals)
 	gr, fin, lo, hi = gchart(c, view, snap, key, G, rows, floor, span, col, fill) if vals is None else scaled(vals, rows, floor, span, col, fill)
 	g, r = C.grey, C.reset
+	f = frame()
 	n = len(gr)
 	if n == 1:
 		axis = "%s – %s%s" % (fmt(lo), fmt(hi), unit) if fin else "no data yet"
-		return ["  " + pad(label, 24) + rpad(now, 14) + "  " + g + "│" + r + pad(gr[0], G) + g + "│" + r + "  " + g + axis + r + ("   " + note if note else "")]
+		return ["  " + pad(label, 24) + rpad(now, 14) + "  " + g + f["v"] + r + pad(gr[0], G) + g + f["v"] + r + "  " + g + axis + r + ("   " + note if note else "")]
 	ticks = {G * k // 4 for k in (1, 2, 3)}
-	top = "┌" + "".join("┬" if i in ticks else "─" for i in range(G)) + "┐"
-	bottom = "└" + "".join("┴" if i in ticks else "─" for i in range(G)) + "┘"
+	top = f["tl"] + "".join(f["tm"] if i in ticks else f["h"] for i in range(G)) + f["tr"]
+	bottom = f["bl"] + "".join(f["bm"] if i in ticks else f["h"] for i in range(G)) + f["br"]
 	lead = "  " + " " * 38 + "  "
 	out = [lead + g + top + r + "  " + g + ((fmt(hi) + unit) if fin else "no data yet") + r]
 	for i, line in enumerate(gr):
 		left = pad(label, 24) + rpad(now, 14) if i == 0 else " " * 38
-		out.append("  " + left + "  " + g + "│" + r + pad(line, G) + g + "│" + r + ("   " + note if note and i == n // 2 else ""))
+		out.append("  " + left + "  " + g + f["v"] + r + pad(line, G) + g + f["v"] + r + ("   " + note if note and i == n // 2 else ""))
 	out.append(lead + g + bottom + r + "  " + g + ((fmt(lo) + unit) if fin else "") + r)
 	return out
 
@@ -896,7 +896,7 @@ def system(c, snap, view, W, H):
 			for v in cores:
 				u = min(100.0, max(0.0, v))
 				col = C.bred if u > 85.0 else C.byellow if u >= 50.0 else C.bgreen
-				cells.append("%s%s%s" % (col, CORE_BAR[min(7, int(u * 8 / 100.0))], C.reset))
+				cells.append("%s%s%s" % (col, core_glyph(u), C.reset))
 			step = max(1, W - 4)
 			for i in range(0, len(cells), step):
 				out.append("  " + "".join(cells[i:i + step]))

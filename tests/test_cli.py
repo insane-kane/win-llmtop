@@ -7,6 +7,7 @@
 
 import http.server
 import json
+import os
 import pathlib
 import socket
 import subprocess
@@ -273,6 +274,68 @@ class TestCLI(unittest.TestCase):
 		with mock.patch("msvcrt.kbhit", return_value=False):
 			self.assertIsNone(llmtop.read_key())
 
+	def test_detect_style_from_env(self):
+		self.assertEqual(llmtop.ui.detect_style({"WT_SESSION": "abc"}), "braille")
+		self.assertEqual(llmtop.ui.detect_style({"TERM_PROGRAM": "vscode"}), "blocks")
+		self.assertEqual(llmtop.ui.detect_style({"ConEmuANSI": "ON"}), "blocks")
+		self.assertEqual(llmtop.ui.detect_style({}), "coarse")
+		self.assertEqual(llmtop.ui.detect_style({"ConEmuANSI": "off"}), "coarse")
+		# Windows Terminal wins over the other signals
+		self.assertEqual(llmtop.ui.detect_style({"WT_SESSION": "abc", "TERM_PROGRAM": "vscode"}), "braille")
+
+	def test_terminal_kind_from_env(self):
+		self.assertEqual(llmtop.ui.terminal_kind({"WT_SESSION": "abc"}), "Windows Terminal")
+		self.assertEqual(llmtop.ui.terminal_kind({"TERM_PROGRAM": "vscode"}), "other")
+		self.assertEqual(llmtop.ui.terminal_kind({"ConEmuANSI": "ON"}), "other")
+		self.assertEqual(llmtop.ui.terminal_kind({}), "classic console")
+
+	def test_s_cycles_four_graph_styles(self):
+		from types import SimpleNamespace
+		cycle = ("braille", "blocks", "coarse", "ascii")
+		old = llmtop.ui.STYLE["mode"]
+		try:
+			for cur, nxt in zip(cycle, cycle[1:] + cycle[:1]):
+				llmtop.ui.STYLE["mode"] = cur
+				view = SimpleNamespace(page=0, msg="")
+				llmtop.handle("s", None, view, None, 40)
+				self.assertEqual(llmtop.ui.STYLE["mode"], nxt)
+				self.assertEqual(view.msg, "graph style: %s" % nxt)
+		finally:
+			llmtop.ui.STYLE["mode"] = old
+
+	def _check_terminal_line(self, env_extra, extra_args=()):
+		env = dict(os.environ)
+		for k in ("WT_SESSION", "TERM_PROGRAM", "ConEmuANSI"):
+			env.pop(k, None)
+		env.update(env_extra)
+		unused = _unused_port()
+		with tempfile.TemporaryDirectory() as tmpdir:
+			cmd = [sys.executable, "-I", LLMTOP_PY, "--check", "--router", "http://127.0.0.1:%d" % unused, "--state-dir", tmpdir]
+			cmd += list(extra_args)
+			proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, env=env)
+		for ln in proc.stdout.splitlines():
+			if ln.strip().startswith("terminal"):
+				return ln
+		self.fail("no terminal line in --check output: %r" % proc.stdout)
+
+	def test_check_terminal_line(self):
+		# classic console (no detection vars): coarse, with the note
+		term = self._check_terminal_line({})
+		self.assertIn("classic console: charts use the coarse style", term)
+		self.assertIn("Windows Terminal draws finer charts", term)
+		# Windows Terminal: braille, no note
+		term = self._check_terminal_line({"WT_SESSION": "test"})
+		self.assertIn("Windows Terminal: charts use the braille style", term)
+		self.assertNotIn("Windows Terminal draws finer charts", term)
+		# other modern terminal: blocks, no note
+		term = self._check_terminal_line({"TERM_PROGRAM": "vscode"})
+		self.assertIn("other: charts use the blocks style", term)
+		self.assertNotIn("Windows Terminal draws finer charts", term)
+		# an explicit --graph-style coarse does not get the note
+		term = self._check_terminal_line({}, extra_args=("--graph-style", "coarse"))
+		self.assertIn("charts use the coarse style", term)
+		self.assertNotIn("Windows Terminal draws finer charts", term)
+
 
 CASES = [
 	("help_generic_and_no_local_names", TestCLI("test_help_generic_and_no_local_names")),
@@ -281,6 +344,10 @@ CASES = [
 	("once_page_all_runs_cleanly", TestCLI("test_once_page_all_runs_cleanly")),
 	("removed_pagein_warn_threshold_accepted_with_note", TestCLI("test_removed_pagein_warn_threshold_accepted_with_note")),
 	("read_key_case_insensitivity", TestCLI("test_read_key_case_insensitivity")),
+	("detect_style_from_env", TestCLI("test_detect_style_from_env")),
+	("terminal_kind_from_env", TestCLI("test_terminal_kind_from_env")),
+	("s_cycles_four_graph_styles", TestCLI("test_s_cycles_four_graph_styles")),
+	("check_terminal_line", TestCLI("test_check_terminal_line")),
 ]
 
 

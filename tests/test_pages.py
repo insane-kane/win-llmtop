@@ -15,7 +15,7 @@ import sys
 import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from llmtop_lib import pages, state as S  # noqa: E402
+from llmtop_lib import pages, state as S, ui  # noqa: E402
 
 
 def req(preset="m", pn=120, pp=100.0, tn=30, tg=5.0, wall=1000.0):
@@ -608,6 +608,125 @@ def test_shared_row_widths_live_and_memory():
 			assert not any("beyond" in ln for ln in rendered), (page_name, w, [ln for ln in rendered if "beyond" in ln])
 
 
+class DataRing:
+	"""A ring that returns a varying series so charts render partial and full cells, not just blanks."""
+
+	def cols(self, t, seconds, n, how="max"):
+		if n <= 0:
+			return []
+		return [((i * 37) % 100) / 100.0 * 8.0 for i in range(n)]
+
+	def span_max(self, a, b):
+		return 8.0
+
+
+class DataRings:
+	def __getitem__(self, key):
+		return DataRing()
+
+
+def _coarse_allowed():
+	"""Everything the classic console draws: ASCII, all of code page 437, plus the symbols the pages already use outside
+	charts and bars that we assume the console draws (they are not in cp437)."""
+	allowed = set(range(128))
+	for b in range(256):
+		try:
+			allowed.add(ord(bytes([b]).decode("cp437")))
+		except Exception:
+			pass
+	# outside-chart symbols the pages already use, not in cp437 (assumed to draw on the user's console):
+	# ● ▲ ◆ ┃ … ◂ ▸ ✓ ↑ ↓ ← → the en dash in the chart axis, ≈ in the memory page's text, × in the cache topology
+	for cp in (0x25CF, 0x25B2, 0x25C6, 0x2503, 0x2026, 0x25C2, 0x25B8, 0x2713, 0x2191, 0x2193, 0x2190, 0x2192, 0x2013, 0x2248, 0x00D7):
+			allowed.add(cp)
+	return allowed
+
+
+def _full_snap():
+	snap = make_test_snap()
+	snap["ram"]["standby"] = 16384.0
+	snap["ram"]["pages_in"] = 0.0
+	snap["ram"]["pages_out"] = 0.0
+	snap["ram"]["free"] = 8192.0
+	snap["ram"]["modified"] = 4096.0
+	snap["ram"]["ws_total"] = 30000.0
+	snap["ram"]["ws_by"] = {}
+	snap["ram"]["pf_cfg"] = []
+	snap["cpu"] = {"pct": 10.0, "cores": 8, "threads": 16, "freq": 3500.0, "top": [], "cpu_cores": [10.0, 20.0, 55.0, 90.0, 5.0, 35.0, 70.0, 45.0]}
+	snap["llama"]["cpu"] = 1.0
+	return snap
+
+
+def _coarse_collector():
+	c = collector([], cfg=dict(S.CFG))
+	c.rings = DataRings()
+	c.cpu_info = {}
+	c.alerts.ordered = lambda: []
+	return c
+
+
+def test_coarse_pages_only_allowed_glyphs():
+	allowed = _coarse_allowed()
+	old = ui.STYLE["mode"]
+	try:
+		ui.STYLE["mode"] = "coarse"
+		snap = _full_snap()
+		for page_idx in range(6):
+			view = pages.View()
+			view.page = page_idx
+			c = _coarse_collector()
+			rendered = pages.render(c, snap, view, 120, 40)
+			for ln in rendered:
+				plain_ln = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", ln)
+				bad = [ch for ch in plain_ln if ord(ch) not in allowed]
+				assert not bad, ("page %d" % page_idx, sorted(set(bad)), plain_ln)
+	finally:
+		ui.STYLE["mode"] = old
+
+
+def test_bar_fractions_all_styles():
+	old = ui.STYLE["mode"]
+	try:
+		for style in ("braille", "blocks", "coarse", "ascii"):
+			ui.STYLE["mode"] = style
+			t = ui.TABLES[style]
+			full_g, empty_g = t["full"], t["empty"]
+			out0 = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", ui.bar(0.0, 10))
+			assert out0 == empty_g * 10, (style, out0)
+			out1 = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", ui.bar(1.0, 10))
+			assert out1 == full_g * 10, (style, out1)
+			out_half = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", ui.bar(0.5, 10))
+			assert out_half == full_g * 5 + empty_g * 5, (style, out_half)
+	finally:
+		ui.STYLE["mode"] = old
+
+
+def test_ascii_charts_and_bars_printable_ascii():
+	old = ui.STYLE["mode"]
+	try:
+		ui.STYLE["mode"] = "ascii"
+
+		def asc(s):
+			return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", s)
+
+		def is_asciiprint(s):
+			return all(32 <= ord(ch) <= 126 for ch in s)
+
+		for frac in (0.0, 0.3, 0.5, 0.7, 1.0):
+			out = asc(ui.bar(frac, 20))
+			assert is_asciiprint(out), (frac, out)
+		out = asc(ui.stack([(5, ""), (3, "")], 10, 20, marker=7))
+		assert is_asciiprint(out), out
+		vals = [1.0, 3.0, 2.0, 5.0, 4.0, 2.5, 0.5]
+		for ln in ui.plot(vals, 0.0, 5.0, 3):
+			out = asc(ln)
+			assert is_asciiprint(out), out
+		for u in range(0, 101, 5):
+			g = ui.core_glyph(u)
+			assert is_asciiprint(g), (u, g)
+	finally:
+		ui.STYLE["mode"] = old
+
+
 CASES = [
 	("summary_short_requests_fall_back", test_summary_short_requests_fall_back),
 	("summary_long_cutoffs_when_reached", test_summary_long_cutoffs_when_reached),
@@ -647,6 +766,9 @@ CASES = [
 	("shared_row_over_zero_no_beyond_term", test_shared_row_over_zero_no_beyond_term),
 	("no_percent_of_all_shared_anywhere", test_no_percent_of_all_shared_anywhere),
 	("shared_row_widths_live_and_memory", test_shared_row_widths_live_and_memory),
+	("coarse_pages_only_allowed_glyphs", test_coarse_pages_only_allowed_glyphs),
+	("bar_fractions_all_styles", test_bar_fractions_all_styles),
+	("ascii_charts_and_bars_printable_ascii", test_ascii_charts_and_bars_printable_ascii),
 ]
 
 

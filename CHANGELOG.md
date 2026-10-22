@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The classic Windows console (`conhost.exe`) no longer draws boxes in the trend charts: `win-llmtop` now defaults to a new `coarse` glyph style there (code page 437 only — `▄`/`█` charts, whole- and half-cell bars), detected from the terminal like the existing `braille` and `blocks` styles. `--graph-style` and the `s` key cycle all four, including a plain-ascii style.
 - A malformed GGUF model header now fails with a clear `ValueError` or `IndexError` in the memory map, as the parser promises, instead of `ZeroDivisionError` (a zero `general.alignment`) or `OverflowError` (a string array with an oversized length).
 
 ### Removed

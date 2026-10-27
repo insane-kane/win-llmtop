@@ -201,12 +201,44 @@ class TestWin(unittest.TestCase):
 		self.assertNotEqual(code, 0)
 		self.assertTrue(bool(msg))
 
+	def test_pagefiles_none_returns_empty(self):
+		real_fn = win._ntdll.NtQuerySystemInformation
+
+		def stub(info_class, buf, length, ret_len):
+			return 0  # success with nothing written; ret_len stays 0
+
+		try:
+			win._ntdll.NtQuerySystemInformation = stub
+			self.assertEqual(win.pagefiles(), [])
+		finally:
+			win._ntdll.NtQuerySystemInformation = real_fn
+
+	def test_vm_summary_needs_query_information_only(self):
+		real_fn = win._k32.OpenProcess
+		masks = []
+
+		def wrapper(access, inherit, pid):
+			masks.append(access)
+			return real_fn(access, inherit, pid)
+
+		try:
+			win._k32.OpenProcess = wrapper
+			vm = win.vm_summary(os.getpid(), name_mib=0)
+		finally:
+			win._k32.OpenProcess = real_fn
+		self.assertEqual(masks, [win.PROCESS_QUERY_INFORMATION])
+		self.assertIsNotNone(vm)
+		self.assertGreater(vm["private"], 0.0)
+		self.assertTrue(vm["files"])
+
 
 CASES = [
 	("counters_sample_per_luid_and_engine_spaces", TestWin("test_counters_sample_per_luid_and_engine_spaces")),
 	("pmc_ex2_to_ex_fallback", TestWin("test_pmc_ex2_to_ex_fallback")),
 	("live_this_process_and_system", TestWin("test_live_this_process_and_system")),
 	("proc_info_nonexistent_pid", TestWin("test_proc_info_nonexistent_pid")),
+	("pagefiles_none_returns_empty", TestWin("test_pagefiles_none_returns_empty")),
+	("vm_summary_needs_query_information_only", TestWin("test_vm_summary_needs_query_information_only")),
 ]
 
 

@@ -606,11 +606,14 @@ def pagefiles():
 	n = wt.ULONG()
 	if _ntdll.NtQuerySystemInformation(18, buf, len(buf), ctypes.byref(n)) != 0:
 		return []
+	if n.value == 0:
+		return []
 	out, off = [], 0
 	while True:
 		e = _Pfi.from_buffer(buf, off)
 		name = ctypes.wstring_at(e.name.buffer, e.name.length // 2).replace("\\??\\", "")
-		out.append({"name": name, "size": e.size * PAGE_SIZE / MIB, "used": e.used * PAGE_SIZE / MIB, "peak": e.peak * PAGE_SIZE / MIB})
+		if name or e.size:
+			out.append({"name": name, "size": e.size * PAGE_SIZE / MIB, "used": e.used * PAGE_SIZE / MIB, "peak": e.peak * PAGE_SIZE / MIB})
 		if not e.next:
 			return out
 		off += e.next
@@ -647,7 +650,7 @@ def _dos_map():
 def vm_summary(pid, big_mib=256, name_mib=8):
 	"""What a process's address space holds, by walking it (about 150 ms for a large process): MiB committed as private memory, mapped files and
 	images, reserved but not committed, the mapped files by name, and the private allocations of at least `big_mib`."""
-	h = _k32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+	h = _k32.OpenProcess(PROCESS_QUERY_INFORMATION, False, pid)
 	if not h:
 		_rec_err("vm_summary", pid)
 		return None

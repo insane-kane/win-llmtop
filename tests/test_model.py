@@ -7,6 +7,7 @@ Runnable as:
 	python -I tools/win-llmtop/tests/test_model.py
 """
 
+import builtins
 import os
 import pathlib
 import shutil
@@ -14,6 +15,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 PARENT = HERE.parent
@@ -272,6 +274,40 @@ class TestModelAnalysis(unittest.TestCase):
 		with self.assertRaises(ValueError):
 			model._parse(raw, len(raw))
 
+	def test_corrupt_header_read_is_capped(self):
+		"""A key length past the end of the file raises ValueError without reading past HEADER_CAP (or the file size)."""
+		header = b"GGUF" + struct.pack("<IQQ", 3, 0, 1) + struct.pack("<Q", 2**40)
+		file_size = 20 * 1024 * 1024
+		path = os.path.join(self.tmpdir, "huge_key.gguf")
+		with open(path, "wb") as f:
+			f.write(header + b"\x00" * (file_size - len(header)))
+
+		real_open = builtins.open
+		read_total = [0]
+
+		def counting_open(*args, **kwargs):
+			f = real_open(*args, **kwargs)
+			real_read = f.read
+
+			def read(size=-1):
+				data = real_read(size)
+				read_total[0] += len(data)
+				return data
+
+			f.read = read
+			return f
+
+		with mock.patch.object(builtins, "open", counting_open):
+			with self.assertRaises(ValueError):
+				model._read_single(path)
+		self.assertLessEqual(read_total[0], file_size + 8 * 1024 * 1024)
+
+		read_total[0] = 0
+		with mock.patch.object(builtins, "open", counting_open), mock.patch.object(model, "HEADER_CAP", 8 * 1024 * 1024):
+			with self.assertRaises(ValueError):
+				model._read_single(path)
+		self.assertLessEqual(read_total[0], 8 * 1024 * 1024)
+
 
 CASES = [
 	("small_model_attn_kv", "test_small_model_attn_kv"),
@@ -282,6 +318,7 @@ CASES = [
 	("draft_path_each_flag", "test_draft_path_each_flag"),
 	("fit_projection_output_parser", "test_fit_projection_output_parser"),
 	("gguf_invalid_alignment", "test_gguf_invalid_alignment"),
+	("corrupt_header_read_is_capped", "test_corrupt_header_read_is_capped"),
 ]
 
 

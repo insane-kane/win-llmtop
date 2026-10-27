@@ -11,6 +11,7 @@ import struct
 import subprocess
 
 MIB = 2**20
+HEADER_CAP = 256 * MIB  # the largest GGUF header win-llmtop reads: a corrupt length must never pull a whole model into memory
 
 # ggml type id: (name, elements per block, bytes per block)
 GGML = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 2: ("Q4_0", 32, 18), 3: ("Q4_1", 32, 20), 6: ("Q5_0", 32, 22), 7: ("Q5_1", 32, 24), 8: ("Q8_0", 32, 34),
@@ -270,17 +271,20 @@ def read_gguf(path):
 
 
 def _read_single(path):
-	size = 8 << 20
 	file_size = os.path.getsize(path)
+	limit = min(HEADER_CAP, file_size)
+	size = min(8 << 20, limit)
 	while True:
 		with open(path, "rb") as f:
 			buf = f.read(size)
 		try:
 			return _parse(buf, file_size)
 		except (struct.error, IndexError):
+			if size >= limit:
+				raise ValueError("GGUF header is larger than 256 MiB or corrupt") from None
 			if len(buf) < size:
 				raise
-			size *= 4
+			size = min(size * 4, limit)
 
 
 def _parse(b, file_size):

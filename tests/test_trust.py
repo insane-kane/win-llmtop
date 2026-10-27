@@ -50,7 +50,7 @@ class _Stub:
 				parent.requests.append((self.path, auth))
 				if parent.redirect_to:
 					self.send_response(parent.redirect_code)
-					self.send_header("Location", parent.redirect_to + self.path)
+					self.send_header("Location", parent.redirect_to + ("/models" if self.path == "/models" else "/"))
 					self.send_header("Content-Length", "0")
 					self.end_headers()
 				elif parent.require_key and auth != "Bearer " + parent.require_key:
@@ -159,7 +159,7 @@ class TestTrust(unittest.TestCase):
 					c.poll_models(NOW)
 					self.assertIn("p", c.flags)  # the flags are still read from status.args
 					self.assertEqual(c.flags["p"][0].get("ctx-size"), "4096")
-					self.assertIsNone(c.trusted_exe())
+					self.assertIsNone(c.watched_exe())
 					c.ensure_map("p")
 					self.assertEqual(c.mem["p"]["state"], "error")
 					self.assertIn("not used because", c.mem["p"]["error"])
@@ -183,7 +183,7 @@ class TestTrust(unittest.TestCase):
 				with _trusted_win(exe=mine), mock.patch("subprocess.run", side_effect=_recording_run(calls)):
 					c = state.Collector(_cfg(tmp, stub.url))
 					c.poll_models(NOW)
-					self.assertEqual(c.trusted_exe(), mine)
+					self.assertEqual(c.watched_exe(), mine)
 					self.assertEqual(c.flags["p"][0].get("ctx-size"), "2048")  # short flags are read with the trusted server's own alias table
 					self.assertEqual(c.flags["p"][1], mine)
 					c.map_job("p", c.flags["p"][0], "key")  # no llama-fit-params next to the trusted server; the GGUF is not there either
@@ -382,7 +382,7 @@ class TestTrust(unittest.TestCase):
 			with tempfile.TemporaryDirectory() as tmp, _trusted_win():
 				c = self._collector(tmp, stub)
 				c.poll_models(NOW)
-				self.assertEqual(c.trusted_exe(), SERVER_EXE)
+				self.assertEqual(c.watched_exe(), SERVER_EXE)
 				c.flags["p"] = ({"log-file": "\\\\host\\share\\p.log", "model": "\\\\host\\share\\m.gguf", "model-draft": "d.gguf"}, SERVER_EXE)
 				self.assertIsNone(c.preset_log_path("p"))
 				self.assertIn("p: the log file path is ignored: it is not an absolute path on a local drive", c.rejected.values())
@@ -442,15 +442,15 @@ class TestTrust(unittest.TestCase):
 			info = {7001: {"exe": SERVER_EXE, "argv": [SERVER_EXE], "created": 1.0}, 7002: {"exe": "C:\\py\\python.exe", "argv": ["python.exe"], "created": 1.0}}
 			with tempfile.TemporaryDirectory() as tmp, _patch_win(procs=procs, proc_info_map=info, proc_mem_map={}, **kw):
 				c = state.Collector(_cfg(tmp, url or "http://127.0.0.1:18080"))
-				self.assertIsNone(c.trusted_exe(refresh=True), label)
+				self.assertIsNone(c.watched_exe(refresh=True), label)
 				self.assertIn(why, c.trust_reason, label)
 		with tempfile.TemporaryDirectory() as tmp, _patch_win(procs={7001: ("llama-server.exe", 400)}, proc_info_map={7001: {"exe": None, "argv": None, "created": None}}, proc_mem_map={}, listener_pid=7001):
 			c = state.Collector(_cfg(tmp, "http://127.0.0.1:18080"))
-			self.assertIsNone(c.trusted_exe(refresh=True))
+			self.assertIsNone(c.watched_exe(refresh=True))
 			self.assertIn("could not be read", c.trust_reason)
 		with tempfile.TemporaryDirectory() as tmp, _trusted_win():  # the one that is trusted
 			for url in ("http://127.0.0.1:18080", "http://localhost:18080", "http://[::1]:18080"):
-				self.assertEqual(state.Collector(_cfg(tmp, url)).trusted_exe(refresh=True), SERVER_EXE, url)
+				self.assertEqual(state.Collector(_cfg(tmp, url)).watched_exe(refresh=True), SERVER_EXE, url)
 
 	def test_tcp_listener_pid_reports_the_listening_process(self):
 		"""The call that decides which local server is trusted: a socket this test opens reports this test's pid."""

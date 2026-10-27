@@ -427,13 +427,13 @@ def check(c, args):
 	print(ui.safe("%-18s %-5s %s" % ("logs", log_status, log_fact)))
 
 	# 6. llama-fit-params: looked for only next to the llama-server that serves the watched URL (and only when that server is trusted)
-	trusted = c.trusted_exe(refresh=True)
-	if trusted:
-		found = next((p for p in (os.path.join(os.path.dirname(trusted), "llama-fit-params.exe"), os.path.join(os.path.dirname(trusted), "llama-fit-params")) if os.path.isfile(p)), None)
+	watched = c.watched_exe(refresh=True)
+	if watched:
+		found = next((p for p in (os.path.join(os.path.dirname(watched), "llama-fit-params.exe"), os.path.join(os.path.dirname(watched), "llama-fit-params")) if os.path.isfile(p)), None)
 		if found:
 			fit_status, fit_fact = "ok", "found next to the running server (%s)" % found
 		else:
-			fit_status, fit_fact = "--", "not found next to the running server (looked in %s)" % os.path.dirname(trusted)
+			fit_status, fit_fact = "--", "not found next to the running server (looked in %s)" % os.path.dirname(watched)
 	else:
 		fit_status, fit_fact = "--", "off: no helper program is run and no file path from the server is used, because %s" % c.trust_reason
 	print(ui.safe("%-18s %-5s %s" % ("llama-fit-params", fit_status, fit_fact)))

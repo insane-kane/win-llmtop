@@ -427,7 +427,7 @@ class Collector:
 		self.router_discovery, self.router_tried, self.mode = None, [], None
 		self._last_api_key = self.cfg.get("api_key")
 		self.router_keyed = False  # True once the URL in use was taken from a running llama-server's command line; the API key goes only to such a URL or one the user gave
-		self._trust, self.trust_reason, self.rejected = None, "", {}  # the trusted server (see trusted_exe), why there is none, and the server-supplied paths refused: {(preset, flag): notice}
+		self._trust, self.trust_reason, self.rejected = None, "", {}  # the trusted server (see watched_exe), why there is none, and the server-supplied paths refused: {(preset, flag): notice}
 		self.dx = win.Dxgi() if win.WIN else None
 		self.gpu = self.dx.main() if self.dx else None
 		self.gpu_notice = None
@@ -541,9 +541,9 @@ class Collector:
 	def _pid_url_and_flags(self, pid):
 		info = self._proc_info(pid)
 		argv, exe = info.get("argv"), info.get("exe")
-		trusted = self.trusted_exe()
+		watched = self.watched_exe()
 		if not argv:
-			return None, None, (({}, trusted) if exe else None)
+			return None, None, (({}, watched) if exe else None)
 		pflags = model.parse_args(argv, self._aliases())
 		host = pflags.get("host", "127.0.0.1")
 		if not isinstance(host, str) or not host or host in ("0.0.0.0", "::", "::0", "[::]"):
@@ -552,10 +552,10 @@ class Collector:
 		if isinstance(port, bool) or not port:
 			port = "8080"
 		url = "http://%s:%s" % ("[%s]" % host if ":" in host and not host.startswith("[") else host, port)
-		return url, str(port), (pflags, trusted)
+		return url, str(port), (pflags, watched)
 
 	# ---- what a server's say-so may start or open: only the llama-server this machine runs and that serves the watched URL ----
-	def trusted_exe(self, refresh=False):
+	def watched_exe(self, refresh=False):
 		"""The image path of the llama-server process that serves the watched URL, or None (then `trust_reason` says why).
 
 		Helper programs (`llama-server --help`, `llama-fit-params`) run only from this one file's folder, and the model, draft-model and log-file
@@ -592,7 +592,7 @@ class Collector:
 		return exe, ""
 
 	def _aliases(self):
-		return model.server_aliases(self.trusted_exe())
+		return model.server_aliases(self.watched_exe())
 
 	@property
 	def key_allowed(self):
@@ -602,7 +602,7 @@ class Collector:
 	def _vet_path(self, preset, flag, value):
 		"""`value` when the server is trusted and it is an absolute path on a local drive, else None (with a notice for a refused path)."""
 		key = (preset, flag)
-		if self.trusted_exe() is None:
+		if self.watched_exe() is None:
 			self.rejected.pop(key, None)  # the notice that there is no trusted server says why
 			return None
 		if model.local_path(value):
@@ -851,7 +851,7 @@ class Collector:
 		return None, first_err
 
 	def poll_models(self, now):
-		self.trusted_exe(refresh=True)
+		self.watched_exe(refresh=True)
 		try:
 			data = self.get("/models")["data"]
 			if not self.router_explicit and not self.router_discovery:
@@ -889,7 +889,7 @@ class Collector:
 				args = m["status"].get("args")
 				if isinstance(args, list) and args and all(isinstance(a, str) for a in args):
 					# args[0] is only the server's word for its own program: it is never used to find or start anything
-					self.flags[name] = (model.parse_args(args, self._aliases()), self.trusted_exe())
+					self.flags[name] = (model.parse_args(args, self._aliases()), self.watched_exe())
 			else:
 				if not self.pids and win.WIN:
 					self._update_procs(now)
@@ -953,7 +953,7 @@ class Collector:
 			notices.append("%d llama-server instances found; watching %s (pass --router to choose)" % (len(indep), self.cfg["router"]))
 		if self.mode == "single":
 			notices.append("single-model mode")
-		if self.router_up and self.models and self.trusted_exe() is None:
+		if self.router_up and self.models and self.watched_exe() is None:
 			notices.append(self.TRUST_OFF % self.trust_reason)
 		notices.extend(msg for (name, _flag), msg in sorted(self.rejected.items()) if name in self.models or name == "router")
 		if self.gpu_notice:
@@ -1265,7 +1265,7 @@ class Collector:
 			return
 		flags = self._vet_flags(preset, fe[0])
 		error = None
-		if self.trusted_exe() is None:
+		if self.watched_exe() is None:
 			error = self.NOT_TRUSTED_ERROR % self.trust_reason
 		elif flags is None:
 			error = "the model path is not an absolute path on a local drive"
@@ -1294,7 +1294,7 @@ class Collector:
 
 	def map_job(self, preset, flags, key):
 		try:
-			exe = self.trusted_exe()  # the only program ever started, and only from its own folder
+			exe = self.watched_exe()  # the only program ever started, and only from its own folder
 			if exe is None:
 				raise PermissionError(self.NOT_TRUSTED_ERROR % self.trust_reason)
 			fit = model.fit_projection(exe, flags)

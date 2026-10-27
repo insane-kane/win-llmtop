@@ -5,3 +5,9 @@ dist/
 *.egg-info/
 .venv/
 venv/
+.coverage
+.coverage.*
+.ruff_cache/
+.e2e-cache/
+.e2e-bin/
+.e2e-artifacts/

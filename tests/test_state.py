@@ -119,7 +119,13 @@ def _patch_win(
 	adapters=None,
 	sample_data=None,
 	sys_mem_data=None,
+	listener_pid=None,
+	guard=True,
 ):
+	"""Patch every Windows call the Collector makes. `listener_pid` is the process that listens on whatever port the watched URL names (None: no one does).
+
+	With `guard`, no program may be started under this patch: `subprocess.run` is replaced, and leaving the block fails the test if it was called.
+	"""
 	procs = procs if procs is not None else {1000: ("llama-server.exe", 400), 2000: ("llama-server.exe", 1000)}
 	proc_info_map = proc_info_map if proc_info_map is not None else {
 		1000: {"exe": "llama-server.exe", "argv": ["llama-server.exe", "--port", "8080"], "created": 1700000000.0},
@@ -141,7 +147,11 @@ def _patch_win(
 	}
 	sys_mem_data = sys_mem_data if sys_mem_data is not None else {"total": 65536.0, "avail": 32768.0, "commit": 20000.0, "commit_limit": 81920.0}
 	stack = contextlib.ExitStack()
+	if guard:
+		run_mock = stack.enter_context(mock.patch("subprocess.run", side_effect=AssertionError("a program was started")))
+		stack.callback(lambda: run_mock.assert_not_called())
 	stack.enter_context(mock.patch.object(win, "WIN", True))
+	stack.enter_context(mock.patch.object(win, "tcp_listener_pid", create=True, side_effect=lambda port, host=None: listener_pid))  # create: the suite also runs against code that predates the function
 	stack.enter_context(mock.patch.object(win, "Dxgi", side_effect=lambda: _StubDxgi(adapters)))
 	stack.enter_context(mock.patch.object(win, "Counters", side_effect=lambda: _StubCounters(sample_data)))
 	stack.enter_context(mock.patch.object(win, "processes", side_effect=lambda: dict(procs)))
@@ -184,7 +194,8 @@ class TestState(unittest.TestCase):
 				self.assertIsNotNone(p["slot"])
 				self.assertEqual(p["slot"]["n_ctx"], 8192)
 				flags, exe = c.flags["org/repo:q4_k_m"]
-				self.assertEqual(exe, "llama-server.exe")
+				self.assertIsNone(exe)  # args[0] is not a trusted program: no process listens on the stub's port as llama-server
+				self.assertTrue(any("no helper program is run" in n for n in snap["notices"]), snap["notices"])
 				self.assertEqual(flags.get("ctx-size"), "16384")
 				self.assertEqual(flags.get("cache-type-k"), "q8_0")
 				self.assertEqual(flags.get("cache-type-v"), "q4_0")
@@ -220,7 +231,7 @@ class TestState(unittest.TestCase):
 			"sys": {"pages_in": 0.0, "pages_out": 0.0, "standby": 8192.0, "free": 16384.0, "modified": 128.0, "pagefile_pct": 5.0},
 		}
 		try:
-			with tempfile.TemporaryDirectory() as tmp, _patch_win(procs=procs, proc_info_map=proc_info_map, proc_mem_map=proc_mem_map, sample_data=sample_data):
+			with tempfile.TemporaryDirectory() as tmp, _patch_win(procs=procs, proc_info_map=proc_info_map, proc_mem_map=proc_mem_map, sample_data=sample_data, listener_pid=3456):
 				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
 				c = state.Collector(cfg)
 				c.ensure_map = lambda preset: None
@@ -233,7 +244,8 @@ class TestState(unittest.TestCase):
 				self.assertEqual(snap["llama"]["ws"], 2048.0)
 				self.assertEqual(snap["presets"]["local-single.gguf"]["status"], "loaded")
 				flags, exe = c.flags["local-single.gguf"]
-				self.assertEqual(exe, "C:\\bin\\llama-server.exe")
+				self.assertEqual(exe, "C:\\bin\\llama-server.exe")  # the trusted program: the one listening on the watched port
+				self.assertFalse(any("no helper program is run" in n for n in snap["notices"]), snap["notices"])
 				self.assertEqual(flags.get("ctx-size"), "32768")
 				self.assertEqual(flags.get("flash-attn"), "on")
 				self.assertIn(("/slots", None), srv.requests)
@@ -599,7 +611,7 @@ class TestState(unittest.TestCase):
 			3000: {"ws": 512.0, "pws": 500.0, "commit": 600.0, "faults": 2, "cpu_s": 2.0},
 		}
 		try:
-			with tempfile.TemporaryDirectory() as tmp, _patch_win(procs=procs, proc_info_map=proc_info_map, proc_mem_map=proc_mem_map):
+			with tempfile.TemporaryDirectory() as tmp, _patch_win(procs=procs, proc_info_map=proc_info_map, proc_mem_map=proc_mem_map, listener_pid=3000):
 				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
 				c = state.Collector(cfg)
 				c.ensure_map = lambda preset: None

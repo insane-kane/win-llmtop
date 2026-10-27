@@ -11,6 +11,8 @@ import os
 import re
 import time
 
+from . import ui
+
 MIB = 2**20
 RE_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 RE_FWD = re.compile(r"^\[\s*(\d+)\]\s*")  # the router forwards each child's stderr as "[<port>] <line>"
@@ -70,6 +72,7 @@ def normalize_line(line):
 	"""Strip ANSI colour escapes, an optional router-forwarded "[<port>] " prefix and an optional "M.SS.mmm.uuu L " timestamp
 	(timestamps are off by default in llama.cpp). Returns (t or None, level or None, text, port or None)."""
 	line = RE_ANSI.sub("", line)
+	line = ui.safe(line)
 	port = None
 	if m := RE_FWD.match(line):
 		port = int(m.group(1))
@@ -120,7 +123,7 @@ class Assembler:
 	"""Child-log lines in; finished requests, sessions and notable events out. Works on a backlog and on a live tail alike."""
 
 	def __init__(self, preset):
-		self.preset = preset
+		self.preset = ui.safe(preset)
 		self.sessions = []  # [{'n', 'load_s', 'wall'}]
 		self.cur = {}  # task -> request being assembled
 		self.sel = None

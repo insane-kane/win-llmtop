@@ -7,7 +7,6 @@ cross-checks it against llama.cpp's own projection (llama-fit-params, which read
 
 import os
 import re
-import shutil
 import struct
 import subprocess
 
@@ -28,6 +27,8 @@ FIT_FLAGS = ("model", "ctx-size", "batch-size", "ubatch-size", "cache-type-k", "
 RE_FIT_DEV = re.compile(r"-\s+(\S+)\s+\(([^)]*)\)\s*\|\s*(\d+)\s*=\s*(-?\d+)\s*\+\s*\(\s*(\d+)\s*=\s*(\d+)\s*\+\s*(\d+)\s*\+\s*(\d+)\s*\)")
 RE_FIT_HOST = re.compile(r"-\s+Host\s*\|\s*(\d+)\s*=\s*(\d+)\s*\+\s*(\d+)\s*\+\s*(\d+)")
 RE_BLK = re.compile(r"^blk\.(\d+)\.(.*)$")
+RE_LOCAL_PATH = re.compile(r'[A-Za-z]:[\\/][^:*?"<>|\x00-\x1f]*\Z')  # a drive letter, a separator, then no stream colon, wildcard or control character
+DEVICE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} | {"LPT%d" % i for i in range(1, 10)})
 
 # llama.cpp short flag to long flag mappings from common/arg.cpp
 SHORT_FLAGS = {
@@ -65,24 +66,30 @@ class ServerDefaults(dict):
 		self.aliases = {}
 
 
-def resolve_exe(exe):
-	"""The path as given if it exists, else shutil.which(exe), else None."""
-	if not exe:
-		return None
-	if os.path.exists(exe):
-		return exe
-	return shutil.which(exe)
+def local_path(p):
+	r"""True for an absolute path on a local drive letter (`X:\...` or `X:/...`): the only kind of file path llmtop opens on a server's say-so.
+
+	Network paths (`\\host\share`, `//host/x`, `\\?\...`, `\\.\...`), relative and drive-relative paths, values that are not text,
+	streams (a second colon), wildcards and device names (CON, NUL, COM1, ...) are all refused.
+	"""
+	if not isinstance(p, str) or not RE_LOCAL_PATH.match(p):
+		return False
+	return not any(part.split(".")[0].rstrip(" ").upper() in DEVICE_NAMES for part in p.replace("/", "\\").split("\\")[1:])
 
 
 def server_defaults(exe):
-	"""{long flag name: default text} taken from `llama-server --help`, which states each default; cached per executable."""
+	"""{long flag name: default text} taken from `llama-server --help`, which states each default; cached per executable.
+
+	`exe` must be the image path of the llama-server llmtop watches. Anything else (None, a name, a path that is not a file) starts no program and yields no defaults.
+	"""
+	out = ServerDefaults()
+	if not isinstance(exe, str) or not os.path.isabs(exe) or not os.path.isfile(exe):
+		return out
 	if exe in _DEFAULTS:
 		return _DEFAULTS[exe]
-	resolved = resolve_exe(exe) or exe
-	out = ServerDefaults()
 	aliases = {}
 	try:
-		r = subprocess.run([resolved, "--help"], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+		r = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
 		text = r.stdout + r.stderr
 	except (OSError, subprocess.TimeoutExpired):
 		text = ""
@@ -371,27 +378,16 @@ def parse_fit_output(text):
 	return None
 
 
-def fit_projection(exe_dir, flags, timeout=60):
-	"""llama.cpp's memory projection for these flags: {'gpus': [...], 'gpu': {...MiB}, 'host': {...MiB}} or None. Allocates nothing; takes about a second."""
-	if "model" not in flags:
-		return None
-	candidates = []
-	if exe_dir:
-		if os.path.isdir(exe_dir):
-			candidates.extend([os.path.join(exe_dir, "llama-fit-params.exe"), os.path.join(exe_dir, "llama-fit-params")])
-		else:
-			resolved = resolve_exe(exe_dir)
-			if resolved:
-				d = os.path.dirname(resolved)
-				candidates.extend([os.path.join(d, "llama-fit-params.exe"), os.path.join(d, "llama-fit-params")])
-			elif os.path.dirname(exe_dir):
-				d = os.path.dirname(exe_dir)
-				candidates.extend([os.path.join(d, "llama-fit-params.exe"), os.path.join(d, "llama-fit-params")])
-	w = resolve_exe("llama-fit-params.exe") or resolve_exe("llama-fit-params")
-	if w:
-		candidates.append(w)
+def fit_projection(server_exe, flags, timeout=60):
+	"""llama.cpp's memory projection for these flags: {'gpus': [...], 'gpu': {...MiB}, 'host': {...MiB}} or None. Allocates nothing; takes about a second.
 
-	exe = next((c for c in candidates if c and os.path.exists(c) and not os.path.isdir(c)), None)
+	`server_exe` is the image path of the llama-server llmtop watches. llama-fit-params is looked for only in that folder, never on PATH or in the
+	current folder; with no such file (or no usable path) nothing is started and the result is None.
+	"""
+	if "model" not in flags or not isinstance(server_exe, str) or not os.path.isabs(server_exe) or not local_path(flags["model"]):
+		return None
+	folder = os.path.dirname(server_exe)
+	exe = next((c for c in (os.path.join(folder, "llama-fit-params.exe"), os.path.join(folder, "llama-fit-params")) if os.path.isfile(c)), None)
 	if not exe:
 		return None
 	argv = [exe, "-lv", "4"]
@@ -457,6 +453,8 @@ def _place(name, layer, n_layer, ngl, overrides, flags):
 
 def analyze(flags, fit=None, defaults=None):
 	"""Memory map for a preset's flags: weights by component, per-layer sizes, KV cache and recurrent state, checkpoint sizes. MiB throughout."""
+	if not local_path(flags["model"]):
+		raise ValueError("the model path is not an absolute path on a local drive")
 	meta, tensors = read_gguf(flags["model"])
 	embd = next((t for t in tensors if t[0] == "token_embd.weight"), None)
 	tied = bool(embd) and not any(t[0] == "output.weight" for t in tensors)
@@ -569,7 +567,7 @@ def analyze(flags, fit=None, defaults=None):
 	weights = {k: round(sum(v[k] for n, v in groups.items() if n != "MTP head"), 1) for k in ("gpu", "cpu")}
 	draft = None
 	dp = draft_path(flags)
-	if dp and os.path.exists(dp):
+	if dp and local_path(dp) and os.path.exists(dp):
 		try:
 			dmeta, dten = read_gguf(dp)
 			draft = {"path": dp, "mib": sum(t[3] for t in dten) / MIB, "arch": dmeta.get("general.architecture", "")}

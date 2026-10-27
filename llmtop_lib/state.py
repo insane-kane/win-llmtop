@@ -2,6 +2,7 @@
 """llmtop engine: time series, persistence, alert rules, and the per-tick collector that fuses every data source into one snapshot."""
 
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -57,6 +58,31 @@ SERIES = {"vram": "max", "vram_llama": "max", "spill": "max", "budget": "last", 
 	"ram_used": "max", "ram_avail": "min", "commit": "max", "llama_ws": "max", "llama_cpu": "mean", "cpu": "mean", "cpu_mhz": "mean", "pages_in": "max", "ctx": "max",
 	"dec": "mean", "pre": "mean", "busy": "max", "heap": "last", "pf_used": "max", "pages_out": "max", "standby": "mean", "free": "mean"}
 LEVELS = {"info": 0, "warn": 1, "crit": 2}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+	"""Refuses every redirect: a 3xx answer is raised as an HTTPError, like any other HTTP error, and no second request is made."""
+
+	def redirect_request(self, req, fp, code, msg, headers, newurl):
+		raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+
+def opener_for(url):
+	"""The opener for a request to `url`: no redirect is followed, and a loopback server is reached directly (never through a proxy) while any other
+	server goes through the system proxy settings. Built per request, so the environment and registry settings are read as they are now."""
+	proxies = urllib.request.ProxyHandler({}) if is_loopback_host(urllib.parse.urlsplit(url).hostname) else urllib.request.ProxyHandler()
+	return urllib.request.build_opener(proxies, _NoRedirect())
+
+
+def is_loopback_host(host):
+	"""True for `localhost` and for a loopback IP address (127.0.0.0/8, ::1); a host name is never looked up."""
+	h = str(host or "").strip("[]").lower()
+	if h == "localhost":
+		return True
+	try:
+		return ipaddress.ip_address(h).is_loopback
+	except ValueError:
+		return False
 
 
 def agg(xs, how):
@@ -289,16 +315,17 @@ class Alerts:
 	def evaluate(self, snap, mem):
 		"""Every alert is a short headline (msg) plus an optional detail; the detail carries the comparisons, thresholds and deductions."""
 		now, c, g, ll, rm = snap["t"], self.cfg, snap["gpu"], snap["llama"], snap["ram"]
+		sent = snap.get("router_key_allowed", True)  # False: the default address is probed without the API key
 		if not snap["router_up"]:
 			if snap.get("router_auth_error"):
-				self.flag("router", "crit", headline("%s: pass --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY" % snap["router_auth_error"]), now,
+				self.flag("router", "crit", headline("%s: pass %s" % (snap["router_auth_error"], "--api-key or set LLMTOP_API_KEY / LLAMA_API_KEY" if sent else "--router with --api-key or LLAMA_API_KEY")), now,
 					detail="server at %s returned %s" % (c["router"], snap["router_auth_error"]))
 			else:
 				self.flag("router", "crit", headline("router unreachable at %s" % c["router"]), now, detail=snap["router_error"] or None)
 		for preset, p in snap["presets"].items():
 			err = p.get("slot_error")
 			if err:
-				fix = ("pass --api-key or set LLAMA_API_KEY" if err in ("HTTP 401", "HTTP 403") else
+				fix = (("pass --api-key or set LLAMA_API_KEY" if sent else "pass --router with --api-key or LLAMA_API_KEY") if err in ("HTTP 401", "HTTP 403") else
 					"the server's /slots endpoint is off (start it with --slots)" if err in ("HTTP 404", "HTTP 501") else None)
 				self.flag("slots:" + preset, "info", headline("/slots for %s returned %s" % (preset, err)), now, detail=fix)
 			else:
@@ -399,6 +426,8 @@ class Collector:
 		self.cfg["router"] = (raw_router or "http://127.0.0.1:8080").rstrip("/")
 		self.router_discovery, self.router_tried, self.mode = None, [], None
 		self._last_api_key = self.cfg.get("api_key")
+		self.router_keyed = False  # True once the URL in use was taken from a running llama-server's command line; the API key goes only to such a URL or one the user gave
+		self._trust, self.trust_reason, self.rejected = None, "", {}  # the trusted server (see trusted_exe), why there is none, and the server-supplied paths refused: {(preset, flag): notice}
 		self.dx = win.Dxgi() if win.WIN else None
 		self.gpu = self.dx.main() if self.dx else None
 		self.gpu_notice = None
@@ -512,10 +541,10 @@ class Collector:
 	def _pid_url_and_flags(self, pid):
 		info = self._proc_info(pid)
 		argv, exe = info.get("argv"), info.get("exe")
+		trusted = self.trusted_exe()
 		if not argv:
-			return None, None, (({}, exe) if exe else None)
-		exe = exe or argv[0]
-		pflags = model.parse_args(argv, model.server_aliases(exe))
+			return None, None, (({}, trusted) if exe else None)
+		pflags = model.parse_args(argv, self._aliases())
 		host = pflags.get("host", "127.0.0.1")
 		if not isinstance(host, str) or not host or host in ("0.0.0.0", "::", "::0", "[::]"):
 			host = "127.0.0.1"
@@ -523,7 +552,64 @@ class Collector:
 		if isinstance(port, bool) or not port:
 			port = "8080"
 		url = "http://%s:%s" % ("[%s]" % host if ":" in host and not host.startswith("[") else host, port)
-		return url, str(port), (pflags, exe)
+		return url, str(port), (pflags, trusted)
+
+	# ---- what a server's say-so may start or open: only the llama-server this machine runs and that serves the watched URL ----
+	def trusted_exe(self, refresh=False):
+		"""The image path of the llama-server process that serves the watched URL, or None (then `trust_reason` says why).
+
+		Helper programs (`llama-server --help`, `llama-fit-params`) run only from this one file's folder, and the model, draft-model and log-file
+		paths a server reports are opened only while it is set. A server is trusted when its address is a loopback address and the process
+		listening on that port is named llama-server*; nothing the server reports (status.args, ...) is ever used to find a program.
+		"""
+		url = self.cfg.get("router") or ""
+		if refresh or self._trust is None or self._trust[0] != url:
+			exe, reason = self._find_trusted(url)
+			self._trust, self.trust_reason = (url, exe), reason
+		return self._trust[1]
+
+	def _find_trusted(self, url):
+		if not win.WIN:
+			return None, "this is not Windows"
+		u = urllib.parse.urlsplit(url)
+		try:
+			port = u.port or (443 if u.scheme == "https" else 80)
+		except ValueError:
+			return None, "the server address has no valid port"
+		if not is_loopback_host(u.hostname):
+			return None, "the server at %s is not at a loopback address" % url
+		pid = win.tcp_listener_pid(port, u.hostname)
+		if pid is None:
+			return None, "no single process listens on port %d of the loopback address" % port
+		if not (self.procs.get(pid) or win.processes().get(pid) or ("",))[0].startswith("llama-server"):
+			return None, "the process listening on port %d (pid %d) is not named llama-server*" % (port, pid)
+		info = self._proc_info(pid)
+		if not info.get("exe"):
+			info = self.pinfo[pid] = win.proc_info(pid)  # a failed read is not kept: try again
+		exe = info.get("exe")
+		if not exe or not os.path.isabs(exe) or not os.path.basename(exe).lower().startswith("llama-server"):
+			return None, "the image path of llama-server (pid %d) could not be read" % pid
+		return exe, ""
+
+	def _aliases(self):
+		return model.server_aliases(self.trusted_exe())
+
+	@property
+	def key_allowed(self):
+		"""The API key goes only to a URL the user gave or one taken from a running llama-server's command line, never to the default-address probe."""
+		return self.router_explicit or self.router_keyed
+
+	def _vet_path(self, preset, flag, value):
+		"""`value` when the server is trusted and it is an absolute path on a local drive, else None (with a notice for a refused path)."""
+		key = (preset, flag)
+		if self.trusted_exe() is None:
+			self.rejected.pop(key, None)  # the notice that there is no trusted server says why
+			return None
+		if model.local_path(value):
+			self.rejected.pop(key, None)
+			return value
+		self.rejected[key] = "%s: the %s path is ignored: it is not an absolute path on a local drive" % (preset, {"model": "model", "model-draft": "draft model", "log-file": "log file"}.get(flag, flag))
+		return None
 
 	def _single_model_pid(self):
 		candidates = self._independent_pids() or list(self.pids)
@@ -575,7 +661,7 @@ class Collector:
 	def preset_log_path(self, preset):
 		flags = self.flags.get(preset, ({}, ""))[0]
 		lf = flags.get("log-file")
-		if isinstance(lf, str) and lf:
+		if isinstance(lf, str) and lf and self._vet_path(preset, "log-file", lf):
 			return lf
 		if self.cfg.get("log_dir"):
 			safe = RE_BAD_FILE.sub("_", preset)
@@ -655,10 +741,9 @@ class Collector:
 		if self.cfg.get("router_log"):
 			routers = logmod.router_logs(None, [self.cfg["router_log"]])
 		elif rinfo.get("argv"):
-			exe = rinfo.get("exe") or rinfo["argv"][0]
-			rflags = model.parse_args(rinfo["argv"], model.server_aliases(exe))
+			rflags = model.parse_args(rinfo["argv"], self._aliases())
 			rlf = rflags.get("log-file")
-			if isinstance(rlf, str) and rlf:
+			if isinstance(rlf, str) and rlf and self._vet_path("router", "log-file", rlf):
 				routers = logmod.router_logs(None, [rlf])
 		if not routers and self.cfg.get("log_dir"):
 			routers = logmod.router_logs(self.cfg["log_dir"])
@@ -691,9 +776,11 @@ class Collector:
 
 	# ---- HTTP -------------------------------------------------------------------------------------------------------
 	def get(self, path, timeout=0.8):
-		headers = {"Authorization": "Bearer " + str(self.cfg["api_key"])} if self.cfg.get("api_key") else {}
-		req = urllib.request.Request(self.cfg["router"] + path, headers=headers)
-		with urllib.request.urlopen(req, timeout=timeout) as r:
+		"""GET `path` from the watched server as JSON. No redirect is followed, and the API key (an unredirected header) goes only where `key_allowed` says."""
+		req = urllib.request.Request(self.cfg["router"] + path)
+		if self.cfg.get("api_key") and self.key_allowed:
+			req.add_unredirected_header("Authorization", "Bearer " + str(self.cfg["api_key"]))
+		with opener_for(self.cfg["router"]).open(req, timeout=timeout) as r:
 			return json.load(r)
 
 	def is_due(self, key, now, period):
@@ -745,6 +832,7 @@ class Collector:
 			if url not in tried:
 				tried.append(url)
 			self.cfg["router"] = url
+			self.router_keyed = True  # the URL comes from a running llama-server's own command line: the API key may be sent to it
 			try:
 				data = self.get("/models")["data"]
 				self.router_tried = tried
@@ -763,6 +851,7 @@ class Collector:
 		return None, first_err
 
 	def poll_models(self, now):
+		self.trusted_exe(refresh=True)
 		try:
 			data = self.get("/models")["data"]
 			if not self.router_explicit and not self.router_discovery:
@@ -773,6 +862,9 @@ class Collector:
 				if not self.router_explicit and not self.router_discovery:
 					self.router_discovery = "server found at %s (default)" % self.cfg["router"]
 				data = None
+				if self.cfg.get("api_key") and not self.key_allowed:
+					# the default address was asked without the key: if a running llama-server's command line names this address, ask it again with the key
+					data, err = self._discover_router(e)
 			elif self.router_explicit:
 				data = None
 			else:
@@ -781,7 +873,8 @@ class Collector:
 				if isinstance(err, urllib.error.HTTPError) and err.code in (401, 403):
 					self.router_auth_error = "HTTP %d" % err.code
 					self.router_up = False
-					self.router_error = "%s (pass --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY)" % self.router_auth_error
+					self.router_error = "%s (%s)" % (self.router_auth_error, "pass --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY" if self.key_allowed else
+						"no API key was sent to the default address: pass --router with --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY")
 					self.models, self.mode = {}, None
 				else:
 					self.router_auth_error = None
@@ -794,9 +887,9 @@ class Collector:
 		for name, m in self.models.items():
 			if isinstance(m.get("status"), dict):
 				args = m["status"].get("args")
-				if args:
-					exe = args[0]
-					self.flags[name] = (model.parse_args(args, model.server_aliases(exe)), exe)
+				if isinstance(args, list) and args and all(isinstance(a, str) for a in args):
+					# args[0] is only the server's word for its own program: it is never used to find or start anything
+					self.flags[name] = (model.parse_args(args, self._aliases()), self.trusted_exe())
 			else:
 				if not self.pids and win.WIN:
 					self._update_procs(now)
@@ -860,6 +953,9 @@ class Collector:
 			notices.append("%d llama-server instances found; watching %s (pass --router to choose)" % (len(indep), self.cfg["router"]))
 		if self.mode == "single":
 			notices.append("single-model mode")
+		if self.router_up and self.models and self.trusted_exe() is None:
+			notices.append(self.TRUST_OFF % self.trust_reason)
+		notices.extend(msg for (name, _flag), msg in sorted(self.rejected.items()) if name in self.models or name == "router")
 		if self.gpu_notice:
 			notices.append(self.gpu_notice)
 		loaded = [n for n, p in presets.items() if p["status"] == "loaded"]
@@ -980,7 +1076,7 @@ class Collector:
 		self.allow = ll["allow"] or self.allow
 		self.allow_known = self.allow_known or ll["allow_known"]
 		notices = self._build_notices(presets, kids)
-		snap = {"t": now, "mode": self.mode, "router_up": self.router_up, "router_error": self.router_error, "router_auth_error": self.router_auth_error, "gpu": gpu, "llama": ll,
+		snap = {"t": now, "mode": self.mode, "router_up": self.router_up, "router_error": self.router_error, "router_auth_error": self.router_auth_error, "router_key_allowed": self.key_allowed, "gpu": gpu, "llama": ll,
 			"vm_error": self.vm_error, "others": others, "ram": ram, "cpu": cpu, "presets": presets, "busy": busy, "new_events": new_events, "notices": notices}
 		self.rec.add(now, self.series_values(snap))
 		self.alerts.evaluate(snap, self.mem)
@@ -1153,6 +1249,8 @@ class Collector:
 
 	# ---- memory maps (computed off-thread: llama-fit-params takes about a second) ------------------------------------------
 	NO_FLAGS_ERROR = "the server did not report this model's command line (/models has no status.args) and no llama-server process was found for it"
+	TRUST_OFF = "no helper program is run and no file path from the server is used: %s"
+	NOT_TRUSTED_ERROR = "the model file and the helper programs are not used because %s"
 
 	def ensure_map(self, preset):
 		fe = self.flags.get(preset)
@@ -1165,16 +1263,41 @@ class Collector:
 				return  # already recorded; do not rewrite it every frame
 			self.mem[preset] = {"key": None, "state": "error", "error": self.NO_FLAGS_ERROR}
 			return
-		flags, exe = fe
+		flags = self._vet_flags(preset, fe[0])
+		error = None
+		if self.trusted_exe() is None:
+			error = self.NOT_TRUSTED_ERROR % self.trust_reason
+		elif flags is None:
+			error = "the model path is not an absolute path on a local drive"
+		if error:
+			cur = self.mem.get(preset, {})
+			if cur.get("key") is None and cur.get("state") == "error" and cur.get("error") == error:
+				return  # already recorded; do not rewrite it every frame
+			self.mem[preset] = {"key": None, "state": "error", "error": error}
+			return
 		key = json.dumps({k: flags.get(k) for k in model.FIT_FLAGS + ("model-draft", "cache-ram", "swa-checkpoints", "ctx-checkpoints")}, sort_keys=True)
 		if self.mem.get(preset, {}).get("key") == key:
 			return
 		self.mem[preset] = {"key": key, "state": "pending"}
-		threading.Thread(target=self.map_job, args=(preset, flags, exe, key), daemon=True).start()
+		threading.Thread(target=self.map_job, args=(preset, flags, key), daemon=True).start()
 
-	def map_job(self, preset, flags, exe, key):
+	def _vet_flags(self, preset, flags):
+		"""The flags to analyse: a copy without a draft model whose path may not be opened, or None when the model path may not be."""
+		use = dict(flags)
+		if "model" in use and not self._vet_path(preset, "model", use["model"]):
+			return None
+		dp = model.draft_path(use)
+		if dp and not self._vet_path(preset, "model-draft", dp):
+			use.pop("model-draft", None)
+			use.pop("spec-draft-model", None)
+		return use
+
+	def map_job(self, preset, flags, key):
 		try:
-			fit = model.fit_projection(os.path.dirname(exe), flags)
+			exe = self.trusted_exe()  # the only program ever started, and only from its own folder
+			if exe is None:
+				raise PermissionError(self.NOT_TRUSTED_ERROR % self.trust_reason)
+			fit = model.fit_projection(exe, flags)
 			self.mem[preset] = {"key": key, "state": "ready", "map": model.analyze(flags, fit, model.server_defaults(exe)), "at": time.time()}
 		except Exception as e:
 			self.mem[preset] = {"key": key, "state": "error", "error": "%s: %s" % (type(e).__name__, e)}

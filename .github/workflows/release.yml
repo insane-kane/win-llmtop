@@ -38,6 +38,7 @@ jobs:
       - name: Verify annotated tag is GPG-signed by the maintainer
         env:
           TAG: ${{ github.ref_name }}
+          MAINTAINER_FPR: 95CBD5BB52CEE0980584E9EE65CEDA2A928F49C9
         run: |
           git fetch --no-tags origin "refs/tags/$TAG:refs/tags/$TAG"
           if [ "$(git cat-file -t "$TAG")" != "tag" ]; then
@@ -49,12 +50,13 @@ jobs:
           export GNUPGHOME
           trap 'rm -rf "$GNUPGHOME"' EXIT
           curl -fsSL https://github.com/insane-kane.gpg | gpg --batch --import
-          out="$(git tag -v "$TAG" 2>&1)" || {
+          out="$(git verify-tag --raw "$TAG" 2>&1)" || {
             echo "$out" >&2
             exit 1
           }
           echo "$out"
-          echo "$out" | grep -Fq "gpg: Good signature from "
+          # the signing key (or its primary key) must be the maintainer's pinned fingerprint
+          echo "$out" | grep -Eq "^\[GNUPG:\] VALIDSIG (.* )?${MAINTAINER_FPR}( |$)"
       - name: Check tag matches pyproject.toml version and dated changelog heading
         env:
           TAG: ${{ github.ref_name }}

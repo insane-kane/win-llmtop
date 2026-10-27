@@ -10,7 +10,7 @@ A live, read-only terminal panel for [llama.cpp](https://github.com/ggml-org/lla
 
 ## What it shows
 
-`win-llmtop` is strictly **read-only**: it reads the server's HTTP API, log files and Windows performance counters, and never changes the server.
+`win-llmtop` is strictly **read-only**: it reads the server's HTTP API, log files and Windows performance counters, and never changes the server. The only programs it runs are two helpers of the `llama-server` it watches — `llama-server --help`, to read each flag's default, and `llama-fit-params`, llama.cpp's own memory projection — and it runs them only from the folder of that running `llama-server`, never from a path the server reports, the current folder or `PATH`.
 
 - **Dedicated and shared GPU memory per process** against the DXGI OS budget, with alerts when Windows demotes VRAM into system RAM.
 - **System RAM, commit charge and the page file** — working sets by consumer, private commit headroom and disk page-ins/page-outs.

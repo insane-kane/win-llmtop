@@ -21,9 +21,36 @@ def check(data: bytes) -> None:
 	try:
 		text = data.decode("utf-8", errors="replace")
 		lines = text.splitlines()
+		asm = log.Assembler("fuzz_model")
 		for line in lines:
 			log.normalize_line(line)
-		log.parse_router(lines)
+			done, a_events = asm.feed(line)
+			for ev in a_events:
+				msg = ev.get("msg")
+				if msg is not None:
+					assert log.ui.safe(msg) == msg
+				detail = ev.get("detail")
+				if detail is not None:
+					assert log.ui.safe(detail) == detail
+				preset = ev.get("preset")
+				if preset is not None:
+					assert log.ui.safe(preset) == preset
+			for req in done:
+				preset = req.get("preset")
+				if preset is not None:
+					assert log.ui.safe(preset) == preset
+		assert log.ui.safe(asm.preset) == asm.preset
+		events = log.parse_router(lines)
+		for ev in events:
+			msg = ev.get("msg")
+			if msg is not None:
+				assert log.ui.safe(msg) == msg
+			detail = ev.get("detail")
+			if detail is not None:
+				assert log.ui.safe(detail) == detail
+			preset = ev.get("preset")
+			if preset is not None:
+				assert log.ui.safe(preset) == preset
 	except Exception as e:
 		raise AssertionError(f"log contract violation: {type(e).__name__}: {e}") from e
 

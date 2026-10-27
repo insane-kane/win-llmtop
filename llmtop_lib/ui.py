@@ -3,8 +3,37 @@
 
 import re
 
-RE_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-RE_TOKEN = re.compile(r"(\x1b\[[0-9;?]*[A-Za-z])|(.)")
+RE_SGR_PATTERN = r"\x1b\[[0-9;]*m"
+RE_ANSI = re.compile(RE_SGR_PATTERN)
+RE_SGR = RE_ANSI
+RE_SGR_TOKEN = re.compile(rf"({RE_SGR_PATTERN})|(.)", re.DOTALL)
+
+RE_NON_SGR_ESC = (
+	r"\x1b\](?:[^\x07\x1b]|\x1b(?!\\))*(?:\x07|\x1b\\|$)"
+	r"|\x1b[PX^_](?:[^\x1b]|\x1b(?!\\))*(?:\x1b\\|$)"
+	r"|\x1b\[[\x20-\x3f]*[\x40-\x7e]"
+	r"|\x1b.?"
+)
+RE_BIDI = r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]"
+RE_CONTROLS = rf"[\x00-\x08\x0a-\x1f\x7f\x80-\x9f]|{RE_BIDI}"
+RE_CONTROLS_CHECK = re.compile(rf"[\t\x00-\x08\x0a-\x1f\x7f\x80-\x9f]|{RE_BIDI}")
+
+RE_SAFE_TOKEN = re.compile(
+	rf"({RE_SGR_PATTERN}|{RE_NON_SGR_ESC})"
+	rf"|(\t)"
+	rf"|({RE_CONTROLS})"
+	rf"|(.)",
+	re.DOTALL,
+)
+
+RE_TOKEN = re.compile(
+	rf"({RE_SGR_PATTERN})"
+	rf"|({RE_NON_SGR_ESC})"
+	rf"|(\t)"
+	rf"|({RE_CONTROLS})"
+	rf"|(.)",
+	re.DOTALL,
+)
 
 # The chart and bar glyphs, one table per style. Every glyph in the `coarse` tables is in code page 437 (so it draws in
 # the classic console and in every console font); the `ascii` tables are printable ASCII only, as insurance for a console
@@ -51,31 +80,88 @@ class _Colors:
 C = _Colors()
 
 
+def safe(text):
+	"""Strip escape sequences, C0/C1 controls, DEL, and bidi characters. Tabs become a single space."""
+	if not text:
+		return text
+	if "\x1b" not in text and not RE_CONTROLS_CHECK.search(text):
+		return text
+	out = []
+	for m in RE_SAFE_TOKEN.finditer(text):
+		if m.group(1) or m.group(3):
+			continue
+		elif m.group(2):
+			out.append(" ")
+		else:
+			out.append(m.group(4))
+	return "".join(out)
+
+
 def vlen(s):
-	return len(RE_ANSI.sub("", s))
+	"""Visible column count. Only SGR sequences are zero-width; non-SGR escapes and controls do not count."""
+	plain = RE_SGR.sub("", s)
+	if "\x1b" not in plain and not RE_CONTROLS_CHECK.search(plain):
+		return len(plain)
+	return len(safe(s))
 
 
-def clip(s, width):
-	"""Truncate to `width` visible columns, keeping colour codes intact."""
-	if vlen(s) <= width:
-		return s
+def _clip_slow(s, width):
 	out, n = [], 0
 	for m in RE_TOKEN.finditer(s):
 		if m.group(1):
 			out.append(m.group(1))
+		elif m.group(2) or m.group(4):
+			continue
 		elif n < width - 1:
-			out.append(m.group(2))
+			out.append(" " if m.group(3) else m.group(5))
 			n += 1
 		else:
 			break
 	return "".join(out) + "…" + C.reset
 
 
+def clip(s, width):
+	"""Truncate to `width` visible columns, keeping colour codes (SGR) intact and removing non-SGR escapes and controls."""
+	plain = RE_SGR.sub("", s)
+	if "\x1b" not in plain and not RE_CONTROLS_CHECK.search(plain):
+		if len(plain) <= width:
+			return s
+		out, n = [], 0
+		for m in RE_SGR_TOKEN.finditer(s):
+			if m.group(1):
+				out.append(m.group(1))
+			elif n < width - 1:
+				out.append(m.group(2))
+				n += 1
+			else:
+				break
+		return "".join(out) + "…" + C.reset
+	if vlen(s) <= width:
+		out = []
+		for m in RE_TOKEN.finditer(s):
+			if m.group(1):
+				out.append(m.group(1))
+			elif m.group(2) or m.group(4):
+				continue
+			elif m.group(3):
+				out.append(" ")
+			else:
+				out.append(m.group(5))
+		return "".join(out)
+	return _clip_slow(s, width)
+
+
 def pad(s, width):
+	plain = RE_SGR.sub("", s)
+	if "\x1b" not in plain and not RE_CONTROLS_CHECK.search(plain):
+		return s + " " * max(0, width - len(plain))
 	return s + " " * max(0, width - vlen(s))
 
 
 def rpad(s, width):
+	plain = RE_SGR.sub("", s)
+	if "\x1b" not in plain and not RE_CONTROLS_CHECK.search(plain):
+		return " " * max(0, width - len(plain)) + s
 	return " " * max(0, width - vlen(s)) + s
 
 

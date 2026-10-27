@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-27
+
+### Security
+
+- `win-llmtop` runs its two helper programs, `llama-server --help` and `llama-fit-params`, only from the folder of the running `llama-server` it monitors: the process named `llama-server*` that listens on the watched port at a loopback address. It no longer takes a program path from the server's `/models` reply, the current folder or `PATH` ([GHSA-fxxm-3w8c-mjr4](https://github.com/insane-kane/win-llmtop/security/advisories/GHSA-fxxm-3w8c-mjr4)).
+- The model, draft-model and log-file paths a server reports are opened only for that server, and only when they are absolute paths on a local drive letter; network, device and relative paths are skipped with a notice.
+- The API key is sent only to a URL given with `--router` (or `LLMTOP_ROUTER`) or read from a running `llama-server`'s command line, never to the default-address probe, and HTTP redirects are no longer followed.
+- A server at a loopback address is always reached directly, never through a proxy; a remote `--router` uses the system proxy settings.
+- Escape sequences and control characters in text from the server, the logs or error messages are removed before they reach the terminal; only `win-llmtop`'s own colour codes are written.
+
+### Changed
+
+- A server on another machine, or one whose listening process is not `llama-server*`, is still monitored, but its Memory and Tensors pages say `could not analyse` with the reason, and `--check` says why on its `llama-fit-params` line.
+- The release workflow checks that a release tag is signed by the maintainer's pinned key fingerprint.
+
 ## [0.3.0] - 2026-10-22
 
 ### Added

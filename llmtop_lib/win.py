@@ -4,12 +4,15 @@
 	PDH     per-process dedicated / shared / committed VRAM, GPU engine load, paging rates (a few ms per sample)
 	DXGI    the VRAM budget the OS reports for the calling process (it can be below the card's capacity)
 	psapi   per-process working set, private bytes, CPU time; system RAM and commit charge
+	iphlpapi  which process listens on a TCP port (the server llmtop trusts for helper programs and file paths)
 """
 
 import ctypes
 import ctypes.wintypes as wt
+import ipaddress
 import os
 import re
+import struct
 import uuid
 
 MIB = 2**20
@@ -501,6 +504,57 @@ def proc_info(pid):
 		return {"exe": exe, "argv": argv, "created": created}
 	finally:
 		_k32.CloseHandle(h)
+
+
+def tcp_listener_pid(port, host=None):
+	"""The pid of the one process listening on TCP `port` where a connection to `host` (a loopback address; default: any loopback address) would arrive, or None.
+
+	None also means the answer is not certain: no listener, listeners owned by more than one process, or the table could not be read.
+	Reads the system's listener table with GetExtendedTcpTable (iphlpapi, TCP_TABLE_OWNER_PID_LISTENER, IPv4 and IPv6); no administrator rights are needed.
+	"""
+	if not WIN or isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
+		return None
+	name = str(host or "").strip("[]").lower()
+	try:
+		want = ipaddress.ip_address(name) if name and name != "localhost" else None
+		fn = ctypes.WinDLL("iphlpapi", use_last_error=True).GetExtendedTcpTable
+	except (ValueError, OSError, AttributeError):
+		return None
+	fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.DWORD), wt.BOOL, wt.ULONG, ctypes.c_int, wt.ULONG]
+	fn.restype = wt.DWORD
+	pids = set()
+	# (address family, table layout): MIB_TCPROW_OWNER_PID is six DWORDs; MIB_TCP6ROW_OWNER_PID is 16 + 4 + 4 + 16 + 4 + 4 + 4 + 4 bytes
+	for af, size_of_row in ((2, 24), (23, 56)):
+		size = wt.DWORD(0)
+		buf = None
+		for _ in range(8):  # the table can grow between the size query and the read
+			r = fn(buf, ctypes.byref(size), False, af, 3, 0)  # 3 = TCP_TABLE_OWNER_PID_LISTENER
+			if r == 0:
+				break
+			if r != 122:  # ERROR_INSUFFICIENT_BUFFER
+				return None
+			buf = ctypes.create_string_buffer(size.value)
+		else:
+			return None
+		if buf is None:
+			continue
+		raw = buf.raw
+		(count,) = struct.unpack_from("<I", raw, 0)
+		for i in range(min(count, (len(raw) - 4) // size_of_row)):
+			off = 4 + i * size_of_row
+			if af == 2:  # dwState, dwLocalAddr, dwLocalPort, dwRemoteAddr, dwRemotePort, dwOwningPid
+				addr = ipaddress.IPv4Address(raw[off + 4:off + 8])
+				(port_raw,), (pid,) = struct.unpack_from("<I", raw, off + 8), struct.unpack_from("<I", raw, off + 20)
+			else:  # ucLocalAddr[16], dwLocalScopeId, dwLocalPort, ucRemoteAddr[16], dwRemoteScopeId, dwRemotePort, dwState, dwOwningPid
+				addr = ipaddress.IPv6Address(raw[off:off + 16])
+				(port_raw,), (pid,) = struct.unpack_from("<I", raw, off + 20), struct.unpack_from("<I", raw, off + 52)
+			if ((port_raw & 0xFF) << 8 | (port_raw >> 8 & 0xFF)) != port:  # the port is stored in network byte order
+				continue
+			if addr.is_unspecified:  # a wildcard listener also takes loopback connections (a dual-stack one takes both families)
+				pids.add(pid)
+			elif addr.is_loopback and (want is None or (want.version == addr.version and want == addr)):
+				pids.add(pid)
+	return next(iter(pids)) if len(pids) == 1 else None
 
 
 def enable_vt():

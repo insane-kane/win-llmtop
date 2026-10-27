@@ -23,9 +23,9 @@ It inspects the prerequisites and every data source it can reach, prints one sta
 | `processes` | The `llama-server` processes it found (PID and executable path) |
 | `server` | The URL it uses ([`--router`](llmtop.1.md#options)) and how it found it, the mode (`router` or `single`), how many models the server reports, and whether `/models` and `/slots` are reachable ([`--api-key`](llmtop.1.md#options)) |
 | `logs` | For each model, the log path and whether it exists and has timestamps; and the router log ([`--log-dir`](llmtop.1.md#options), [`--router-log`](llmtop.1.md#options)) |
-| `llama-fit-params` | Where it found the `llama-fit-params` helper (next to the server executable, on `PATH`, or not found) |
+| `llama-fit-params` | Whether the `llama-fit-params` helper is next to the running `llama-server` executable that serves the watched URL, not found there, or switched off (`off: ...` with the reason, see [troubleshooting](troubleshooting.md#helper-programs-and-server-paths-are-off)); it is looked for nowhere else |
 | `state` | The state folder ([`--state-dir`](llmtop.1.md#options)) and whether it is writable ([`--no-persist`](llmtop.1.md#options)) |
-| `notice` | Any active notices, such as single-model mode, several llama-server instances found, a server found by discovery, a missing log, or a log without timestamps |
+| `notice` | Any active notices, such as single-model mode, several llama-server instances found, a server found by discovery, helper programs and server paths switched off, a refused file path, a missing log, or a log without timestamps |
 
 If any line prints `FAIL` or an unexpected notice, see [`troubleshooting.md`](troubleshooting.md).
 
@@ -82,7 +82,7 @@ Run `win-llmtop` with no arguments for the interactive full-screen view (sampled
 
 ### Per-model logs and timestamps
 
-Pass `--log-file` (in router mode, each preset's `log-file`) and `--log-timestamps` to `llama-server`, and point [`--log-dir`](llmtop.1.md#options) (or `LLMTOP_LOG_DIR`) at the log directory if the preset does not specify an full path so `win-llmtop` can open `<log-dir>\<preset>.log`.
+Pass `--log-file` (in router mode, each preset's `log-file`) and `--log-timestamps` to `llama-server`, and point [`--log-dir`](llmtop.1.md#options) (or `LLMTOP_LOG_DIR`) at the log directory if the preset does not specify an full path so `win-llmtop` can open `<log-dir>\<preset>.log`. A log path read from a server or its command line is used only when it is an absolute path on a local drive (`D:\logs\name.log`) and the server is this machine's own `llama-server`; otherwise it is skipped with a notice (see [troubleshooting](troubleshooting.md#a-reported-file-path-was-ignored)).
 
 - **What it unlocks:** finished turn and prompt history on **Live** and **Requests** — per-turn prefill and decode speeds, prompt cache hit tokens, speculative draft acceptance rates, and wall-clock completion times.
 - **What you lose without `--log-file` / [`--log-dir`](llmtop.1.md#options):** the request history is empty and `win-llmtop` prints a `no log file for preset <name>` notice.
@@ -90,7 +90,7 @@ Pass `--log-file` (in router mode, each preset's `log-file`) and `--log-timestam
 
 ### Live slot telemetry
 
-Start `llama-server` with `--slots` enabled (and pass [`--api-key`](llmtop.1.md#options) or set `LLMTOP_API_KEY` / `LLAMA_API_KEY` if the server requires authentication).
+Start `llama-server` with `--slots` enabled (and pass [`--api-key`](llmtop.1.md#options) or set `LLMTOP_API_KEY` / `LLAMA_API_KEY` if the server requires authentication). The key is sent only to the URL you give with [`--router`](llmtop.1.md#options) or to one read from a running `llama-server`'s command line; the default address `http://127.0.0.1:8080` is probed without it, so for a server that requires a key and does not show up in the process list, pass `--router` as well (see [`llmtop.1.md#discovery-the-api-key-and-trust`](llmtop.1.md#discovery-the-api-key-and-trust)).
 
 - **What it unlocks:** live in-flight request progress from the server's `/slots` endpoint — whether a slot is in `PREFILL` or `DECODE`, how many prompt tokens have been processed, the prefill ETA, live tokens/s, and current KV cache fill.
 - **What you lose without `--slots`:** `/slots` is disabled (`HTTP 404` or `HTTP 501`), so `win-llmtop` still shows GPU memory, host RAM and finished requests from logs, but cannot show the currently running request and raises a warning to start the server with `--slots`.
@@ -107,7 +107,7 @@ Point [`--router-log`](llmtop.1.md#options) directly at the router's log file, o
 ## Snapshots and VRAM planning
 
 - **Single snapshot ([`--once`](llmtop.1.md#options)):** `win-llmtop --once` collects four warmup samples (so rate counters have two points) and prints the **Live** page once to standard output. Combine with [`--page`](llmtop.1.md#options) (`live`, `memory`, `system`, `requests`, `events`, `tensors`, or `all` for every page), [`--detail`](llmtop.1.md#options) to show each event's detail line(s) on the Events page, [`--width`](llmtop.1.md#options) to fix the column width, and [`--no-color`](llmtop.1.md#options) when piping to a file.
-- **VRAM projection ([`--plan`](llmtop.1.md#options)):** `win-llmtop --plan` inspects every preset's GGUF header and runs `llama-fit-params` to project weights, KV cache and recurrent state, compute buffers, draft model and learned VRAM overhead against the DXGI OS budget without loading any model. Pass a preset name (`win-llmtop --plan <PRESET>`) to print the full **Memory** page map for that preset.
+- **VRAM projection ([`--plan`](llmtop.1.md#options)):** `win-llmtop --plan` inspects every preset's GGUF header and runs `llama-fit-params` (from the folder of the running `llama-server`) to project weights, KV cache and recurrent state, compute buffers, draft model and learned VRAM overhead against the DXGI OS budget without loading any model. Pass a preset name (`win-llmtop --plan <PRESET>`) to print the full **Memory** page map for that preset.
 
 ---
 

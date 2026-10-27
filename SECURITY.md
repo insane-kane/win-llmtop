@@ -29,6 +29,8 @@ The maintainer acknowledges a report within 7 days.
 
 llmtop is read-only. It reads llama-server's HTTP API (optionally with an API key from `--api-key` or `LLMTOP_API_KEY`/`LLAMA_API_KEY`), its log files and Windows performance counters, and writes only to its state folder.
 
+It runs `llama-server --help` and `llama-fit-params` only from the folder of the running `llama-server` it monitors: the process named `llama-server*` that listens on the watched port, when the server is at a loopback address. It opens the model, draft-model and log-file paths a server reports only for such a server, and only when the path is absolute on a local drive letter (`X:\...`); network, device and relative paths are skipped with a notice. It follows no HTTP redirect, and it sends the API key only to the URL given with `--router` or taken from a running `llama-server`'s command line, never to the default-address probe.
+
 In scope:
 
 - anything that makes llmtop write outside its state folder;

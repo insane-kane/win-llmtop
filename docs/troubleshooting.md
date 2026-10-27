@@ -1,6 +1,6 @@
 # Troubleshooting win-llmtop
 
-**Contents:** [32-bit Python or older Python (`windows FAIL`)](#32-bit-python-or-older-python) · [No GPU counters or adapter not matched (`gpu FAIL`)](#no-gpu-counters-or-adapter-not-matched) · [No server found or unreachable (`server FAIL`)](#no-server-found-or-server-unreachable) · [Several llama-servers running](#several-llama-servers-running) · ["llama-server 0 MiB", a missing RAM row, or "no memory map"](#llama-server-0-mib-a-missing-ram-row-or-no-memory-map) · [`/slots` endpoint is off (`HTTP 404` / `HTTP 501`)](#slots-endpoint-is-off) · [Server or `/slots` authentication error (`HTTP 401` / `HTTP 403`)](#server-or-slots-authentication-error) · [Missing per-model log, unrecognised format or missing timestamps](#missing-per-model-log-unrecognised-format-or-missing-timestamps) · [Router log not found](#router-log-not-found) · [State folder not writable (`state FAIL`)](#state-folder-not-writable-or-unavailable) · [`llama-fit-params` not found](#llama-fit-params-not-found) · [Informational notices](#informational-notices) · [Unknown threshold or collector error](#unknown-threshold-or-collector-error) · [Garbled display or boxes in the charts](#garbled-display-or-boxes-in-the-charts)
+**Contents:** [32-bit Python or older Python (`windows FAIL`)](#32-bit-python-or-older-python) · [No GPU counters or adapter not matched (`gpu FAIL`)](#no-gpu-counters-or-adapter-not-matched) · [No server found or unreachable (`server FAIL`)](#no-server-found-or-server-unreachable) · [Several llama-servers running](#several-llama-servers-running) · ["llama-server 0 MiB", a missing RAM row, or "no memory map"](#llama-server-0-mib-a-missing-ram-row-or-no-memory-map) · [`/slots` endpoint is off (`HTTP 404` / `HTTP 501`)](#slots-endpoint-is-off) · [Server or `/slots` authentication error (`HTTP 401` / `HTTP 403`)](#server-or-slots-authentication-error) · [Missing per-model log, unrecognised format or missing timestamps](#missing-per-model-log-unrecognised-format-or-missing-timestamps) · [Router log not found](#router-log-not-found) · [State folder not writable (`state FAIL`)](#state-folder-not-writable-or-unavailable) · [`llama-fit-params` not found](#llama-fit-params-not-found) · [Helper programs and server paths are off](#helper-programs-and-server-paths-are-off) · [A reported file path was ignored](#a-reported-file-path-was-ignored) · [Informational notices](#informational-notices) · [Unknown threshold or collector error](#unknown-threshold-or-collector-error) · [Garbled display or boxes in the charts](#garbled-display-or-boxes-in-the-charts)
 
 Each entry lists the exact message printed by `win-llmtop` or `win-llmtop --check` (see [`usage.md`](usage.md#first-run)), its cause, and how to fix it. Every command-line option links to [`llmtop.1.md#options`](llmtop.1.md#options).
 
@@ -162,9 +162,9 @@ In both cases the model still appears in the preset list and `m` still cycles ov
 		(or `HTTP 403`).
 	- `win-llmtop --check` shows `/slots error: HTTP 401` on the `server` line, and the **Live** page shows `slot data unavailable: HTTP 401`.
 
-**Cause:** `llama-server` requires a Bearer API key for HTTP requests. When started with `--api-key`, `/models` (and everything except `/health`) requires authentication, not only `/slots`.
+**Cause:** `llama-server` requires a Bearer API key for HTTP requests. When started with `--api-key`, `/models` (and everything except `/health`) requires authentication, not only `/slots`. `win-llmtop` sends its key only to a URL you gave with `--router` or one read from a running `llama-server`'s command line; the probe of the default address `http://127.0.0.1:8080` carries no key, and when it is refused and a key is set `win-llmtop` looks for a running `llama-server` whose command line names that address. If none does, the message reads `HTTP 401 (no API key was sent to the default address: pass --router with --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY)` (the alert says `HTTP 401: pass --router with --api-key or LLAMA_API_KEY`).
 
-**Fix:** Pass [`--api-key`](llmtop.1.md#options) `<KEY>`, or set `LLMTOP_API_KEY` or `LLAMA_API_KEY` in your environment before starting `win-llmtop`.
+**Fix:** Pass [`--api-key`](llmtop.1.md#options) `<KEY>`, or set `LLMTOP_API_KEY` or `LLAMA_API_KEY` in your environment before starting `win-llmtop`; when the message mentions the default address, also pass [`--router`](llmtop.1.md#options) `http://127.0.0.1:<port>` with the server's URL. A server that answers with a redirect is reported as an error (`HTTP Error 302`): pass the URL it redirects to as `--router`.
 
 ---
 
@@ -236,9 +236,55 @@ In both cases the model still appears in the preset list and `m` still cycles ov
 	llama-fit-params   --    not found
 	```
 
-**Cause:** `llama-fit-params.exe` was not found in the same folder as `llama-server.exe` or on `PATH`. Without it, `win-llmtop` still derives model weights, KV cache and recurrent state from the GGUF header, but cannot cross-check them against `llama.cpp`'s own projection or show `llama.cpp`'s compute-buffer figure.
+**Cause:** `llama-fit-params.exe` is not in the same folder as the running `llama-server.exe` that serves the watched URL. `win-llmtop` looks only there: not on `PATH`, not in the current folder, and not in any folder a server reports. Without it, `win-llmtop` still derives model weights, KV cache and recurrent state from the GGUF header, but cannot cross-check them against `llama.cpp`'s own projection or show `llama.cpp`'s compute-buffer figure.
 
-**Fix:** Keep `llama-fit-params.exe` (included in official `llama.cpp` Windows release archives) in the same directory as `llama-server.exe`, or add its folder to `PATH`.
+**Fix:** Keep `llama-fit-params.exe` (included in official `llama.cpp` Windows release archives) in the same directory as `llama-server.exe`. If the line reads `off: ...` instead, see [Helper programs and server paths are off](#helper-programs-and-server-paths-are-off).
+
+---
+
+## Helper programs and server paths are off
+
+**Symptom:**
+
+- A notice prints:
+	```text
+	no helper program is run and no file path from the server is used: <reason>
+	```
+- `win-llmtop --check` prints:
+	```text
+	llama-fit-params   --    off: no helper program is run and no file path from the server is used, because <reason>
+	```
+- The **Memory** and/or **Tensors** page shows:
+	```text
+	could not analyse: the model file and the helper programs are not used because <reason>
+	```
+
+**Cause:** `win-llmtop` runs `llama-server --help` and `llama-fit-params`, and opens the model, draft-model and log-file paths a server reports, only for the server it can show is this machine's own `llama-server`: a loopback URL (`127.0.0.1`, `::1`, `localhost`) whose port is listened on by exactly one process named `llama-server*`, with a readable image path. `<reason>` says which part failed:
+
+- `the server at <URL> is not at a loopback address`: the server is on another machine, or `--router` names a host rather than a loopback address.
+- `no single process listens on port <N> of the loopback address`: nothing listens there (the server just stopped, or runs in a container or WSL whose sockets Windows does not list), or two processes do.
+- `the process listening on port <N> (pid <PID>) is not named llama-server*`: a wrapper, proxy or renamed binary is in front of the server.
+- `the image path of llama-server (pid <PID>) could not be read`: `llama-server` runs under another account with restricted permissions.
+
+The server is still monitored over HTTP; only the memory map, the defaults read from `--help`, the projection and the log paths a server reports are unavailable.
+
+**Fix:** Run `win-llmtop` on the machine that runs `llama-server`, give [`--router`](llmtop.1.md#options) a loopback URL, and run the server as a plain `llama-server` process (or `llama-server-<suffix>`) from your own account. Per-model logs can still be given with [`--log-dir`](llmtop.1.md#options) and the router log with [`--router-log`](llmtop.1.md#options), which are never checked.
+
+---
+
+## A reported file path was ignored
+
+**Symptom:**
+
+- A notice prints:
+	```text
+	<preset>: the model path is ignored: it is not an absolute path on a local drive
+	```
+	(or `the draft model path`, `the log file path`; for the router's own log the name before the colon is `router`), and the **Memory** page shows `could not analyse: the model path is not an absolute path on a local drive` when it is the model.
+
+**Cause:** The model, draft-model and log-file paths a server or its command line reports are used only when they are absolute on a local drive letter (`X:\...` or `X:/...`). A network path (`\\host\share\...`, `//host/...`), a `\\?\` or `\\.\` path, a device name such as `NUL`, a relative path and a path with a stream or wildcard are skipped. The rest of the page still works: a skipped draft model is left out of the memory map, and a skipped log file means that preset has no log (see [Missing per-model log](#missing-per-model-log-unrecognised-format-or-missing-timestamps)).
+
+**Fix:** Start the preset with a full local path for its model (for example `D:\models\name.gguf`). For a log on a network share, pass [`--log-dir`](llmtop.1.md#options) or [`--router-log`](llmtop.1.md#options) yourself.
 
 ---
 

@@ -299,6 +299,19 @@ def test_request_failed_is_crit_with_detail():
 	assert e["detail"] == msg[:400], e["detail"]
 
 
+def test_normalize_line_safe_sequences():
+	raw = "0.05.059.171 I srv  \x1b[32mmodel \x1b[2Jloaded\x1b[0m\t\x1b]0;title\x07\x1bPdata\x1b\\\x1bM\x00\x7f\x82\u200e \u202aok\u202c"
+	t, lvl, text, port = log.normalize_line(raw)
+	assert t == 5.059171
+	assert lvl == "I"
+	assert text == "srv  model loaded  ok"
+	assert "\x1b" not in text
+	assert "\x00" not in text
+	assert "\x7f" not in text
+	assert "\x82" not in text
+	assert "\u200e" not in text
+
+
 CASES = [
 	("b11669_with_timestamps", test_b11669_with_timestamps),
 	("no_timestamps", test_no_timestamps),
@@ -317,6 +330,7 @@ CASES = [
 	("log_headline_prefix_trim", test_log_headline_prefix_trim),
 	("trunc_is_crit", test_trunc_is_crit),
 	("request_failed_is_crit_with_detail", test_request_failed_is_crit_with_detail),
+	("normalize_line_safe_sequences", test_normalize_line_safe_sequences),
 ]
 
 

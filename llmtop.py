@@ -177,6 +177,7 @@ def _render_error_frame(c, snap, view, W, H, e):
 	else:
 		body.append("  press 1-6 to try another page")
 		body += tb[-8:]
+	body = [ui.safe(ln) for ln in body]
 	lines = [pages.header(c, snap, view, W)]
 	body_h = H - len(lines) - 1
 	body = body[:max(0, body_h)]
@@ -187,7 +188,7 @@ def _render_error_frame(c, snap, view, W, H, e):
 
 def frame_text(c, snap, view, W, H):
 	if snap is None:
-		return ["llmtop: collector error (press q to quit)", view.msg or "collector error"]
+		return [ui.safe("llmtop: collector error (press q to quit)"), ui.safe(view.msg or "collector error")]
 	try:
 		return pages.render(c, snap, view, W, H)
 	except Exception as e:
@@ -214,7 +215,8 @@ def live(c, view):
 				prev, last_size = None, (size.columns, size.lines)
 			if snap is None:
 				err_lines = err.splitlines() if err else ([view.msg] if view.msg else ["unknown error"])
-				lines = ["llmtop: collector error (press q to quit)"] + err_lines[-(size.lines - 2):]
+				raw_lines = ["llmtop: collector error (press q to quit)"] + err_lines[-(size.lines - 2):]
+				lines = [ui.clip(ui.safe(ln), size.columns - 1) for ln in raw_lines]
 			else:
 				if view.paused and frozen is None:
 					frozen = snap
@@ -276,22 +278,24 @@ def plan(c, view, which, width):
 		view.msel = order.index(which) if which in order else 0
 		print("\n".join(frame_text(c, snap, view, width, 200)).rstrip())
 		return
-	print("%s: %s MiB, OS budget %s MiB" % (g["name"], "{:,.0f}".format(g["vram"]), "{:,.0f}".format(g["budget"])) if g else "no GPU telemetry")
-	print("\n%-26s %9s %9s %9s %9s %9s %10s  %s" % ("preset", "weights", "KV+state", "compute", "draft", "overhead", "projected", "vs OS budget"))
+	print(ui.safe("%s: %s MiB, OS budget %s MiB" % (g["name"], "{:,.0f}".format(g["vram"]), "{:,.0f}".format(g["budget"])) if g else "no GPU telemetry"))
+	print()
+	print(ui.safe("%-26s %9s %9s %9s %9s %9s %10s  %s" % ("preset", "weights", "KV+state", "compute", "draft", "overhead", "projected", "vs OS budget")))
 	for name in names:
 		e = c.mem.get(name, {})
 		if e.get("state") != "ready":
-			print("%-26s %s" % (name, e.get("error", "no projection")))
+			print(ui.safe("%-26s %s" % (name, e.get("error", "no projection"))))
 			continue
 		cal = c.calib.get(c.calib_key(e["key"]))
 		rows = model.memory_rows(e["map"], None, cal["overhead"] if cal else None)
 		by = lambda pred, rows=rows: sum(r[1] for r in rows if pred(r[0]))
 		total = sum(r[1] for r in rows)
 		head = g["budget"] - total if g else float("nan")
-		print("%-26s %9.0f %9.0f %9.0f %9.0f %9s %10.0f  %+.0f MiB%s%s" % (name, by(lambda n: n.startswith("weights")), by(lambda n: n.startswith(("KV", "recurrent"))), by(lambda n: n == "compute buffers"),
-			by(lambda n: n.startswith(("MTP", "draft"))), "%.0f" % cal["overhead"] if cal else "?", total, head, "  over the budget" if head < 0 else "", "" if cal else "  (not calibrated)"))
-	print("\nFigures are MiB. 'overhead' is resident VRAM minus the projected rows, measured on an earlier load of the same model file, context size and cache types (shared by every preset with that configuration).")
-	print("'?' means no such load has been measured yet, so the projection has no overhead term. 'vs OS budget' compares the projected resident VRAM with the DXGI budget; shared GPU memory is not part of it.")
+		print(ui.safe("%-26s %9.0f %9.0f %9.0f %9.0f %9s %10.0f  %+.0f MiB%s%s" % (name, by(lambda n: n.startswith("weights")), by(lambda n: n.startswith(("KV", "recurrent"))), by(lambda n: n == "compute buffers"),
+			by(lambda n: n.startswith(("MTP", "draft"))), "%.0f" % cal["overhead"] if cal else "?", total, head, "  over the budget" if head < 0 else "", "" if cal else "  (not calibrated)")))
+	print()
+	print(ui.safe("Figures are MiB. 'overhead' is resident VRAM minus the projected rows, measured on an earlier load of the same model file, context size and cache types (shared by every preset with that configuration)."))
+	print(ui.safe("'?' means no such load has been measured yet, so the projection has no overhead term. 'vs OS budget' compares the projected resident VRAM with the DXGI budget; shared GPU memory is not part of it."))
 
 
 def check(c, args):
@@ -315,15 +319,15 @@ def check(c, args):
 		win_ver = sys.platform
 	py_ver = "Python %s %s" % (platform.python_version(), "64-bit" if win.IS_64 else "32-bit")
 	win_ok = win.WIN and win.IS_64
-	print("%-18s %-5s %s" % ("windows", "ok" if win_ok else "FAIL", "%s, %s" % (win_ver, py_ver)))
+	print(ui.safe("%-18s %-5s %s" % ("windows", "ok" if win_ok else "FAIL", "%s, %s" % (win_ver, py_ver))))
 	if tick_error:
-		print("%-18s %-5s %s" % ("collector", "FAIL", tick_error))
+		print(ui.safe("%-18s %-5s %s" % ("collector", "FAIL", tick_error)))
 
 	# 1b. the terminal: which console this is, and which chart style it will use (informational; does not affect the exit code)
 	kind = ui.terminal_kind(os.environ)
 	style = ui.STYLE["mode"]
 	note = " (Windows Terminal draws finer charts; s or --graph-style changes it)" if style in ("coarse", "ascii") and not args.style_explicit else ""
-	print("%-18s %-5s %s" % ("terminal", "--", "%s: charts use the %s style%s" % (kind, style, note)))
+	print(ui.safe("%-18s %-5s %s" % ("terminal", "--", "%s: charts use the %s style%s" % (kind, style, note))))
 
 	# 2. GPU: DXGI adapters, watched adapter, PDH GPU counters
 	dx = c.dx
@@ -344,7 +348,7 @@ def check(c, args):
 		pdh_str = "PDH counters present" if pdh_ok else "PDH counters absent"
 		gpu_fact = "%s, %s; %s" % ("; ".join(ad_strs), watch_str, pdh_str)
 		gpu_status = "ok" if gpu_telemetry_ok else "FAIL"
-	print("%-18s %-5s %s" % ("gpu", gpu_status, gpu_fact))
+	print(ui.safe("%-18s %-5s %s" % ("gpu", gpu_status, gpu_fact)))
 
 	# 3. llama-server processes (pid, exe from proc_info, or the reason it couldn't be read)
 	if not win.WIN:
@@ -364,7 +368,7 @@ def check(c, args):
 				reason = err[1] if err else "cannot read process info"
 				items.append("pid %d: %s" % (pid, reason))
 		proc_fact = "; ".join(items)
-	print("%-18s %-5s %s" % ("processes", proc_status, proc_fact))
+	print(ui.safe("%-18s %-5s %s" % ("processes", proc_status, proc_fact)))
 
 	# 4. the server: URL used and how it was found, mode, models reported (count), /slots reachable for a loaded model (or its slot_error)
 	server_ok = bool(c.router_up)
@@ -389,14 +393,15 @@ def check(c, args):
 		server_status = "FAIL"
 		url = c.cfg.get("router") or ""
 		how = "explicit" if c.router_explicit else (c.router_discovery or "discovered")
-		server_fact = "%s (%s): %s (pass --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY)" % (url, how, c.router_auth_error)
+		server_fact = "%s (%s): %s (%s)" % (url, how, c.router_auth_error, "pass --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY" if c.key_allowed else
+			"no API key was sent to the default address: pass --router with --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY")
 	else:
 		server_status = "FAIL"
 		url = c.cfg.get("router") or ""
 		tried = ", ".join(c.router_tried) if c.router_tried else url
 		err = (": " + c.router_error) if c.router_error else ""
 		server_fact = "server unreachable (tried %s)%s" % (tried, err)
-	print("%-18s %-5s %s" % ("server", server_status, server_fact))
+	print(ui.safe("%-18s %-5s %s" % ("server", server_status, server_fact)))
 
 	# 5. log files: per model, the path and whether it exists and has timestamps; the router log
 	log_items = []
@@ -419,39 +424,19 @@ def check(c, args):
 	else:
 		log_fact = "; ".join(log_items)
 		log_status = "ok" if any("exists" in item for item in log_items) else "--"
-	print("%-18s %-5s %s" % ("logs", log_status, log_fact))
+	print(ui.safe("%-18s %-5s %s" % ("logs", log_status, log_fact)))
 
-	# 6. llama-fit-params: found next to the server, on PATH, or not found
-	fit_found = None
-	fit_where = None
-	candidates = []
-	for pid in c.pids:
-		info = win.proc_info(pid) if win.WIN else {}
-		exe = info.get("exe")
-		if exe:
-			d = os.path.dirname(exe)
-			candidates.extend([os.path.join(d, "llama-fit-params.exe"), os.path.join(d, "llama-fit-params")])
-	for _, exe in c.flags.values():
-		if exe:
-			d = os.path.dirname(exe)
-			candidates.extend([os.path.join(d, "llama-fit-params.exe"), os.path.join(d, "llama-fit-params")])
-	for cand in candidates:
-		if os.path.isfile(cand):
-			fit_found = cand
-			fit_where = "found next to server"
-			break
-	if not fit_found:
-		w = shutil.which("llama-fit-params.exe") or shutil.which("llama-fit-params")
-		if w:
-			fit_found = w
-			fit_where = "found on PATH"
-	if fit_found:
-		fit_status = "ok"
-		fit_fact = "%s (%s)" % (fit_where, fit_found)
+	# 6. llama-fit-params: looked for only next to the llama-server that serves the watched URL (and only when that server is trusted)
+	trusted = c.trusted_exe(refresh=True)
+	if trusted:
+		found = next((p for p in (os.path.join(os.path.dirname(trusted), "llama-fit-params.exe"), os.path.join(os.path.dirname(trusted), "llama-fit-params")) if os.path.isfile(p)), None)
+		if found:
+			fit_status, fit_fact = "ok", "found next to the running server (%s)" % found
+		else:
+			fit_status, fit_fact = "--", "not found next to the running server (looked in %s)" % os.path.dirname(trusted)
 	else:
-		fit_status = "--"
-		fit_fact = "not found"
-	print("%-18s %-5s %s" % ("llama-fit-params", fit_status, fit_fact))
+		fit_status, fit_fact = "--", "off: no helper program is run and no file path from the server is used, because %s" % c.trust_reason
+	print(ui.safe("%-18s %-5s %s" % ("llama-fit-params", fit_status, fit_fact)))
 
 	# 7. the state folder: path and whether it is writable (check without creating it when --no-persist)
 	state_dir = c.state_dir
@@ -494,11 +479,11 @@ def check(c, args):
 			state_status, state_fact = "ok", "%s (writable)" % state_dir
 		except Exception as e:
 			state_status, state_fact = "FAIL", "%s (%s)" % (state_dir, e)
-	print("%-18s %-5s %s" % ("state", state_status, state_fact))
+	print(ui.safe("%-18s %-5s %s" % ("state", state_status, state_fact)))
 
 	# 8. then every snap["notices"] line
 	for n in snap.get("notices", []):
-		print("%-18s %-5s %s" % ("notice", "--", n))
+		print(ui.safe("%-18s %-5s %s" % ("notice", "--", n)))
 
 	gpu_ok_or_cpu = bool(win.WIN and (gpu_telemetry_ok or not adapters))
 	return 0 if (server_ok and gpu_ok_or_cpu) else 1

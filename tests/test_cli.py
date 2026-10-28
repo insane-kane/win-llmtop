@@ -104,6 +104,15 @@ class TestCLI(unittest.TestCase):
 		for name in _public_names.FORBIDDEN:
 			self.assertNotIn(name.lower(), proc.stdout.lower())
 
+	def test_fit_params_option_in_help(self):
+		proc = subprocess.run([sys.executable, "-I", LLMTOP_PY, "--help"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+		self.assertEqual(proc.returncode, 0)
+		self.assertIn("--fit-params", proc.stdout)
+		proc = subprocess.run([sys.executable, "-I", LLMTOP_PY, "--fit-params", "bogus"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+		self.assertEqual(proc.returncode, 2, "stderr: %s" % proc.stderr)
+		self.assertIn("error:", proc.stderr)
+		self.assertNotIn("Traceback", proc.stderr)
+
 	def test_check_with_stub_server(self):
 		models_data = [
 			{
@@ -545,6 +554,7 @@ class TestCLI(unittest.TestCase):
 
 CASES = [
 	("help_generic_and_no_local_names", TestCLI("test_help_generic_and_no_local_names")),
+	("fit_params_option_in_help", TestCLI("test_fit_params_option_in_help")),
 	("check_with_stub_server", TestCLI("test_check_with_stub_server")),
 	("check_unused_port_server_unreachable", TestCLI("test_check_unused_port_server_unreachable")),
 	("once_page_all_runs_cleanly", TestCLI("test_once_page_all_runs_cleanly")),

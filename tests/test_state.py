@@ -881,6 +881,56 @@ class TestState(unittest.TestCase):
 				self.assertEqual(calls["n"], 2)  # a fresh folder: computed once
 				self.assertFalse(os.path.isfile(os.path.join(state2, "fit-cache.json")))  # calibrate off: nothing written
 
+	def test_fit_params_policy(self):
+		with tempfile.TemporaryDirectory() as tmp, _patch_win():
+			bin_dir = os.path.join(tmp, "bin")
+			os.mkdir(bin_dir)
+			exe = os.path.join(bin_dir, "llama-server.exe")
+			with open(exe, "wb") as f:
+				f.write(b"fake")
+			fit_exe = os.path.join(bin_dir, "llama-fit-params.exe")
+			with open(fit_exe, "wb") as f:
+				f.write(b"fake")
+			model_path = os.path.join(tmp, "model.gguf")
+			with open(model_path, "wb") as f:
+				f.write(b"fake model")
+			flags = {"model": model_path, "ctx-size": "8192", "n-gpu-layers": "99"}
+			calls = {"n": 0}
+
+			def fake_fit(server_exe, flags, timeout=60):
+				calls["n"] += 1
+				return {"gpu": 1000, "host": 100}
+
+			def build(**over):
+				c = state.Collector(dict(state.CFG, state_dir=os.path.join(tmp, "state"), persist=False, calibrate=False, **over))
+				c.watched_exe = lambda: exe
+				return c
+
+			with mock.patch.object(state.model, "fit_projection", side_effect=fake_fit), \
+					mock.patch.object(state.model, "analyze", return_value={}), \
+					mock.patch.object(state.model, "server_defaults", return_value={}):
+				c = build(fit_params="never")
+				c.map_job("p", dict(flags), "k1")
+				self.assertEqual(calls["n"], 0)  # never: not run
+				self.assertIn("never", c.mem["p"]["fit_skipped"])
+				c = build()
+				c.last = {"gpu": {"budget": 10000.0, "ded": 9900.0}}  # 100 MiB of headroom, under the 256 MiB threshold
+				c.map_job("p", dict(flags), "k1")
+				self.assertEqual(calls["n"], 0)  # auto near the budget: skipped
+				self.assertIn("skipped", c.mem["p"]["fit_skipped"])
+				self.assertIsNotNone(c.mem["p"]["retry_at"])
+				c = build(plan=True)
+				c.last = {"gpu": {"budget": 10000.0, "ded": 9900.0}}
+				c.map_job("p", dict(flags), "k1")
+				self.assertEqual(calls["n"], 1)  # --plan: an explicit request, run regardless of headroom
+				self.assertIsNone(c.mem["p"]["fit_skipped"])
+				calls["n"] = 0
+				c = build()
+				c.last = {"gpu": {"budget": 10000.0, "ded": 5000.0}}  # 5 GiB of headroom
+				c.map_job("p", dict(flags), "k1")
+				self.assertEqual(calls["n"], 1)  # auto with room: run
+				self.assertIsNone(c.mem["p"]["fit_skipped"])
+
 
 class _Emit:
 	"""A stand-in for Collector.emit: records each event it is called with."""
@@ -1166,6 +1216,7 @@ CASES = [
 	("calibration_write_is_atomic", TestState("test_calibration_write_is_atomic")),
 	("fit_projection_cached_per_configuration", TestState("test_fit_projection_cached_per_configuration")),
 	("fit_cache_persisted_and_reloaded", TestState("test_fit_cache_persisted_and_reloaded")),
+	("fit_params_policy", TestState("test_fit_params_policy")),
 	("ring_random_data_24h_bucket_aligned", TestRing("test_ring_random_data_24h_bucket_aligned")),
 	("ring_short_windows_legacy_exact", TestRing("test_ring_short_windows_legacy_exact")),
 	("ring_overwrite_keeps_buckets_exact", TestRing("test_ring_overwrite_keeps_buckets_exact")),

@@ -24,6 +24,7 @@ Options, with their environment variables and defaults:
 | `--page {live,memory,system,requests,events,tensors,all}` | — | `live` | page for `--once` |
 | `--detail` | — | off | with `--once --page events`, show each event's detail line(s); the `d` key does this in the interactive Events page |
 | `--plan [PRESET]` | — | off | project VRAM per preset against the OS budget |
+| `--fit-params {auto,never}` | — | `auto` | run `llama-fit-params` for the Memory page's projection: `auto` (skips it while VRAM is within `fit_headroom_mib` of the OS budget) or `never` |
 | `--window {1m,5m,15m,1h,6h,24h}` | — | `5m` | initial history window |
 | `--router URL` | `LLMTOP_ROUTER` | find it | `llama-server` URL |
 | `--log-dir DIR` | `LLMTOP_LOG_DIR` | (none) | directory of `llama-server` logs |
@@ -119,7 +120,7 @@ llmtop shows what it can measure or read, and marks what it derives. It never st
 | Tensor placement | the flags with llama.cpp's offload rules (`--override-tensor`, `--cpu-moe`, `--n-gpu-layers`, input embeddings on the host) | derived, checked against `llama-fit-params` |
 | KV cache and recurrent state size | tensor shapes and flags | derived, checked against `llama-fit-params` |
 | MTP head KV | derived like the KV cache | estimate, marked `est.`, not checked |
-| Compute buffers, host figures | `llama-fit-params` (run with `-lv 4`, allocates nothing, from the folder of the running `llama-server` that serves the watched URL) | reported by llama.cpp |
+| Compute buffers, host figures | `llama-fit-params` (run with `-lv 4`, from the folder of the running `llama-server` that serves the watched URL; it allocates no model memory, but starting the GPU backend briefly uses some VRAM, so win-llmtop runs it once per configuration (cached) and skips it while VRAM is within `fit_headroom_mib` of the OS budget; `--fit-params never` turns it off) | reported by llama.cpp |
 | Overhead on the Memory page | resident VRAM minus the projected rows, kept per configuration | measured on a load |
 | Shared memory when the model became resident | the lowest shared figure of the llama-server process while resident VRAM is at least 90% of the projected rows | measured, per process |
 | CPU-side buffer baseline | the lowest shared GPU memory seen on an earlier load of the same configuration while resident plus shared memory was at least 1 GiB under the budget; until then llama.cpp's host projection, labelled unverified | measured or projected |

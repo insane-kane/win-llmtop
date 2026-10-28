@@ -547,6 +547,7 @@ def main():
 	ap.add_argument("--page", choices=PAGE_NAMES + ["all"], default="live", help="page for --once")
 	ap.add_argument("--detail", action="store_true", help="with --once --page events, show each event's detail line(s) (the d key in the interactive Events page)")
 	ap.add_argument("--plan", nargs="?", const="all", metavar="PRESET", help="project VRAM per preset against the OS budget")
+	ap.add_argument("--fit-params", choices=("auto", "never"), default="auto", help="run llama-fit-params for the Memory page's projection: auto (skips it while VRAM is within fit_headroom_mib of the OS budget) or never")
 	ap.add_argument("--window", choices=list(WINDOWS), default="5m", help="initial history window")
 	ap.add_argument("--router", default=os.environ.get("LLMTOP_ROUTER") or None, metavar="URL", help="llama-server URL (default: find it; env LLMTOP_ROUTER)")
 	ap.add_argument("--log-dir", default=os.environ.get("LLMTOP_LOG_DIR") or None, metavar="DIR", help="directory of llama-server logs (env LLMTOP_LOG_DIR)")
@@ -592,6 +593,7 @@ def main():
 	user_thresholds = set()
 	cfg = dict(state.CFG, router=args.router, log_dir=args.log_dir, router_log=args.router_log, state_dir=args.state_dir,
 		api_key=args.api_key, gpu=args.gpu, hz=args.hz, history_hours=args.history_hours, spill_mib=args.spill_mib,
+		fit_params=args.fit_params, plan=args.plan is not None,
 		persist=not (args.no_persist or args.once or args.plan is not None or args.check),
 		calibrate=not (args.no_persist or args.plan is not None or args.check),
 		user_thresholds=user_thresholds)

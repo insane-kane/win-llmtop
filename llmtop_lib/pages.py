@@ -827,7 +827,8 @@ def memory(c, snap, view, W, H):
 	if m["verified"]:
 		out.append("%s  ✓ weights, KV and state agree with llama.cpp's own projection (llama-fit-params, within 3%%)%s" % (C.grey, C.reset))
 	elif not m["fit"]:
-		out.append("%s  ▲ llama-fit-params gave no projection: weights, KV and state come from the GGUF and the flags alone%s" % (C.byellow, C.reset))
+		reason = c.mem.get(name, {}).get("fit_skipped") or "llama-fit-params gave no projection"
+		out.append("%s  ▲ %s: weights, KV and state come from the GGUF and the flags alone%s" % (C.byellow, reason, C.reset))
 	out += ["%s  ▲ %s%s" % (C.byellow, ch, C.reset) for ch in m["checks"]]
 	out += ["%s  ▲ assumed: %s%s" % (C.byellow, a, C.reset) for a in m["assumed"]]
 	cal = c.calib.get(c.calib_key(entry["key"]))

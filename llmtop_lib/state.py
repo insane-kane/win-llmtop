@@ -33,6 +33,9 @@ CFG = {
 	"persist": True,
 	"calibrate": True,  # save the learned per-configuration VRAM overhead
 	"spill_mib": 256,  # shared GPU memory held by llama-server before it counts as an overflow
+	"fit_params": "auto",  # run llama-fit-params for the projection: auto (skipped near the budget) or never
+	"plan": False,  # --plan is set: an explicit request, so auto runs it regardless of headroom
+	"fit_headroom_mib": 256,  # auto skips llama-fit-params while resident VRAM is within this of the OS budget
 	"burst_mib": 128,  # rise in shared GPU memory within burst_window_s that raises an alert
 	"avail_warn": 4096,
 	"avail_crit": 2048,
@@ -1667,8 +1670,9 @@ class Collector:
 			if n_slots:
 				key_flags["n_slots"] = n_slots
 		key = json.dumps(key_flags, sort_keys=True)
-		if self.mem.get(preset, {}).get("key") == key:
-			return
+		cur = self.mem.get(preset, {})
+		if cur.get("key") == key and not (cur.get("state") == "ready" and cur.get("retry_at") is not None and time.time() >= cur["retry_at"]):
+			return  # same configuration; a fit skipped for headroom is retried after its retry_at
 		self.mem[preset] = {"key": key, "state": "pending"}
 		threading.Thread(target=self.map_job, args=(preset, flags, key), daemon=True).start()
 
@@ -1711,9 +1715,17 @@ class Collector:
 			if t and t.is_alive() and t != threading.current_thread():
 				t.join()
 			fit_key = self._fit_key(exe, flags)
+			fit, fit_skipped, retry_at = None, None, None
 			if fit_key in self.fit_cache:
 				fit = self.fit_cache[fit_key]  # a cached projection
-			else:
+			elif self.cfg["fit_params"] == "never":
+				fit_skipped = "llama-fit-params is off (--fit-params never)"
+			elif not self.cfg["plan"]:
+				g = (self.last or {}).get("gpu") or {}  # starting the GPU backend needs VRAM the card may not have
+				if g.get("budget", 0) > 0 and g["budget"] - g["ded"] < self.cfg["fit_headroom_mib"]:
+					fit_skipped = "llama-fit-params skipped: resident VRAM is within %d MiB of the OS budget; retrying in 60 s" % self.cfg["fit_headroom_mib"]
+					retry_at = time.time() + 60
+			if fit is None and fit_skipped is None:
 				fit = model.fit_projection(exe, flags)
 				if fit_key is not None and fit is not None:  # a failed run (no projection, a timeout) is retried on the next load, not cached
 					with self._fit_lock:
@@ -1727,7 +1739,10 @@ class Collector:
 								pass
 			n_slots = self.rate.get(preset, {}).get("p", {}).get("n_slots")
 			map_res = model.analyze(flags, fit, model.server_defaults(exe), n_slots=n_slots)
-			self.mem[preset] = {"key": key, "state": "ready", "map": map_res, "at": time.time()}
+			entry = {"key": key, "state": "ready", "map": map_res, "at": time.time(), "fit_skipped": fit_skipped}
+			if retry_at is not None:
+				entry["retry_at"] = retry_at
+			self.mem[preset] = entry
 		except Exception as e:
 			self.mem[preset] = {"key": key, "state": "error", "error": "%s: %s" % (type(e).__name__, e)}
 

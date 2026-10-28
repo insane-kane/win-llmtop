@@ -1,6 +1,6 @@
 # Troubleshooting win-llmtop
 
-**Contents:** [32-bit Python or older Python (`windows FAIL`)](#32-bit-python-or-older-python) · [No GPU counters or adapter not matched (`gpu FAIL`)](#no-gpu-counters-or-adapter-not-matched) · [No server found or unreachable (`server FAIL`)](#no-server-found-or-server-unreachable) · [Several llama-servers running](#several-llama-servers-running) · ["llama-server 0 MiB", a missing RAM row, or "no memory map"](#llama-server-0-mib-a-missing-ram-row-or-no-memory-map) · [`/slots` endpoint is off (`HTTP 404` / `HTTP 501`)](#slots-endpoint-is-off) · [Server or `/slots` authentication error (`HTTP 401` / `HTTP 403`)](#server-or-slots-authentication-error) · [Missing per-model log, unrecognised format or missing timestamps](#missing-per-model-log-unrecognised-format-or-missing-timestamps) · [Router log not found](#router-log-not-found) · [State folder not writable (`state FAIL`)](#state-folder-not-writable-or-unavailable) · [`llama-fit-params` not found](#llama-fit-params-not-found) · [Helper programs and server paths are off](#helper-programs-and-server-paths-are-off) · [A reported file path was ignored](#a-reported-file-path-was-ignored) · [Informational notices](#informational-notices) · [Unknown threshold or collector error](#unknown-threshold-or-collector-error) · [Garbled display or boxes in the charts](#garbled-display-or-boxes-in-the-charts)
+**Contents:** [32-bit Python or older Python (`windows FAIL`)](#32-bit-python-or-older-python) · [No GPU counters or adapter not matched (`gpu FAIL`)](#no-gpu-counters-or-adapter-not-matched) · [No server found or unreachable (`server FAIL`)](#no-server-found-or-server-unreachable) · [Several llama-servers running](#several-llama-servers-running) · ["llama-server 0 MiB", a missing RAM row, or "no memory map"](#llama-server-0-mib-a-missing-ram-row-or-no-memory-map) · [`/slots` endpoint is off (`HTTP 404` / `HTTP 501`)](#slots-endpoint-is-off) · [`unexpected /slots reply`](#unexpected-slots-reply) · [Server or `/slots` authentication error (`HTTP 401` / `HTTP 403`)](#server-or-slots-authentication-error) · [Missing per-model log, unrecognised format or missing timestamps](#missing-per-model-log-unrecognised-format-or-missing-timestamps) · [Router log not found](#router-log-not-found) · [State folder not writable (`state FAIL`)](#state-folder-not-writable-or-unavailable) · [`llama-fit-params` not found](#llama-fit-params-not-found) · [Helper programs and server paths are off](#helper-programs-and-server-paths-are-off) · [`llama-fit-params` skipped or off (Memory page)](#llama-fit-params-skipped-or-off-memory-page) · [A reported file path was ignored](#a-reported-file-path-was-ignored) · [Informational notices](#informational-notices) · [Unknown threshold or collector error](#unknown-threshold-or-collector-error) · [Garbled display or boxes in the charts](#garbled-display-or-boxes-in-the-charts)
 
 Each entry lists the exact message printed by `win-llmtop` or `win-llmtop --check` (see [`usage.md`](usage.md#first-run)), its cause, and how to fix it. Every command-line option links to [`llmtop.1.md#options`](llmtop.1.md#options).
 
@@ -126,16 +126,32 @@ In both cases the model still appears in the preset list and `m` still cycles ov
 
 **Symptom:**
 
-- An alert warns:
+- An info alert:
 	```text
-	/slots for <preset> returned HTTP 404: the server's /slots endpoint is off (start it with --slots)
+	/slots for <preset> returned HTTP 404: the server's /slots endpoint is off (it is on unless the server was started with --no-slots)
 	```
 	(or `HTTP 501`).
 - `win-llmtop --check` shows `/slots error: HTTP 404` on the `server` line, and the **Live** page preset section shows `slot data unavailable: HTTP 404`.
 
-**Cause:** `llama-server` was started without the `--slots` flag, so it disables the `/slots` endpoint that reports in-flight prefill/decode progress, ETA and live tokens/s.
+**Cause:** The `/slots` endpoint is on by default in `llama-server` (build b11669). `HTTP 404` or `HTTP 501` means the server was started with `--no-slots`, which disables the endpoint that reports in-flight prefill/decode progress, ETA and live tokens/s.
 
-**Fix:** Add `--slots` to your `llama-server` command line (or to each preset's arguments in router mode) and restart `llama-server`. See [`usage.md#live-slot-telemetry`](usage.md#live-slot-telemetry).
+**Fix:** Remove `--no-slots` from your `llama-server` command line (or from each preset's arguments in router mode) and restart `llama-server`. See [`usage.md#live-slot-telemetry`](usage.md#live-slot-telemetry).
+
+---
+
+## `unexpected /slots reply`
+
+**Symptom:**
+
+- An info alert:
+	```text
+	/slots for <preset> returned unexpected /slots reply
+	```
+- The **Live** page preset section shows `slot data unavailable: unexpected /slots reply`, and `win-llmtop --check` shows `/slots error: unexpected /slots reply` on the `server` line.
+
+**Cause:** The `/slots` endpoint answered, but its reply was not a list of slot objects. This usually means the watched URL is not the intended `llama-server` — a proxy or a different program is listening on the port, or the server is a different build whose `/slots` reply changed shape.
+
+**Fix:** Verify the watched URL is the intended `llama-server`, passing [`--router`](llmtop.1.md#options) `<URL>` to be explicit. `win-llmtop` reports the error and keeps sampling rather than stopping.
 
 ---
 
@@ -233,7 +249,7 @@ In both cases the model still appears in the preset list and `m` still cycles ov
 
 - `win-llmtop --check` prints:
 	```text
-	llama-fit-params   --    not found
+	llama-fit-params   --    not found next to the running server (looked in <dir>)
 	```
 
 **Cause:** `llama-fit-params.exe` is not in the same folder as the running `llama-server.exe` that serves the watched URL. `win-llmtop` looks only there: not on `PATH`, not in the current folder, and not in any folder a server reports. Without it, `win-llmtop` still derives model weights, KV cache and recurrent state from the GGUF header, but cannot cross-check them against `llama.cpp`'s own projection or show `llama.cpp`'s compute-buffer figure.
@@ -269,6 +285,28 @@ In both cases the model still appears in the preset list and `m` still cycles ov
 The server is still monitored over HTTP; only the memory map, the defaults read from `--help`, the projection and the log paths a server reports are unavailable.
 
 **Fix:** Run `win-llmtop` on the machine that runs `llama-server`, give [`--router`](llmtop.1.md#options) a loopback URL, and run the server as a plain `llama-server` process (or `llama-server-<suffix>`) from your own account. Per-model logs can still be given with [`--log-dir`](llmtop.1.md#options) and the router log with [`--router-log`](llmtop.1.md#options), which are never checked.
+
+---
+
+## `llama-fit-params` skipped or off (Memory page)
+
+**Symptom:**
+
+- The **Memory** page shows a yellow line:
+	```text
+	▲ <reason>: weights, KV and state come from the GGUF and the flags alone
+	```
+	where `<reason>` is `llama-fit-params skipped: resident VRAM is within 256 MiB of the OS budget; retrying in 60 s` (the default [`--fit-params`](llmtop.1.md#options) `auto`) or `llama-fit-params is off (--fit-params never)` (when [`--fit-params`](llmtop.1.md#options) `never` was passed).
+
+**Cause:**
+
+- `llama-fit-params skipped: ...`: with [`--fit-params`](llmtop.1.md#options) `auto`, `win-llmtop` skips the helper while the resident VRAM is within `fit_headroom_mib` (`256` MiB by default, set with [`--threshold`](llmtop.1.md#options) `fit_headroom_mib=N`) of the OS budget, because starting the helper's GPU backend uses VRAM the card may not have; it retries after 60 s.
+- `llama-fit-params is off (--fit-params never)`: [`--fit-params`](llmtop.1.md#options) `never` was passed, so the helper is never run.
+
+**Fix:**
+
+- The `skipped` case is transient: the helper runs automatically once the VRAM headroom clears, and [`--plan`](llmtop.1.md#options) always runs it. No action is needed.
+- The `off` case is intentional: remove `--fit-params never` from your command line unless you deliberately want to skip the helper.
 
 ---
 
@@ -321,7 +359,7 @@ The server is still monitored over HTTP; only the memory map, the defaults read 
 
 **Cause:** [`--threshold`](llmtop.1.md#options) `NAME=VALUE` was given an unknown key or a non-numeric value, or an unexpected runtime exception occurred during a collector tick.
 
-**Fix:** Check the valid threshold names (`spill_mib`, `burst_mib`, `avail_warn`, `avail_crit`, `commit_warn`, `commit_crit`, `hold_s`, `clear_s`, `near_budget_mib`, `at_budget_mib`, `idle_headroom_mib`, `rival_gpu_pct`, `card_full_pct`, `pagefile_pct`, `ws_drop_mib`, `burst_window_s`, `load_grace_s`, `hz`, `history_hours`) documented in [`llmtop.1.md#alerts`](llmtop.1.md#alerts).
+**Fix:** Check the valid threshold names (`spill_mib`, `burst_mib`, `avail_warn`, `avail_crit`, `commit_warn`, `commit_crit`, `hold_s`, `clear_s`, `near_budget_mib`, `at_budget_mib`, `idle_headroom_mib`, `fit_headroom_mib`, `rival_gpu_pct`, `card_full_pct`, `pagefile_pct`, `ws_drop_mib`, `burst_window_s`, `load_grace_s`, `prompt_gap_s`, `hz`, `history_hours`) documented in [`llmtop.1.md#alerts`](llmtop.1.md#alerts).
 
 ---
 

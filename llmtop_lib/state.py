@@ -546,7 +546,7 @@ class Alerts:
 			err = p.get("slot_error")
 			if err:
 				fix = (("pass --api-key or set LLAMA_API_KEY" if sent else "pass --router with --api-key or LLAMA_API_KEY") if err in ("HTTP 401", "HTTP 403") else
-					"the server's /slots endpoint is off (start it with --slots)" if err in ("HTTP 404", "HTTP 501") else None)
+					"the server's /slots endpoint is off (it is on unless the server was started with --no-slots)" if err in ("HTTP 404", "HTTP 501") else None)
 				self.flag("slots:" + preset, "info", headline("/slots for %s returned %s" % (preset, err)), now, detail=fix)
 			else:
 				self.active.pop("slots:" + preset, None)
@@ -684,7 +684,14 @@ class Collector:
 		if self.calib_file and os.path.isfile(self.calib_file):
 			try:
 				with open(self.calib_file, encoding="utf-8") as f:
-					self.calib = {k: v for k, v in json.load(f).items() if isinstance(v, dict) and v.get("v") == 4}  # older files held baselines learned under a headroom test on resident memory alone
+					raw = json.load(f)
+				if isinstance(raw, dict):
+					for k, v in raw.items():
+						if isinstance(v, dict) and v.get("v") == 4:
+							if v.get("spilled") or (v.get("overhead") is not None and v.get("overhead") < 0):
+								v.pop("overhead", None)
+								v.pop("spilled", None)
+							self.calib[k] = v
 			except (OSError, ValueError):
 				pass
 		self.fit_cache_file = os.path.join(self.state_dir, "fit-cache.json") if self.state_dir and not self.state_error else None
@@ -1484,10 +1491,17 @@ class Collector:
 			done = s.get("n_prompt_tokens_processed", 0)
 			todo = max(0, n_prompt - cached)
 			task = s.get("id_task")
-			r = self.rate.setdefault((preset, s_id), {"hist": deque(maxlen=64), "task": None, "t0": now, "dec": NAN, "pre": NAN})
+			r = self.rate.setdefault((preset, s_id), {
+				"hist": deque(maxlen=64), "task": None, "t0": now, "dec": NAN, "pre": NAN,
+				"prompt_max": 0, "prompt_grown": False, "sample_t": now,
+			})
 			if task != r["task"]:
-				r.update(task=task, t0=now, dec=NAN, pre=NAN)
+				r.update(task=task, t0=now, dec=NAN, pre=NAN, prompt_max=n_prompt, prompt_grown=False)
 				r["hist"].clear()
+			elif n_prompt > r.get("prompt_max", 0):
+				r["prompt_grown"] = True
+				r["prompt_max"] = n_prompt
+			r["sample_t"] = now
 			r["hist"].append((now, done, decoded))
 			pts = r.setdefault("pre_pts", deque(maxlen=8))
 			if task != r.get("pre_task"):
@@ -1505,9 +1519,9 @@ class Collector:
 					r["dec"] = dec
 				if decoded == 0 and pre == pre:
 					r["pre"] = pre
-			phase = "idle" if not proc else "prefill" if decoded == 0 and done < todo else "starting" if decoded == 0 else "decode"
+			phase = "idle" if not proc else "prefill" if decoded == 0 else "decode"
 			kv = cached + done + decoded if proc else (cached + done + decoded if (cached or done) else (n_prompt + decoded))
-			eta = (todo - done) / r["pre"] if phase == "prefill" and r["pre"] == r["pre"] and r["pre"] > 0 else NAN
+			eta = (todo - done) / r["pre"] if phase == "prefill" and not r.get("prompt_grown") and r["pre"] == r["pre"] and r["pre"] > 0 else NAN
 			elapsed = now - r["t0"] if proc else NAN
 			r["active"] = proc
 			slot_records.append({
@@ -1516,6 +1530,8 @@ class Collector:
 				"decoded": decoded, "remain": nt.get("n_remain", 0), "nt": nt,
 				"phase": phase, "kv": kv, "rate_dec": r["dec"] if proc else NAN,
 				"rate_pre": r["pre"] if proc else NAN, "eta": eta, "elapsed": elapsed,
+				"prompt_grown": r.get("prompt_grown", False),
+				"sample_t": r.get("sample_t", now),
 			})
 		proc_slots = [sr for sr in slot_records if sr["proc"]]
 		if proc_slots:
@@ -1539,11 +1555,15 @@ class Collector:
 				"n_prompt": primary["n_prompt"], "cached": primary["cached"], "done": primary["done"],
 				"todo": primary["todo"], "decoded": primary["decoded"], "remain": primary["remain"],
 				"params": ps.get("params") or {}, "speculative": ps.get("speculative", False),
+				"prompt_grown": primary.get("prompt_grown", False),
+				"sample_t": primary.get("sample_t", now),
 			},
 			"slot_error": None, "phase": primary["phase"], "kv": p_kv,
 			"rate_dec": primary["rate_dec"], "rate_pre": primary["rate_pre"], "eta": primary["eta"],
 			"elapsed": primary["elapsed"], "n_slots": len(slots), "n_busy": len(proc_slots),
 			"all_tokens": all_tokens,
+			"prompt_grown": primary.get("prompt_grown", False),
+			"sample_t": primary.get("sample_t", now),
 		}
 		preset_r = self.rate.setdefault(preset, {})
 		preset_r["active"] = bool(proc_slots)
@@ -1621,9 +1641,10 @@ class Collector:
 			k, pids = self.calib_key(e["key"]), tuple(ll["pids"])
 			cur = self.calib.get(k)
 			ent, changed = dict(cur) if cur else {"v": 4}, False
-			if cur is None or self.calib_pid.get(k) != pids or overhead > cur["overhead"] + 16:
-				ent.update(overhead=round(overhead), at=snap["t"], preset=preset, spilled=ll["over"] >= self.cfg["spill_mib"])
-				self.calib_pid[k], changed = pids, True
+			if ll.get("age", 0.0) >= self.cfg["load_grace_s"] and ll["ded"] >= rows_total and ll["over"] < self.cfg["spill_mib"]:
+				if cur is None or cur.get("overhead") is None or self.calib_pid.get(k) != pids or overhead > cur["overhead"] + 16:
+					ent.update(overhead=round(overhead), at=snap["t"], preset=preset, spilled=False)
+					self.calib_pid[k], changed = pids, True
 			if g and ll["age"] >= self.cfg["load_grace_s"] / 3 and ll["ded"] + ll["shr"] <= g["budget"] - self.cfg["idle_headroom_mib"]:  # resident plus shared fits with room to spare: nothing could have been demoted
 				idle = round(ll["shr"])
 				if ent.get("idle_shared") is None or idle < ent["idle_shared"] - 16:

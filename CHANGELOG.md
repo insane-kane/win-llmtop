@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--version` prints the version, copyright and licence.
+- `--fit-params auto|never`: `auto` (the default) skips `llama-fit-params` while resident VRAM is within `fit_headroom_mib` (256 MiB) of the OS budget and retries after 60 s; `never` turns it off. `--plan` always runs it.
+- `NO_COLOR` (any non-empty value) turns colour off, like `--no-color`.
+- A `slots` line on the Live page for a server with more than one slot: how many are busy, which one is shown, and the tokens in a shared cache.
+- `tests/README.md` on how the tests are written, and `python -I tests/run_all.py --quiet`, which prints only failing suites.
+
+### Changed
+
+- Every server slot counts, not just the first: a request on any slot shows on the Live page and counts as busy for the alerts. A `llama-server` started with `--parallel` auto has 4 slots. The memory projection uses the reported slot count.
+- `llama-fit-params` runs once per configuration; its projection is cached in `fit-cache.json` in the state folder. It allocates no model memory, but starting the GPU backend briefly uses some VRAM.
+- Charts of 1 h and longer are drawn from 10 s and 60 s summaries (a 24 h chart now takes about 0.1 ms instead of 15 ms), and prompt grouping reruns only when a request arrives (a full history went from about 390 ms to 8 ms per frame).
+- `requests.jsonl` keeps the newest 50,000 requests (trimmed at start-up once it holds twice that), and win-llmtop holds at most 60,000 in memory.
+- Out-of-range `--hz`, `--history-hours`, `--width` and `--spill-mib` values exit with status 2; a bad `--threshold` value or an unknown `--plan` preset exits with status 1 and a message instead of a traceback.
+
+### Fixed
+
+- No network call or helper run can stall the screen: each request has a total deadline (1 s for `/models`, 0.5 s for `/slots`) and an 8 MiB reply cap, discovery tries one candidate per tick, and `llama-server --help` runs in the background.
+- A log that `llama-server` rewrites is read from its start even when the new file has already grown past the old one.
+- Prompt grouping's compaction rule honours `--threshold prompt_gap_s`.
+- `calibration.json` is written atomically, so a crash mid-write no longer loses it.
+- A corrupt GGUF header stops after 256 MiB instead of reading the whole model file.
+- A machine without a page file no longer shows an empty one; the address-space walk opens `llama-server` with less access.
+- An unexpected `/slots` reply is reported as a slot error instead of stopping the collector.
+
 ## [0.3.1] - 2026-10-27
 
 ### Security

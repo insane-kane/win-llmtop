@@ -60,7 +60,7 @@ See the [full installation guide (`docs/install.md`)](https://github.com/insane-
 `win-llmtop` works with zero configuration, and unlocks deeper telemetry when `llama-server` exposes logs and slots:
 
 - **Per-model log file with timestamps** — pass `--log-file` and `--log-timestamps` to `llama-server` (win-llmtop reads the path from its command line; `--log-dir` only when it can't) for request history, cache hit rates, draft acceptance and wall-clock times ([usage guide](https://github.com/insane-kane/win-llmtop/blob/main/docs/usage.md#per-model-logs-and-timestamps)).
-- **Live `/slots` telemetry** — start `llama-server` with `--slots` to see live prefill/decode progress, current tokens/s, ETA and context fill ([usage guide](https://github.com/insane-kane/win-llmtop/blob/main/docs/usage.md#live-slot-telemetry)).
+- **Live `/slots` telemetry** — on by default in `llama-server` (build b11669; `--no-slots` turns it off), showing live prefill/decode progress, current tokens/s, ETA and context fill ([usage guide](https://github.com/insane-kane/win-llmtop/blob/main/docs/usage.md#live-slot-telemetry)).
 - **Router event log** — pass `--router-log` or `--log-dir` so `win-llmtop` can tail router model loads, request queueing and preset evictions ([usage guide](https://github.com/insane-kane/win-llmtop/blob/main/docs/usage.md#router-event-log)).
 
 ## Common options

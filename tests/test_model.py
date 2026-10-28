@@ -367,6 +367,24 @@ class TestModelAnalysis(unittest.TestCase):
 		self.assertAlmostEqual(analysis["rec"]["total"], 4 * one_slot_rec, places=6)
 		self.assertIn("--parallel is auto: 4 slots are assumed", analysis["assumed"])
 
+	def test_memory_rows_negative_overhead_adds_no_row(self):
+		m = {
+			"groups": {"attention": {"gpu": 100.0, "cpu": 0.0}},
+			"kv": {"layers": {"full": 1, "swa": 0}, "gpu": 50.0, "mtp": 0.0, "per_token": 1024},
+			"ctx": 2048, "cache_k": "q8_0", "cache_v": "q8_0",
+			"rec": {"total": 0.0}, "mtp_mib": 0.0,
+			"draft": None, "fit": None,
+		}
+		rows_neg = model.memory_rows(m, overhead=-100)
+		self.assertFalse(any("runtime overhead" in r[0] for r in rows_neg))
+		self.assertFalse(any(r[1] < 0 for r in rows_neg))
+		rows_zero = model.memory_rows(m, overhead=0)
+		self.assertFalse(any("runtime overhead" in r[0] for r in rows_zero))
+		rows_pos = model.memory_rows(m, overhead=150)
+		overhead_rows = [r for r in rows_pos if "runtime overhead" in r[0]]
+		self.assertEqual(len(overhead_rows), 1)
+		self.assertEqual(overhead_rows[0][1], 150)
+
 
 CASES = [
 	("small_model_attn_kv", "test_small_model_attn_kv"),
@@ -380,6 +398,7 @@ CASES = [
 	("corrupt_header_read_is_capped", "test_corrupt_header_read_is_capped"),
 	("analyze_parallel_auto_with_reported_slots", "test_analyze_parallel_auto_with_reported_slots"),
 	("analyze_parallel_auto_without_reported_slots", "test_analyze_parallel_auto_without_reported_slots"),
+	("memory_rows_negative_overhead_adds_no_row", "test_memory_rows_negative_overhead_adds_no_row"),
 ]
 
 

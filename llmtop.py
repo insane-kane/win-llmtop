@@ -292,7 +292,8 @@ def plan(c, view, which, width):
 		if e.get("state") != "ready":
 			print(ui.safe("%-26s %s" % (name, e.get("error", "no projection"))))
 			continue
-		cal = c.calib.get(c.calib_key(e["key"]))
+		cal = c.calib.get(c.calib_key(e["key"])) or {}
+		cal = cal if cal.get("overhead") is not None else None  # an entry may hold only the shared-memory baseline
 		rows = model.memory_rows(e["map"], None, cal["overhead"] if cal else None)
 		by = lambda pred, rows=rows: sum(r[1] for r in rows if pred(r[0]))
 		total = sum(r[1] for r in rows)

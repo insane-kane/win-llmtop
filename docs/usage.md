@@ -19,6 +19,7 @@ It inspects the prerequisites and every data source it can reach, prints one sta
 | Line | What it checks |
 | :--- | :--- |
 | `windows` | The Windows build and the Python version and bitness; `ok` on 64-bit Windows |
+| `terminal` | The console kind and the chart style it will use (informational; does not affect the exit code) |
 | `gpu` | The DXGI adapters (name, VRAM, the OS budget), which adapter it is watching ([`--gpu`](llmtop.1.md#options)), and whether the PDH GPU counters are present (or `--  no GPU adapters (CPU-only)` on machines without a GPU) |
 | `processes` | The `llama-server` processes it found (PID and executable path) |
 | `server` | The URL it uses ([`--router`](llmtop.1.md#options)) and how it found it, the mode (`router` or `single`), how many models the server reports, and whether `/models` and `/slots` are reachable ([`--api-key`](llmtop.1.md#options)) |
@@ -92,8 +93,8 @@ Pass `--log-file` (in router mode, each preset's `log-file`) and `--log-timestam
 
 `llama-server` exposes `/slots` by default at build b11669 (`--no-slots` turns it off). Ensure `/slots` is enabled (and pass [`--api-key`](llmtop.1.md#options) or set `LLMTOP_API_KEY` / `LLAMA_API_KEY` if the server requires authentication). The key is sent only to the URL you give with [`--router`](llmtop.1.md#options) or to one read from a running `llama-server`'s command line; the default address `http://127.0.0.1:8080` is probed without it, so for a server that requires a key and does not show up in the process list, pass `--router` as well (see [`llmtop.1.md#discovery-the-api-key-and-trust`](llmtop.1.md#discovery-the-api-key-and-trust)).
 
-- **What it unlocks:** live in-flight request progress from the server's `/slots` endpoint — whether a slot is in `PREFILL` or `DECODE`, how many prompt tokens have been processed, the prefill ETA, live tokens/s, and current KV cache fill. On servers with multiple parallel slots (`-np` / `--parallel N`), `win-llmtop` monitors all slots, summarizes concurrency on its own line (`slots: K of N busy · showing slot S`), and shows total tokens across all slots when a unified KV cache is shared.
-- **What you lose without `/slots` (or with `--no-slots`):** `/slots` is disabled (`HTTP 404` or `HTTP 501`), so `win-llmtop` still shows GPU memory, host RAM and finished requests from logs, but cannot show the currently running request and raises a warning to start the server with `/slots` (or remove `--no-slots`).
+- **What it unlocks:** live in-flight request progress from the server's `/slots` endpoint — whether a slot is in `PREFILL` or `DECODE`, how many prompt tokens have been processed, the prefill ETA, live tokens/s, and current KV cache fill. On servers with multiple parallel slots (`-np` / `--parallel N`), `win-llmtop` monitors all slots, summarizes concurrency on its own line (`slots    K of N busy · showing slot S`), and shows total tokens across all slots when a unified KV cache is shared.
+- **What you lose without `/slots` (or with `--no-slots`):** `/slots` is disabled (`HTTP 404` or `HTTP 501`), so `win-llmtop` still shows GPU memory, host RAM and finished requests from logs, but cannot show the currently running request and raises an info alert (the endpoint is on by default; check the server was not started with `--no-slots`).
 
 ### Router event log
 
@@ -118,5 +119,6 @@ By default, `win-llmtop` stores persisted history in `%LOCALAPPDATA%\win-llmtop\
 - `samples-<date>.jsonl` — one telemetry sample every 5 s (covering [`--history-hours`](llmtop.1.md#options) in memory) plus alert transitions ([`--spill-mib`](llmtop.1.md#options), [`--threshold`](llmtop.1.md#options)), retained for 14 days so trend charts and the event list span restarts.
 - `requests.jsonl` — finished request records, preserved across restarts because `llama-server` truncates and rewrites a preset's log file every time that model loads.
 - `calibration.json` — the per-configuration VRAM overhead and idle shared-memory baseline learned when a single model is resident.
+- `fit-cache.json` — the per-configuration `llama-fit-params` projection cache, so the helper is not re-run for a configuration it has already projected.
 
 Pass [`--no-persist`](llmtop.1.md#options) to disable all disk writes (persistence is also disabled automatically for [`--check`](llmtop.1.md#options), [`--once`](llmtop.1.md#options) and [`--plan`](llmtop.1.md#options)). Read-only runs still replay whatever history is already present in the state folder.

@@ -65,7 +65,7 @@ Notices are grey `· ` lines that say why a figure is missing or a source is abs
 | Page | Content |
 | :--- | :--- |
 | **Live** | Alerts; GPU (VRAM bar with the OS budget marked, llama-server resident and shared memory, engine load, other apps' VRAM), RAM (in use, commit, file cache, page file) and CPU (load, llama-server cores, clock, processor queue) with framed trend charts; per loaded preset: phase (with slot and busy counts on multi-slot servers), prefill or decode progress and live t/s, context fill (with total tokens across slots when cache is unified), last draft acceptance, charts; recent turns or recent prompts (`t` toggles; `▸` marks the first turn of each prompt) and events. |
-| **Memory** | For one preset (`m` cycles presets, loaded or not): VRAM by component against the OS budget, with what would fit; llama-server's own RAM as a short table (working set, commit by kind, mapped files, heap against the `cache-ram` and checkpoint ceilings); layer overview. |
+| **Memory** | For one preset (`m` cycles presets, loaded or not): VRAM by component against the OS budget, with what would fit; llama-server's own RAM as a short table (working set, commit by kind, mapped files, heap against the `cache-ram` and checkpoint ceilings); layer overview. Each category keeps one colour. |
 | **System** | CPU (model, cores and threads, per-core load, L1/L2/L3 cache topology, load and clock trends); system RAM by consumer (llama-server, other processes, kernel, file cache, free) with the largest working sets; llama-server working set and private commit; page file size, use and peak with the commit limit; RAM and paging trends. |
 | **Requests** | Per preset: volume (prompts, turns, busy time, input/new/cached/output tokens, cache hit, loads with mean load time, issues), speed (prefill and decode median, slow 10% and sample count `n`, draft acceptance and mean length), prefill and decode t/s by context depth (`<8k`, `8–32k`, `32–64k`, `64k+`; coloured by rank within each column, green fastest and red slowest), per-turn charts for qualifying turns, and every prompt newest first with its cache hit and draft acceptance (`m` filters by preset, `t` toggles nested turns). |
 | **Events** | Alerts raised and cleared, model loads, queueing, evictions, prompt-cache misses, request errors, truncation. Each event is a short headline; `f` filters by level and `d` toggles the detail line(s) under each event (the comparisons, thresholds and deductions the headline leaves out). |
@@ -121,7 +121,7 @@ llmtop shows what it can measure or read, and marks what it derives. It never st
 | KV cache and recurrent state size | tensor shapes and flags | derived, checked against `llama-fit-params` |
 | MTP head KV | derived like the KV cache | estimate, marked `est.`, not checked |
 | Compute buffers, host figures | `llama-fit-params` (run with `-lv 4`, from the folder of the running `llama-server` that serves the watched URL; it allocates no model memory, but starting the GPU backend briefly uses some VRAM, so win-llmtop runs it once per configuration (cached) and skips it while VRAM is within `fit_headroom_mib` of the OS budget; `--fit-params never` turns it off) | reported by llama.cpp |
-| Overhead on the Memory page | resident VRAM minus the projected rows, kept per configuration | measured on a load |
+| Overhead on the Memory page | resident VRAM minus the projected rows, kept per configuration (learned only once the model has settled, is fully resident and not spilled) | measured on a load |
 | Shared memory when the model became resident | the lowest shared figure of the llama-server process while resident VRAM is at least 90% of the projected rows | measured, per process |
 | CPU-side buffer baseline | the lowest shared GPU memory seen on an earlier load of the same configuration while resident plus shared memory was at least 1 GiB under the budget; until then llama.cpp's host projection, labelled unverified | measured or projected |
 | Alerts | thresholds applied to the figures above | thresholds in `CFG`; messages state values |
@@ -194,7 +194,7 @@ With `--check`, `win-llmtop` exits `0` when the server is reachable and either G
 | `llmtop_lib/log.py`, `prompts.py` | Request assembler, log tailing, router events, session start times, and prompt grouping |
 | `llmtop_lib/state.py` | Collector, time series, persistence, alert rules |
 | `llmtop_lib/ui.py`, `pages.py` | Drawing primitives and the six pages |
-| `%LOCALAPPDATA%\win-llmtop\` (the state folder, `--state-dir`) | `samples-*.jsonl`, `requests.jsonl`, `calibration.json` |
+| `%LOCALAPPDATA%\win-llmtop\` (the state folder, `--state-dir`) | `samples-*.jsonl`, `requests.jsonl`, `calibration.json`, `fit-cache.json` |
 
 ## LIMITS
 - Which allocation or tensor is in shared GPU memory cannot be told from the counters; only how much.

@@ -412,8 +412,6 @@ def model_block(c, snap, view, preset, p, W, gh):
 		bits.append("KV %s/%s" % (flags["cache-type-k"], flags.get("cache-type-v", flags["cache-type-k"])))
 	if flags.get("spec-type") or flags.get("model-draft"):
 		bits.append("%s x%s" % (flags.get("spec-type", "draft"), flags.get("spec-draft-n-max", "?")))
-	if flags.get("reasoning-effort") or flags.get("reasoning"):
-		bits.append("reasoning %s" % flags.get("reasoning-effort", flags.get("reasoning")))
 	asm = c.follow.get(preset, (None, None))[1]
 	sess = asm.session() if asm else None
 	if sess and sess.get("wall"):
@@ -428,13 +426,28 @@ def model_block(c, snap, view, preset, p, W, gh):
 		out.append("  %s%s%s" % (C.grey, "slot data unavailable: %s" % err if err else "waiting for slot data…", C.reset))
 		return out
 	phase = p["phase"]
+	sample_t = s.get("sample_t", p.get("sample_t"))
+	stale = " · updated %ds ago" % int(snap["t"] - sample_t) if (sample_t is not None and snap["t"] - sample_t > 2.0) else ""
 	if phase == "prefill":
-		frac = s["done"] / max(1, s["todo"])
-		eta = "   ETA %s at this rate" % mmss(p["eta"]) if p["eta"] == p["eta"] else ""
-		out.append("  %sPREFILL%s  task %s, %s     %s / %s new tokens  %s %.0f%%   %s t/s%s" % (C.bgreen + C.bold, C.reset, s["task"], mmss(p["elapsed"]), tok(s["done"]), tok(s["todo"]), bar(frac, 24, C.bgreen), 100 * frac, rate(p["rate_pre"]).strip(), eta))
-	elif phase in ("starting", "decode"):
+		if s.get("prompt_grown", p.get("prompt_grown", False)):
+			so_far = s.get("done", 0) + s.get("cached", 0)
+			out.append("  %sPREFILL%s  task %s, %s     %s tokens so far     %s t/s%s" % (
+				C.bgreen + C.bold, C.reset, s["task"], mmss(p["elapsed"]),
+				tok(so_far), rate(p["rate_pre"]).strip(), stale))
+		else:
+			frac = s["done"] / max(1, s["todo"])
+			bw = 10 if W < 100 else 24
+			eta = "   ETA %s at this rate" % mmss(p["eta"]) if p["eta"] == p["eta"] else ""
+			out.append("  %sPREFILL%s  task %s, %s     %s / %s new tokens  %s %.0f%%   %s t/s%s%s" % (
+				C.bgreen + C.bold, C.reset, s["task"], mmss(p["elapsed"]),
+				tok(s["done"]), tok(s["todo"]), bar(frac, bw, C.bgreen), 100 * frac,
+				rate(p["rate_pre"]).strip(), eta, stale))
+	elif phase == "decode":
 		budget = s["decoded"] + s["remain"]
-		out.append("  %sDECODE%s   task %s, %s     %s tokens, %s t/s now     %s of the %s-token limit" % (C.bgreen + C.bold, C.reset, s["task"], mmss(p["elapsed"]), tok(s["decoded"]), rate(p["rate_dec"], 1).strip(), bar(s["decoded"] / max(1, budget), 10, C.cyan), tok(budget)))
+		out.append("  %sDECODE%s   task %s, %s     %s tokens, %s t/s now     %s of the %s-token limit%s" % (
+			C.bgreen + C.bold, C.reset, s["task"], mmss(p["elapsed"]), tok(s["decoded"]),
+			rate(p["rate_dec"], 1).strip(), bar(s["decoded"] / max(1, budget), 10, C.cyan),
+			tok(budget), stale))
 	else:
 		last = last_request(c, preset)
 		tail = ""
@@ -798,9 +811,60 @@ def host_lines(c, snap, name, m, loaded):
 	return out
 
 
-def vram_bar(g, rows, bw, pal):
+# Fixed colours for memory categories: each category keeps the same colour across all models and pages.
+# The KV cache, compute buffers, unattributed, and learned overhead each have a unique colour not used by any weights category.
+MEMORY_CATEGORY_COLORS = {
+	# Dedicated colours not used by any weights category
+	"KV cache": C.bcyan,
+	"compute buffers": C.byellow,
+	"unattributed": C.magenta,
+	"learned overhead": C.red,
+	"runtime overhead (learned)": C.red,
+	# Other non-weights categories
+	"recurrent state": C.green,
+	"MTP head weights": C.blue,
+	"MTP head KV": C.cyan,
+	"MTP head KV (est.)": C.cyan,
+	"draft model weights": C.bred,
+	# Weights categories
+	"attention": C.bgreen,
+	"FFN (dense)": C.blue,
+	"MoE experts": C.blue,
+	"shared expert": C.cyan,
+	"MoE router": C.bred,
+	"linear attention (SSM)": C.cyan,
+	"embeddings": C.bred,
+	"output head": C.yellow,
+	"norms and other": C.green,
+}
+for _cat in ("attention", "FFN (dense)", "MoE experts", "shared expert", "MoE router", "linear attention (SSM)", "embeddings", "output head", "norms and other"):
+	MEMORY_CATEGORY_COLORS["weights: " + _cat] = MEMORY_CATEGORY_COLORS[_cat]
+
+MEMORY_COLORS = MEMORY_CATEGORY_COLORS
+
+
+def memory_category(label):
+	"""Extract the category key from a memory row label."""
+	if label.startswith("weights: "):
+		return label[9:]
+	if label.startswith("KV cache"):
+		return "KV cache"
+	if label.startswith("MTP head KV"):
+		return "MTP head KV"
+	if label.startswith("runtime overhead"):
+		return "learned overhead"
+	return label
+
+
+def memory_color(label):
+	"""Colour for a memory category or row label, falling back to grey for unknown labels."""
+	cat = memory_category(label)
+	return MEMORY_COLORS.get(cat, MEMORY_COLORS.get(label, C.grey))
+
+
+def vram_bar(g, rows, bw, pal=None):
 	"""The Memory page's VRAM bar: scaled against dedicated VRAM, or against the OS budget when the adapter has no dedicated memory (UMA), like the Live page."""
-	parts = [(r[1], pal[i % len(pal)]) for i, r in enumerate(rows) if r[1] > 0]
+	parts = [(r[1], memory_color(r[0])) for r in rows if r[1] > 0]
 	if g.get("uma"):
 		return "  " + stack(parts, g["budget"], bw) + "  %s┃%s shared GPU memory (no dedicated VRAM) %s (DXGI)" % (C.bred, C.reset, gib(g["budget"]))
 	return "  " + stack(parts, g["vram"], bw, marker=g["budget"]) + "  %s┃%s OS budget %s (DXGI, as seen by llmtop)" % (C.bred, C.reset, gib(g["budget"]))
@@ -833,16 +897,15 @@ def memory(c, snap, view, W, H):
 	out += ["%s  ▲ %s%s" % (C.byellow, ch, C.reset) for ch in m["checks"]]
 	out += ["%s  ▲ assumed: %s%s" % (C.byellow, a, C.reset) for a in m["assumed"]]
 	cal = c.calib.get(c.calib_key(entry["key"]))
-	rows = model.memory_rows(m, measured, cal["overhead"] if cal and measured is None else None)
+	rows = model.memory_rows(m, measured, cal.get("overhead") if cal and measured is None else None)
 	est = sum(r[1] for r in rows if not r[0].startswith(("unattributed", "projection above")))
 	total = measured if measured is not None else est
-	pal = [C.bcyan, C.bgreen, C.byellow, C.magenta, C.blue, C.red, C.green, C.cyan, C.yellow, C.bred]
 	bw = max(30, min(100, W - 36))
-	out += ["", section("VRAM", W, "resident %s · shared %s" % (gib(ll["ded"]), gib(ll["shr"])) if on else "projected resident %s%s" % (gib(est), " (includes the overhead learned on an earlier load)" if cal else ", no overhead learned yet for this configuration"))]
+	out += ["", section("VRAM", W, "resident %s · shared %s" % (gib(ll["ded"]), gib(ll["shr"])) if on else "projected resident %s%s" % (gib(est), " (includes the overhead learned on an earlier load)" if cal and cal.get("overhead") is not None else ", no overhead learned yet for this configuration"))]
 	if g:
 		left = g["budget"] - total
 		held = sum(o["ded"] for o in snap["others"])
-		out.append(vram_bar(g, rows, bw, pal))
+		out.append(vram_bar(g, rows, bw))
 		kind = "resident" if on else "projected resident"
 		out.append("  %s%s %s %s the OS budget%s" % (C.bgreen if left >= c.cfg["near_budget_mib"] else C.byellow if left > 0 else C.bred, kind, gib(total), "leaves %s under" % mib(left) if left >= 0 else "is %s over" % mib(-left), C.reset))
 		growth = ll["shr"] - ll["floor"] if on and ll["floor_known"] else 0
@@ -882,8 +945,9 @@ def memory(c, snap, view, W, H):
 	if cal and cal.get("spilled") and not on:
 		out.append("%s  the learned overhead was measured while shared memory was above the threshold, so resident VRAM may have understated demand%s" % (C.grey, C.reset))
 	out.append("")
-	for i, (label, mib_, note) in enumerate(rows):
-		out.append("  %s■%s %s %9s MiB %5.1f%%  %s%s%s" % (pal[i % len(pal)], C.reset, pad(label, 30), num(mib_), 100 * mib_ / total if total else 0, C.grey, note, C.reset))
+	for label, mib_, note in rows:
+		col = memory_color(label)
+		out.append("  %s■%s %s %9s MiB %5.1f%%  %s%s%s" % (col, C.reset, pad(label, 30), num(mib_), 100 * mib_ / total if total else 0, C.grey, note, C.reset))
 	out += ["", section("HOST RAM", W, "llama-server pid %s, measured %s ago" % (ll["vm"]["pid"], ago(snap["t"] - ll["vm"]["at"])) if on and ll["vm"] else "projection")]
 	out += host_lines(c, snap, name, m, loaded)
 	cols = max(1, (W - 8) // 7)

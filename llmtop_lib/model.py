@@ -633,6 +633,6 @@ def memory_rows(m, measured=None, overhead=None):
 	if measured is not None:
 		gap = measured - sum(r[1] for r in rows)
 		rows.append(("unattributed" if gap >= 0 else "projection above resident", gap, "resident VRAM minus the rows above" if gap >= 0 else "the rows above exceed resident VRAM"))
-	elif overhead:
+	elif overhead is not None and overhead > 0:
 		rows.append(("runtime overhead (learned)", overhead, "resident VRAM minus the projection, on an earlier load"))
 	return rows

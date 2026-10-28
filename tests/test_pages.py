@@ -979,6 +979,235 @@ def test_model_block_slot_line_shortens_terms_when_tight():
 			assert "tokens in the shared cache" in slots_lines[0], (w, slots_lines[0])
 
 
+def test_model_block_model_line_no_reasoning():
+	c = collector([])
+	c.flags["m"] = ({"reasoning-effort": "high", "reasoning": "on", "ctx-size": 8192}, "")
+	snap = {"t": 1000.0, "llama": {"ded": 1000.0, "present": False}}
+	p = {
+		"meta": {}, "status": "loaded", "phase": "decode", "kv": 100,
+		"rate_dec": 25.0, "rate_pre": float("nan"), "eta": float("nan"),
+		"elapsed": 2.0, "n_slots": 1, "n_busy": 1,
+		"slot": {"id": 0, "n_ctx": 8192, "task": 1, "n_prompt": 100, "cached": 0, "done": 100, "todo": 100, "decoded": 50, "remain": 150, "params": {}},
+	}
+	lines = pages.model_block(c, snap, pages.View(), "m", p, 120, 2)
+	assert "reasoning" not in plain(lines)[0], lines[0]
+
+
+def test_model_block_stale_sample_updated_seconds_ago():
+	c = collector([], cfg=dict(S.CFG))
+	c.alerts.ordered = lambda: []
+	slot = {
+		"id": 0, "n_ctx": 8192, "task": 42, "n_prompt": 100, "cached": 0,
+		"done": 50, "todo": 100, "decoded": 0, "remain": 100, "params": {},
+		"sample_t": 1000.0,
+	}
+	p_pre = {
+		"meta": {}, "status": "loaded", "phase": "prefill", "kv": 50,
+		"rate_dec": float("nan"), "rate_pre": 25.0, "eta": 2.0, "elapsed": 5.0,
+		"n_slots": 1, "n_busy": 1, "slot": slot, "sample_t": 1000.0,
+	}
+	# Stale (3.5s old > 2.0s)
+	snap_stale = rendered_live_snap(p_pre)
+	snap_stale["t"] = 1003.5
+	lines_pre = pages.model_block(c, snap_stale, pages.View(), "m", p_pre, 120, 2)
+	assert plain(lines_pre)[1].endswith("· updated 3s ago"), lines_pre[1]
+
+	# Fresh (1.5s old <= 2.0s)
+	snap_fresh = rendered_live_snap(p_pre)
+	snap_fresh["t"] = 1001.5
+	lines_fresh = pages.model_block(c, snap_fresh, pages.View(), "m", p_pre, 120, 2)
+	assert "updated" not in plain(lines_fresh)[1], lines_fresh[1]
+
+	# DECODE stale
+	slot_dec = dict(slot, decoded=50, done=100)
+	p_dec = dict(p_pre, phase="decode", slot=slot_dec, rate_dec=30.0)
+	lines_dec = pages.model_block(c, snap_stale, pages.View(), "m", p_dec, 120, 2)
+	assert plain(lines_dec)[1].endswith("· updated 3s ago"), lines_dec[1]
+
+
+def test_model_block_short_prompt_lifecycle():
+	c = collector([], cfg=dict(S.CFG))
+	c.alerts.ordered = lambda: []
+	snap = rendered_live_snap({})
+	slot = {
+		"id": 0, "n_ctx": 8192, "task": 1, "n_prompt": 500, "cached": 0,
+		"done": 250, "todo": 500, "decoded": 0, "remain": 100, "params": {},
+		"prompt_grown": False,
+	}
+	p = {
+		"meta": {}, "status": "loaded", "phase": "prefill", "kv": 250,
+		"rate_dec": float("nan"), "rate_pre": 100.0, "eta": 2.5, "elapsed": 2.5,
+		"n_slots": 1, "n_busy": 1, "slot": slot, "prompt_grown": False,
+	}
+	lines_pre = pages.model_block(c, snap, pages.View(), "m", p, 120, 2)
+	p_ln = plain(lines_pre)[1]
+	assert "250 / 500 new tokens" in p_ln, p_ln
+	assert "50%" in p_ln, p_ln
+	assert "ETA" in p_ln, p_ln
+
+	# Move to decode once n_decoded > 0
+	slot_dec = dict(slot, done=500, decoded=10, remain=90)
+	p_dec = dict(p, phase="decode", kv=510, rate_dec=20.0, slot=slot_dec)
+	lines_dec = pages.model_block(c, snap, pages.View(), "m", p_dec, 120, 2)
+	d_ln = plain(lines_dec)[1]
+	assert "DECODE" in d_ln, d_ln
+	assert "10 tokens" in d_ln, d_ln
+
+
+def test_model_block_prefill_known_and_unknown_survive_80_columns():
+	c = collector([], cfg=dict(S.CFG))
+	c.alerts.ordered = lambda: []
+	# Unknown total case (prompt_grown = True)
+	slot_unk = {
+		"id": 0, "n_ctx": 16384, "task": 3, "n_prompt": 6144, "cached": 0,
+		"done": 6144, "todo": 6144, "decoded": 0, "remain": 100, "params": {},
+		"prompt_grown": True,
+	}
+	p_unk = {
+		"meta": {}, "status": "loaded", "phase": "prefill", "kv": 6144,
+		"rate_dec": float("nan"), "rate_pre": 450.0, "eta": float("nan"), "elapsed": 4.0,
+		"n_slots": 1, "n_busy": 1, "slot": slot_unk, "prompt_grown": True,
+	}
+	snap_unk = rendered_live_snap(p_unk)
+	for w in (80, 120, 200):
+		rendered = pages.render(c, snap_unk, pages.View(), w, 40)
+		for ln in rendered:
+			assert ui.vlen(ln) <= w, (w, ln, ui.vlen(ln))
+		pre_ln = next(ln for ln in plain(rendered) if "PREFILL" in ln)
+		assert "tokens so far" in pre_ln, (w, pre_ln)
+		assert "6,144 tokens so far" in pre_ln, (w, pre_ln)
+		assert "%" not in pre_ln, (w, pre_ln)
+		assert "ETA" not in pre_ln, (w, pre_ln)
+
+	# Known total case (prompt_grown = False)
+	slot_known = {
+		"id": 0, "n_ctx": 16384, "task": 42, "n_prompt": 2048, "cached": 0,
+		"done": 2048, "todo": 2048, "decoded": 0, "remain": 100, "params": {},
+		"prompt_grown": False,
+	}
+	p_known = {
+		"meta": {}, "status": "loaded", "phase": "prefill", "kv": 2048,
+		"rate_dec": float("nan"), "rate_pre": 450.0, "eta": 0.0, "elapsed": 4.0,
+		"n_slots": 1, "n_busy": 1, "slot": slot_known, "prompt_grown": False,
+	}
+	snap_known = rendered_live_snap(p_known)
+	for w in (80, 120, 200):
+		rendered = pages.render(c, snap_known, pages.View(), w, 40)
+		for ln in rendered:
+			assert ui.vlen(ln) <= w, (w, ln, ui.vlen(ln))
+		pre_ln = next(ln for ln in plain(rendered) if "PREFILL" in ln)
+		assert "%" in pre_ln, (w, pre_ln)
+		assert "100%" in pre_ln, (w, pre_ln)
+
+
+def test_memory_category_colours_and_bar_sequence():
+	from llmtop_lib import state, ui
+	# Two different model maps with different category sets and orderings
+	m1 = {
+		"name": "model-dense", "arch": "llama", "n_layer": 32, "layers": {i: {"kind": "full", "mib": 100.0, "gpu": 100.0} for i in range(32)}, "verified": True,
+		"ctx": 4096, "cache_k": "q8_0", "cache_v": "q8_0",
+		"checks": [], "assumed": [],
+		"groups": {
+			"attention": {"gpu": 1000.0, "cpu": 0.0},
+			"FFN (dense)": {"gpu": 2000.0, "cpu": 0.0},
+			"output head": {"gpu": 500.0, "cpu": 0.0},
+		},
+		"kv": {"layers": {"full": 32, "swa": 0}, "gpu": 400.0, "mtp": 0, "full": 32, "swa": 0, "per_token": 1024},
+		"rec": {"total": 0, "layers": 0, "per_layer": 0},
+		"mtp_mib": 0, "draft": None, "fit": None,
+		"weights": {"cpu": 0.0}, "roster": [], "ckpt_max": 0, "cache_ram": 0,
+		"n_expert": 0, "n_expert_used": 0,
+	}
+	m2 = {
+		"name": "model-moe", "arch": "generic_moe", "n_layer": 16, "layers": {i: {"kind": "full", "mib": 100.0, "gpu": 100.0} for i in range(16)}, "verified": True,
+		"ctx": 2048, "cache_k": "q4_0", "cache_v": "q4_0",
+		"checks": [], "assumed": [],
+		"groups": {
+			"MoE experts": {"gpu": 4000.0, "cpu": 0.0},
+			"attention": {"gpu": 800.0, "cpu": 0.0},
+			"shared expert": {"gpu": 600.0, "cpu": 0.0},
+			"output head": {"gpu": 500.0, "cpu": 0.0},
+		},
+		"kv": {"layers": {"full": 16, "swa": 0}, "gpu": 200.0, "mtp": 0, "full": 16, "swa": 0, "per_token": 512},
+		"rec": {"total": 0, "layers": 0, "per_layer": 0},
+		"mtp_mib": 0, "draft": None, "fit": None,
+		"weights": {"cpu": 0.0}, "roster": [], "ckpt_max": 0, "cache_ram": 0,
+		"n_expert": 8, "n_expert_used": 2,
+	}
+
+	snap_base = {
+		"t": 1000.0, "router_up": True, "router_error": "", "router_auth_error": None, "key_allowed": True,
+		"gpu": {"name": "Test GPU", "vram": 16384.0, "budget": 16384.0, "ded": 0.0, "shr": 0.0, "uma": False},
+		"llama": {"present": False, "ded": 0.0, "shr": 0.0, "pids": []},
+		"ram": None, "cpu": None, "others": [], "busy": False, "new_events": [], "notices": [],
+	}
+
+	view = pages.View()
+	view.page = 1
+
+	c1 = collector([], cfg=dict(state.CFG))
+	c1.mem = {"model-dense": {"state": "ready", "map": m1, "key": "k1"}}
+	c1.flags = {"model-dense": ({}, "")}
+	snap1 = dict(snap_base, presets={"model-dense": {"status": "unloaded"}})
+	lines1 = pages.memory(c1, snap1, view, 120, 40)
+
+	c2 = collector([], cfg=dict(state.CFG))
+	c2.mem = {"model-moe": {"state": "ready", "map": m2, "key": "k2"}}
+	c2.flags = {"model-moe": ({}, "")}
+	snap2 = dict(snap_base, presets={"model-moe": {"status": "unloaded"}})
+	lines2 = pages.memory(c2, snap2, view, 120, 40)
+
+	def parse_legend(lines):
+		res = []
+		for ln in lines:
+			m = re.search(r"^\s*(\x1b\[[0-9;]*m)■\x1b\[0m\s+([A-Za-z0-9_:\(\)/ -]+?)\s+\d", ln)
+			if m:
+				res.append((m.group(2).strip(), m.group(1)))
+		return res
+
+	def parse_bar(lines):
+		full_glyph = ui.TABLES[ui.STYLE["mode"]]["full"]
+		for ln in lines:
+			if full_glyph in ln and ("OS budget" in ln or "shared GPU memory" in ln):
+				colors = []
+				for m in re.finditer(r"(\x1b\[[0-9;]*m)" + re.escape(full_glyph), ln):
+					col = m.group(1)
+					if not colors or colors[-1] != col:
+						colors.append(col)
+				return colors
+		return []
+
+	leg1 = parse_legend(lines1)
+	leg2 = parse_legend(lines2)
+	bar1 = parse_bar(lines1)
+	bar2 = parse_bar(lines2)
+
+	# 1. Bar color sequence matches the legend's sequence for the same model
+	assert bar1 == [col for _, col in leg1], (bar1, [col for _, col in leg1])
+	assert bar2 == [col for _, col in leg2], (bar2, [col for _, col in leg2])
+
+	# 2. KV cache row renders in the same colour across both models
+	kv1 = [col for lbl, col in leg1 if lbl.startswith("KV cache")][0]
+	kv2 = [col for lbl, col in leg2 if lbl.startswith("KV cache")][0]
+	assert kv1 == kv2 == pages.C.bcyan, (kv1, kv2)
+
+	# 3. Each shared category renders in the same colour across both models
+	d1 = dict(leg1)
+	d2 = dict(leg2)
+	shared_categories = set(d1.keys()) & set(d2.keys())
+	assert "weights: attention" in shared_categories
+	assert "weights: output head" in shared_categories
+	for cat in shared_categories:
+		assert d1[cat] == d2[cat], (cat, d1[cat], d2[cat])
+
+	# 4. Memory page renders cleanly without overhead row when calib has no 'overhead' key
+	c1.calib = {"k1": {"v": 4, "idle_shared": 370}}
+	lines_no_overhead = pages.memory(c1, snap1, view, 120, 40)
+	leg_no_overhead = parse_legend(lines_no_overhead)
+	assert not any("runtime overhead" in lbl for lbl, _ in leg_no_overhead)
+	assert any("no overhead learned yet for this configuration" in ln for ln in lines_no_overhead)
+
+
 CASES = [
 	("summary_short_requests_fall_back", test_summary_short_requests_fall_back),
 	("summary_long_cutoffs_when_reached", test_summary_long_cutoffs_when_reached),
@@ -1030,6 +1259,11 @@ CASES = [
 	("model_block_unified_cache_total_tokens", test_model_block_unified_cache_total_tokens),
 	("model_block_one_slot_renders_identically_to_baseline", test_model_block_one_slot_renders_identically_to_baseline),
 	("model_block_slot_line_shortens_terms_when_tight", test_model_block_slot_line_shortens_terms_when_tight),
+	("model_block_model_line_no_reasoning", test_model_block_model_line_no_reasoning),
+	("model_block_stale_sample_updated_seconds_ago", test_model_block_stale_sample_updated_seconds_ago),
+	("model_block_short_prompt_lifecycle", test_model_block_short_prompt_lifecycle),
+	("model_block_prefill_known_and_unknown_survive_80_columns", test_model_block_prefill_known_and_unknown_survive_80_columns),
+	("memory_category_colours_and_bar_sequence", test_memory_category_colours_and_bar_sequence),
 ]
 
 

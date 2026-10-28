@@ -13,6 +13,7 @@ import math
 import os
 import pathlib
 import random
+import re
 import sys
 import tempfile
 import threading
@@ -24,7 +25,7 @@ from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from llmtop_lib import state, win  # noqa: E402
+from llmtop_lib import pages, state, win  # noqa: E402
 
 
 class _StubServer:
@@ -521,7 +522,7 @@ class TestState(unittest.TestCase):
 				self.assertIn("Access is denied.", snap["vm_error"])
 				self.assertEqual(snap["presets"]["p1"]["slot_error"], "HTTP 501")
 				self.assertIn("HTTP 501", c.alerts.active["slots:p1"]["msg"])
-				self.assertIn("--slots", c.alerts.active["slots:p1"]["detail"])
+				self.assertIn("--no-slots", c.alerts.active["slots:p1"]["detail"])
 				self.assertTrue(any("calibration is paused" in n for n in snap["notices"]), snap["notices"])
 		finally:
 			srv.close()
@@ -722,6 +723,121 @@ class TestState(unittest.TestCase):
 		finally:
 			srv.close()
 
+	def test_rate_survives_sample_where_only_n_prompt_tokens_grows(self):
+		slots_state = [
+			{"id": 0, "n_ctx": 8192, "id_task": 10, "is_processing": True, "n_prompt_tokens": 2048, "n_prompt_tokens_cache": 0, "n_prompt_tokens_processed": 0, "next_token": [{"n_decoded": 0, "n_remain": 100}]},
+		]
+		models_data = [{"id": "m1", "object": "model", "status": {"value": "loaded", "args": ["llama-server.exe", "-m", "m1.gguf"]}}]
+		srv = _StubServer(models_data, slots_data=slots_state)
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win():
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				c.ensure_map = lambda preset: None
+				# Sample 1 at t=100.0: done=0
+				c.due.clear()
+				c.tick(1700000100.0)
+
+				# Sample 2 at t=102.0: done=2048 -> rate established
+				slots_state[0]["n_prompt_tokens_processed"] = 2048
+				c.due.clear()
+				snap2 = c.tick(1700000102.0)
+				rate1 = snap2["presets"]["m1"]["rate_pre"]
+				self.assertAlmostEqual(rate1, 1024.0, delta=10.0)
+
+				# Sample 3 at t=103.0: only n_prompt_tokens grows (to 4096), done stays 2048
+				slots_state[0]["n_prompt_tokens"] = 4096
+				c.due.clear()
+				snap3 = c.tick(1700000103.0)
+				rate2 = snap3["presets"]["m1"]["rate_pre"]
+				self.assertFalse(math.isnan(rate2))
+				self.assertGreater(rate2, 0.0)
+				self.assertAlmostEqual(rate2, rate1, delta=10.0)
+		finally:
+			srv.close()
+
+	def test_long_prefill_recorded_sequence_phase_and_progress(self):
+		# Recorded llama-server b11669 /slots sequence (8 rows)
+		recorded_rows = [
+			(2048, 0, 0),
+			(4096, 0, 2048),
+			(6144, 0, 4096),
+			(6144, 0, 6144),
+			(8192, 0, 6144),
+			(8192, 0, 8192),
+			(10240, 0, 8192),
+			(10240, 0, 10240),
+		]
+		slots_state = [
+			{"id": 0, "n_ctx": 16384, "id_task": 101, "is_processing": True,
+			 "n_prompt_tokens": 2048, "n_prompt_tokens_cache": 0, "n_prompt_tokens_processed": 0,
+			 "next_token": [{"n_decoded": 0, "n_remain": 100}]},
+		]
+		models_data = [{"id": "m1", "object": "model", "status": {"value": "loaded", "args": ["llama-server.exe", "-m", "m1.gguf"]}}]
+		srv = _StubServer(models_data, slots_data=slots_state)
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win():
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				c.ensure_map = lambda preset: None
+				for step, (n_prompt, cached, done) in enumerate(recorded_rows):
+					slots_state[0]["n_prompt_tokens"] = n_prompt
+					slots_state[0]["n_prompt_tokens_cache"] = cached
+					slots_state[0]["n_prompt_tokens_processed"] = done
+					c.due.clear()
+					t = 1700000100.0 + step * 4.2
+					snap = c.tick(t)
+					p = snap["presets"]["m1"]
+					# Phase is prefill at every step
+					self.assertEqual(p["phase"], "prefill", "step %d expected prefill, got %s" % (step, p["phase"]))
+					# Rendered Live block never contains DECODE
+					rendered_lines = pages.model_block(c, snap, pages.View(), "m1", p, 120, 2)
+					rendered_text = "\n".join(re.sub(r"\x1b\[[0-9;]*m", "", ln) for ln in rendered_lines)
+					self.assertNotIn("DECODE", rendered_text, "step %d rendered DECODE" % step)
+					# While total is unknown (step > 0 where n_prompt has grown), it shows tokens so far and no % or ETA
+					if step > 0:
+						self.assertTrue(p["slot"]["prompt_grown"], "step %d expected prompt_grown=True" % step)
+						pre_line = re.sub(r"\x1b\[[0-9;]*m", "", rendered_lines[1])
+						self.assertIn("tokens so far", pre_line, "step %d missing 'tokens so far': %s" % (step, pre_line))
+						self.assertNotIn("%", pre_line, "step %d has '%%': %s" % (step, pre_line))
+						self.assertNotIn("ETA", pre_line, "step %d has 'ETA': %s" % (step, pre_line))
+		finally:
+			srv.close()
+
+	def test_collector_stale_sample_updated_seconds_ago(self):
+		slots_state = [
+			{"id": 0, "n_ctx": 8192, "id_task": 10, "is_processing": True, "n_prompt_tokens": 2048, "n_prompt_tokens_cache": 0, "n_prompt_tokens_processed": 1024, "next_token": [{"n_decoded": 0, "n_remain": 100}]},
+		]
+		models_data = [{"id": "m1", "object": "model", "status": {"value": "loaded", "args": ["llama-server.exe", "-m", "m1.gguf"]}}]
+		srv = _StubServer(models_data, slots_data=slots_state)
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win():
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				c.ensure_map = lambda preset: None
+				# Good sample at t=100.0
+				c.due.clear()
+				snap1 = c.tick(1700000100.0)
+				p1 = snap1["presets"]["m1"]
+				lines1 = pages.model_block(c, snap1, pages.View(), "m1", p1, 120, 2)
+				self.assertNotIn("updated", re.sub(r"\x1b\[[0-9;]*m", "", lines1[1]))
+
+				# Next poll times out (simulate OSError) at t=103.5
+				orig_get = c.get
+				def fail_get(path):
+					if "/slots" in path:
+						raise OSError("timed out")
+					return orig_get(path)
+				c.get = fail_get
+				c.due.clear()
+				snap2 = c.tick(1700000103.5)
+				p2 = snap2["presets"]["m1"]
+				lines2 = pages.model_block(c, snap2, pages.View(), "m1", p2, 120, 2)
+				plain2 = re.sub(r"\x1b\[[0-9;]*m", "", lines2[1])
+				self.assertTrue(plain2.endswith("· updated 3s ago"), plain2)
+		finally:
+			srv.close()
+
 	def test_slots_reply_bad_types_and_empty(self):
 		models_data = [{"id": "m1", "object": "model", "status": {"value": "loaded", "args": ["llama-server.exe", "-m", "m1.gguf"]}}]
 		srv = _StubServer(models_data)
@@ -799,6 +915,88 @@ class TestState(unittest.TestCase):
 			state.write_json_atomic(path, {"new": 1}, indent=1)
 			with open(path, encoding="utf-8") as f:
 				self.assertEqual(json.load(f), {"new": 1})  # a normal write replaces the content
+
+	def test_calibration_load_drops_spilled_and_negative(self):
+		with tempfile.TemporaryDirectory() as tmp, _patch_win():
+			state_dir = os.path.join(tmp, "state")
+			os.makedirs(state_dir, exist_ok=True)
+			calib_data = {
+				"good": {"v": 4, "overhead": 250, "at": 1700000100.0, "preset": "m_good", "spilled": False, "idle_shared": 100},
+				"negative": {"v": 4, "overhead": -575, "at": 1700000100.0, "preset": "m_neg", "spilled": False, "idle_shared": 200},
+				"spilled": {"v": 4, "overhead": 400, "at": 1700000100.0, "preset": "m_spill", "spilled": True, "idle_shared": 370},
+			}
+			with open(os.path.join(state_dir, "calibration.json"), "w", encoding="utf-8") as f:
+				json.dump(calib_data, f)
+			cfg = dict(state.CFG, state_dir=state_dir, persist=False, calibrate=False)
+			c = state.Collector(cfg)
+			self.assertEqual(set(c.calib.keys()), {"good", "negative", "spilled"})
+			# "good" keeps overhead, spilled flag, and idle_shared
+			self.assertEqual(c.calib["good"]["overhead"], 250)
+			self.assertFalse(c.calib["good"]["spilled"])
+			self.assertEqual(c.calib["good"]["idle_shared"], 100)
+			# "negative" loses overhead and spilled flag, keeps idle_shared
+			self.assertNotIn("overhead", c.calib["negative"])
+			self.assertNotIn("spilled", c.calib["negative"])
+			self.assertEqual(c.calib["negative"]["idle_shared"], 200)
+			# "spilled" loses overhead and spilled flag, keeps idle_shared
+			self.assertNotIn("overhead", c.calib["spilled"])
+			self.assertNotIn("spilled", c.calib["spilled"])
+			self.assertEqual(c.calib["spilled"]["idle_shared"], 370)
+
+	def test_calibration_sample_gates(self):
+		with tempfile.TemporaryDirectory() as tmp, _patch_win():
+			cfg = dict(state.CFG, state_dir=os.path.join(tmp, "state"), persist=False, calibrate=False, load_grace_s=15.0, spill_mib=256.0, idle_headroom_mib=1024.0)
+			c = state.Collector(cfg)
+			fake_map = {
+				"groups": {"attention": {"gpu": 1000.0, "cpu": 0.0}},
+				"kv": {"layers": {"full": 1, "swa": 0}, "gpu": 500.0, "mtp": 0.0, "per_token": 1024},
+				"ctx": 2048, "cache_k": "q8_0", "cache_v": "q8_0",
+				"rec": {"total": 0.0}, "mtp_mib": 0.0,
+				"draft": None, "fit": None,
+			}
+			# rows_total for fake_map is 1500.0
+			c.mem = {"test_model": {"key": "test_model_key", "state": "ready", "map": fake_map}}
+			k = c.calib_key("test_model_key")
+
+			base_snap = {
+				"t": 1700000100.0,
+				"presets": {"test_model": {"status": "loaded"}},
+				"gpu": None,
+				"llama": {
+					"present": True,
+					"pids": [1234],
+					"age": 20.0,
+					"ded": 1600.0,
+					"shr": 100.0,
+					"over": 0.0,
+				},
+			}
+
+			# 1. Sample while spilled is ignored
+			snap_spilled = dict(base_snap, llama=dict(base_snap["llama"], over=300.0))
+			c.calibrate(snap_spilled)
+			self.assertNotIn(k, c.calib)
+
+			# 2. Sample before load_grace_s is ignored
+			snap_early = dict(base_snap, llama=dict(base_snap["llama"], age=5.0))
+			c.calibrate(snap_early)
+			self.assertNotIn(k, c.calib)
+
+			# 3. Sample at 95% of projection with headroom: idle_shared is learned, overhead is not
+			gpu_headroom = {"budget": 16384.0}
+			snap_95 = dict(base_snap, gpu=gpu_headroom, llama=dict(base_snap["llama"], ded=1425.0, shr=200.0))
+			c.calibrate(snap_95)
+			self.assertIn(k, c.calib)
+			self.assertNotIn("overhead", c.calib[k])
+			self.assertEqual(c.calib[k].get("idle_shared"), 200)
+
+			# 4. Settled, fully resident, unspilled sample: overhead is learned, idle_shared retained
+			snap_good = dict(base_snap)
+			c.calibrate(snap_good)
+			self.assertIn(k, c.calib)
+			self.assertEqual(c.calib[k]["overhead"], 100)
+			self.assertFalse(c.calib[k]["spilled"])
+			self.assertEqual(c.calib[k]["idle_shared"], 200)
 
 	def test_fit_projection_cached_per_configuration(self):
 		with tempfile.TemporaryDirectory() as tmp, _patch_win():
@@ -1211,10 +1409,15 @@ CASES = [
 	("three_slots_only_slot_2_processing", TestState("test_three_slots_only_slot_2_processing")),
 	("two_slots_processing_primary_is_newer", TestState("test_two_slots_processing_primary_is_newer")),
 	("per_slot_rates_separate", TestState("test_per_slot_rates_separate")),
+	("rate_survives_sample_where_only_n_prompt_tokens_grows", TestState("test_rate_survives_sample_where_only_n_prompt_tokens_grows")),
+	("long_prefill_recorded_sequence_phase_and_progress", TestState("test_long_prefill_recorded_sequence_phase_and_progress")),
+	("collector_stale_sample_updated_seconds_ago", TestState("test_collector_stale_sample_updated_seconds_ago")),
 	("slots_reply_bad_types_and_empty", TestState("test_slots_reply_bad_types_and_empty")),
 	("request_log_trimmed_only_when_persisting", TestState("test_request_log_trimmed_only_when_persisting")),
 	("requests_in_memory_capped", TestState("test_requests_in_memory_capped")),
 	("calibration_write_is_atomic", TestState("test_calibration_write_is_atomic")),
+	("calibration_load_drops_spilled_and_negative", TestState("test_calibration_load_drops_spilled_and_negative")),
+	("calibration_sample_gates", TestState("test_calibration_sample_gates")),
 	("fit_projection_cached_per_configuration", TestState("test_fit_projection_cached_per_configuration")),
 	("fit_cache_persisted_and_reloaded", TestState("test_fit_cache_persisted_and_reloaded")),
 	("fit_params_policy", TestState("test_fit_params_policy")),

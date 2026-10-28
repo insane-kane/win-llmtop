@@ -31,16 +31,17 @@ Options, with their environment variables and defaults:
 | `--state-dir DIR` | `LLMTOP_STATE_DIR` | `%LOCALAPPDATA%\win-llmtop` | directory for persisted history and calibration |
 | `--api-key KEY` | `LLMTOP_API_KEY` or `LLAMA_API_KEY` | (none) | Bearer token for `llama-server` |
 | `--gpu INDEX\|NAME` | — | the adapter the model runs on | adapter index or name substring |
-| `--hz HZ` | — | `4.0` | sampling and redraw rate |
-| `--history-hours HISTORY_HOURS` | — | `24` | hours of per-second history kept in memory and replayed |
-| `--spill-mib SPILL_MIB` | — | `256` | excess shared GPU memory (MiB) that raises an alert |
+| `--hz HZ` | — | `4.0` | sampling and redraw rate (a number greater than 0 and at most 60) |
+| `--history-hours HISTORY_HOURS` | — | `24` | hours of per-second history kept in memory and replayed (at least 1) |
+| `--spill-mib SPILL_MIB` | — | `256` | excess shared GPU memory (MiB) that raises an alert (0 or more) |
 | `--threshold NAME=VALUE` | — | (none) | override an alert or grouping threshold (see `CFG` in `llmtop_lib/state.py`); repeatable |
 | `--no-persist` | — | off | do not mirror history to disk |
 | `--graph-style {braille,blocks,coarse,ascii}` | — | detected: braille in Windows Terminal, blocks in other modern terminals, coarse in the classic console | braille line plots, block-character charts, a code-page-437 coarse style for the classic console, or plain ascii |
 | `--no-color` | — | off | disable ANSI colour escapes |
-| `--width WIDTH` | — | the terminal width | line width for `--once` and `--plan` |
+| `--width WIDTH` | — | the terminal width | line width for `--once` and `--plan` (0, or at least 40) |
+| `--version` | — | show the version and exit | show the version, copyright and licence, then exit |
 
-`--router` finds the server when no URL is given: it tries the default `http://127.0.0.1:8080`, then the host and port read from each running llama-server's command line, and says how it found the one that answers. When several independent `llama-server` instances are running, pass `--router` to choose which one to watch. `--api-key` (or `LLMTOP_API_KEY` / `LLAMA_API_KEY`) passes a Bearer token for HTTP requests; a server started with `--api-key` requires it for `/models` and `/slots`. `--log-dir` is the folder the per-model logs and the router log live in; `--router-log` names the router log file directly. `--state-dir` is the folder for the persisted history and calibration.
+`--router` finds the server when no URL is given: it tries the default `http://127.0.0.1:8080`, then the host and port read from each running llama-server's command line, and says how it found the one that answers. When several independent `llama-server` instances are running, pass `--router` to choose which one to watch. `--api-key` (or `LLMTOP_API_KEY` / `LLAMA_API_KEY`) passes a Bearer token for HTTP requests; a server started with `--api-key` requires it for `/models` and `/slots`. `--log-dir` is the folder the per-model logs and the router log live in; `--router-log` names the router log file directly. `--state-dir` is the folder for the persisted history and calibration. `NO_COLOR` (any non-empty value) turns colour off, like `--no-color`.
 
 ### Discovery, the API key and trust
 - **The API key** is sent only to a URL you gave (`--router` or `LLMTOP_ROUTER`) or one read from a running `llama-server`'s command line. The probe of the default address carries no key. When that probe is answered `401` or `403` and a key is set, `win-llmtop` looks for a running `llama-server` whose command line names the same address and asks it again with the key; if there is none it reports the error and asks you to pass `--router` together with `--api-key`. No HTTP redirect is followed: a `3xx` answer is an error like any other HTTP error. A server at a loopback address is always reached directly, never through a proxy; a remote `--router` URL uses the system proxy settings (the proxy environment variables, `NO_PROXY` included, or the Windows Internet settings).
@@ -177,7 +178,9 @@ Rings hold one value per second for 24 h. They are mirrored to the state folder'
 ## EXIT STATUS
 In interactive mode, `--once`, and `--plan`, `win-llmtop` exits 0 on normal termination.
 
-It exits `1` with a message, before doing anything else, when it can't run: not Windows, 32-bit Python, Python older than 3.11, or an unknown or non-numeric `--threshold`.
+It exits `1` with a message, before doing anything else, when it can't run: not Windows, 32-bit Python, Python older than 3.11, or an unknown or non-numeric `--threshold` name. A `--threshold` value that is not a number, is `nan` or `inf`, or is not a whole number where the default is an integer, and an unknown `--plan` preset, also exit `1` with a message.
+
+An out-of-range option value (`--hz`, `--history-hours`, `--width`, `--spill-mib`) exits `2` with an `error:` line from argparse.
 
 With `--check`, `win-llmtop` exits `0` when the server is reachable and either GPU telemetry is present or the machine has no GPU adapters (CPU-only), and exits `1` otherwise (the server is unreachable or requires an API key, or GPU adapters are present but PDH counters are missing).
 

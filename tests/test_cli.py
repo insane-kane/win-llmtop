@@ -501,6 +501,47 @@ class TestCLI(unittest.TestCase):
 		self.assertIn("charts use the coarse style", term)
 		self.assertNotIn("Windows Terminal draws finer charts", term)
 
+	def test_version_prints_version_copyright_licence(self):
+		proc = subprocess.run([sys.executable, "-I", LLMTOP_PY, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+		self.assertEqual(proc.returncode, 0, "stderr: %s" % proc.stderr)
+		lines = proc.stdout.splitlines()
+		self.assertEqual(len(lines), 5, proc.stdout)
+		self.assertTrue(lines[0].startswith("win-llmtop "), lines[0])
+		self.assertIn("Copyright (C) 2026 Aaron Kane", lines[1])
+		self.assertIn("License GPL-3.0-or-later", lines[2])
+		self.assertIn("free software", lines[3])
+		self.assertIn("NO WARRANTY", lines[4])
+
+	def test_bad_option_values_exit_cleanly(self):
+		for extra in (("--hz", "0"), ("--hz", "nan"), ("--history-hours", "0"), ("--width", "10"), ("--spill-mib", "-1")):
+			proc = subprocess.run([sys.executable, "-I", LLMTOP_PY, *extra, "--once"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+			self.assertEqual(proc.returncode, 2, "args %r stderr: %s" % (extra, proc.stderr))
+			self.assertIn("error:", proc.stderr)
+			self.assertNotIn("Traceback", proc.stderr)
+
+	def test_bad_threshold_values_exit_1(self):
+		for value in ("avail_warn=abc", "avail_warn=inf", "hold_s=1.5"):
+			proc = subprocess.run([sys.executable, "-I", LLMTOP_PY, "--once", "--no-persist", "--router", "http://127.0.0.1:1", "--threshold", value], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+			self.assertEqual(proc.returncode, 1, "threshold %r stderr: %s" % (value, proc.stderr))
+			self.assertNotIn("Traceback", proc.stderr)
+		# a whole number written as a float is accepted for an int threshold
+		proc = subprocess.run([sys.executable, "-I", LLMTOP_PY, "--threshold", "hold_s=2.0", "--once", "--router", "http://127.0.0.1:1", "--no-persist"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+		self.assertEqual(proc.returncode, 0, "stderr: %s" % proc.stderr)
+		self.assertNotIn("Traceback", proc.stderr)
+
+	def test_plan_unknown_preset_exits_1(self):
+		proc = subprocess.run([sys.executable, "-I", LLMTOP_PY, "--plan", "no-such-preset", "--router", "http://127.0.0.1:1", "--no-persist"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+		self.assertEqual(proc.returncode, 1, "stderr: %s" % proc.stderr)
+		self.assertIn("unknown preset no-such-preset", proc.stderr)
+		self.assertNotIn("Traceback", proc.stderr)
+
+	def test_no_color_env_turns_colour_off(self):
+		env = dict(os.environ)
+		env["NO_COLOR"] = "1"
+		proc = subprocess.run([sys.executable, "-I", LLMTOP_PY, "--once", "--router", "http://127.0.0.1:1", "--no-persist"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, env=env)
+		self.assertEqual(proc.returncode, 0, "stderr: %s" % proc.stderr)
+		self.assertNotIn("\x1b[", proc.stdout)
+
 
 CASES = [
 	("help_generic_and_no_local_names", TestCLI("test_help_generic_and_no_local_names")),
@@ -518,6 +559,11 @@ CASES = [
 	("terminal_kind_from_env", TestCLI("test_terminal_kind_from_env")),
 	("s_cycles_four_graph_styles", TestCLI("test_s_cycles_four_graph_styles")),
 	("check_terminal_line", TestCLI("test_check_terminal_line")),
+	("version_prints_version_copyright_licence", TestCLI("test_version_prints_version_copyright_licence")),
+	("bad_option_values_exit_cleanly", TestCLI("test_bad_option_values_exit_cleanly")),
+	("bad_threshold_values_exit_1", TestCLI("test_bad_threshold_values_exit_1")),
+	("plan_unknown_preset_exits_1", TestCLI("test_plan_unknown_preset_exits_1")),
+	("no_color_env_turns_colour_off", TestCLI("test_no_color_env_turns_colour_off")),
 ]
 
 

@@ -34,7 +34,8 @@ import sys
 import time
 import traceback
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if __name__ == "__main__":
+	sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from llmtop_lib import model, pages, state, win  # noqa: E402
 from llmtop_lib import ui  # noqa: E402
 from llmtop_lib.ui import C  # noqa: E402
@@ -262,9 +263,13 @@ def snapshot(c, view, which, width):
 
 
 def plan(c, view, which, width):
-	"""Memory projection of presets against the OS VRAM budget, without loading anything."""
+	"""Memory projection of presets against the OS VRAM budget, without loading anything. Returns 1 for an unknown preset, 0 otherwise."""
 	snap = c.tick()
 	g = snap["gpu"]
+	if which != "all" and which not in c.flags:
+		presets = ", ".join(sorted(c.flags)) if c.flags else "none reported by the server"
+		print("win-llmtop: unknown preset %s; presets: %s" % (which, presets), file=sys.stderr)
+		return 1
 	names = [which] if which in c.flags else list(c.flags)
 	for name in names:
 		c.ensure_map(name)
@@ -296,6 +301,18 @@ def plan(c, view, which, width):
 	print()
 	print(ui.safe("Figures are MiB. 'overhead' is resident VRAM minus the projected rows, measured on an earlier load of the same model file, context size and cache types (shared by every preset with that configuration)."))
 	print(ui.safe("'?' means no such load has been measured yet, so the projection has no overhead term. 'vs OS budget' compares the projected resident VRAM with the DXGI budget; shared GPU memory is not part of it."))
+
+
+def _dir_writable(path):
+	"""(True, None) if a file can be created, written and removed in path, else (False, error text)."""
+	tf = os.path.join(path, ".test_write_%d" % os.getpid())
+	try:
+		with open(tf, "w") as f:
+			f.write("")
+		os.remove(tf)
+		return True, None
+	except Exception as e:
+		return False, str(e)
 
 
 def check(c, args):
@@ -442,14 +459,7 @@ def check(c, args):
 	state_dir = c.state_dir
 	if args.no_persist:
 		if os.path.isdir(state_dir):
-			try:
-				tf = os.path.join(state_dir, ".test_write_%d" % os.getpid())
-				with open(tf, "w") as f:
-					f.write("")
-				os.remove(tf)
-				writable = True
-			except Exception:
-				writable = False
+			writable, _ = _dir_writable(state_dir)
 		else:
 			p = os.path.abspath(state_dir)
 			while p and not os.path.exists(p):
@@ -457,14 +467,7 @@ def check(c, args):
 				p = os.path.dirname(p)
 				if p == prev:
 					break
-			try:
-				tf = os.path.join(p, ".test_write_%d" % os.getpid())
-				with open(tf, "w") as f:
-					f.write("")
-				os.remove(tf)
-				writable = True
-			except Exception:
-				writable = False
+			writable, _ = _dir_writable(p)
 		if writable:
 			state_status, state_fact = "ok", "%s (writable)" % state_dir
 		else:
@@ -472,13 +475,14 @@ def check(c, args):
 	else:
 		try:
 			os.makedirs(state_dir, exist_ok=True)
-			tf = os.path.join(state_dir, ".test_write_%d" % os.getpid())
-			with open(tf, "w") as f:
-				f.write("")
-			os.remove(tf)
-			state_status, state_fact = "ok", "%s (writable)" % state_dir
 		except Exception as e:
 			state_status, state_fact = "FAIL", "%s (%s)" % (state_dir, e)
+		else:
+			writable, err = _dir_writable(state_dir)
+			if writable:
+				state_status, state_fact = "ok", "%s (writable)" % state_dir
+			else:
+				state_status, state_fact = "FAIL", "%s (%s)" % (state_dir, err)
 	print(ui.safe("%-18s %-5s %s" % ("state", state_status, state_fact)))
 
 	# 8. then every snap["notices"] line
@@ -489,10 +493,55 @@ def check(c, args):
 	return 0 if (server_ok and gpu_ok_or_cpu) else 1
 
 
+def _hz_value(s):
+	"""A float with 0 < hz <= 60; nan and inf fail the range check."""
+	try:
+		v = float(s)
+	except ValueError:
+		raise argparse.ArgumentTypeError("not a number: %s" % s) from None
+	if not 0 < v <= 60:
+		raise argparse.ArgumentTypeError("must be a number greater than 0 and at most 60: %s" % s)
+	return v
+
+
+def _history_hours_value(s):
+	"""An int >= 1."""
+	try:
+		v = int(s)
+	except ValueError:
+		raise argparse.ArgumentTypeError("not an integer: %s" % s) from None
+	if v < 1:
+		raise argparse.ArgumentTypeError("must be at least 1: %s" % s)
+	return v
+
+
+def _width_value(s):
+	"""An int that is 0 or >= 40 (0: use the terminal width)."""
+	try:
+		v = int(s)
+	except ValueError:
+		raise argparse.ArgumentTypeError("not an integer: %s" % s) from None
+	if v != 0 and v < 40:
+		raise argparse.ArgumentTypeError("must be 0 or at least 40: %s" % s)
+	return v
+
+
+def _spill_mib_value(s):
+	"""An int >= 0."""
+	try:
+		v = int(s)
+	except ValueError:
+		raise argparse.ArgumentTypeError("not an integer: %s" % s) from None
+	if v < 0:
+		raise argparse.ArgumentTypeError("must be 0 or more: %s" % s)
+	return v
+
+
 def main():
 	if sys.version_info < (3, 11):
 		sys.exit("win-llmtop needs Python 3.11 or later (this is %d.%d)" % sys.version_info[:2])
-	ap = argparse.ArgumentParser(prog="win-llmtop", description="Live terminal panel for llama.cpp's llama-server on Windows: GPU and shared memory, RAM, requests.")
+	# RawDescriptionHelpFormatter: the --version text (which the version action feeds to the help formatter) keeps its line breaks
+	ap = argparse.ArgumentParser(prog="win-llmtop", formatter_class=argparse.RawDescriptionHelpFormatter, description="Live terminal panel for llama.cpp's llama-server on Windows: GPU and shared memory, RAM, requests.")
 	ap.add_argument("--check", action="store_true", help="report on prerequisites and reachable sources, then exit")
 	ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
 	ap.add_argument("--page", choices=PAGE_NAMES + ["all"], default="live", help="page for --once")
@@ -505,14 +554,20 @@ def main():
 	ap.add_argument("--state-dir", default=os.environ.get("LLMTOP_STATE_DIR") or state.CFG["state_dir"], metavar="DIR", help="directory for persisted history and calibration (env LLMTOP_STATE_DIR)")
 	ap.add_argument("--api-key", default=os.environ.get("LLMTOP_API_KEY") or os.environ.get("LLAMA_API_KEY") or None, metavar="KEY", help="Bearer token for llama-server (env LLMTOP_API_KEY or LLAMA_API_KEY)")
 	ap.add_argument("--gpu", default=None, metavar="INDEX|NAME", help="adapter index or name substring")
-	ap.add_argument("--hz", type=float, default=state.CFG["hz"], help="sampling and redraw rate")
-	ap.add_argument("--history-hours", type=int, default=state.CFG["history_hours"])
-	ap.add_argument("--spill-mib", type=int, default=state.CFG["spill_mib"], help="excess shared GPU memory (MiB) that raises an alert")
+	ap.add_argument("--hz", type=_hz_value, default=state.CFG["hz"], help="sampling and redraw rate (a number greater than 0 and at most 60)")
+	ap.add_argument("--history-hours", type=_history_hours_value, default=state.CFG["history_hours"], help="hours of per-second history kept in memory and replayed (at least 1)")
+	ap.add_argument("--spill-mib", type=_spill_mib_value, default=state.CFG["spill_mib"], help="excess shared GPU memory (MiB) that raises an alert (0 or more)")
 	ap.add_argument("--threshold", action="append", default=[], metavar="NAME=VALUE", help="override an alert threshold (see CFG in llmtop_lib/state.py); repeatable")
 	ap.add_argument("--no-persist", action="store_true", help="do not mirror history to disk")
 	ap.add_argument("--graph-style", choices=("braille", "blocks", "coarse", "ascii"), default=None, help="braille line plots, block-character charts, a code-page-437 coarse style for the classic console, or plain ascii")
 	ap.add_argument("--no-color", action="store_true")
-	ap.add_argument("--width", type=int, default=0, help="line width for --once and --plan")
+	ap.add_argument("--width", type=_width_value, default=0, help="line width for --once and --plan (0, or at least 40)")
+	ap.add_argument("--version", action="version", version=(
+		"win-llmtop %s\n"
+		"Copyright (C) 2026 Aaron Kane\n"
+		"License GPL-3.0-or-later <https://www.gnu.org/licenses/gpl-3.0.html>\n"
+		"This is free software: you are free to change and redistribute it.\n"
+		"There is NO WARRANTY, to the extent permitted by law." % _llmtop_version()))
 	args = ap.parse_args()
 	if not win.WIN:
 		sys.exit("llmtop reads Windows performance counters and runs on Windows only.")
@@ -529,10 +584,11 @@ def main():
 		except (AttributeError, ValueError):
 			pass
 	interactive = sys.stdout.isatty() and not args.once and not args.check and args.plan is None
+	no_color = args.no_color or bool(os.environ.get("NO_COLOR"))
 	if not vt_ok and sys.stdout.isatty():
 		C.enable(False)
 	else:
-		C.enable(not args.no_color and sys.stdout.isatty())
+		C.enable(not no_color and sys.stdout.isatty())
 	user_thresholds = set()
 	cfg = dict(state.CFG, router=args.router, log_dir=args.log_dir, router_log=args.router_log, state_dir=args.state_dir,
 		api_key=args.api_key, gpu=args.gpu, hz=args.hz, history_hours=args.history_hours, spill_mib=args.spill_mib,
@@ -550,7 +606,15 @@ def main():
 			continue
 		if name not in num_thresholds or not value:
 			sys.exit("unknown or non-numeric threshold %r; thresholds: %s" % (item, ", ".join(num_thresholds)))
-		cfg[name] = type(num_thresholds[name])(float(value))
+		try:
+			num = float(value)
+		except ValueError:
+			sys.exit("threshold %s: not a number: %s" % (name, value))
+		if num != num or num in (float("inf"), float("-inf")):
+			sys.exit("threshold %s: not a finite number: %s" % (name, value))
+		if isinstance(num_thresholds[name], int) and not num.is_integer():
+			sys.exit("threshold %s: not an integer: %s" % (name, value))
+		cfg[name] = type(num_thresholds[name])(num)
 		user_thresholds.add(name)
 	c = state.Collector(cfg)
 	if not args.check:
@@ -563,7 +627,7 @@ def main():
 			rc = check(c, args)
 			sys.exit(rc)
 		elif args.plan is not None:
-			plan(c, view, args.plan, width)
+			sys.exit(plan(c, view, args.plan, width))
 		elif interactive:
 			live(c, view)
 		else:

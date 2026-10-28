@@ -54,6 +54,7 @@ CFG = {
 	"burst_window_s": 4,  # window for the shared-memory rise
 	"load_grace_s": 90,  # rises in shared memory this soon after a load are not reported as bursts
 	"prompt_gap_s": 30,  # idle gap in seconds between turns on the same slot that starts a new prompt
+	"hide_after_days": 7,  # the Requests page hides a preset the server no longer lists this many days after its newest request
 }
 SCALED_THRESHOLDS = ("avail_warn", "avail_crit", "commit_warn", "commit_crit", "near_budget_mib", "idle_headroom_mib")
 RE_BAD_FILE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -108,6 +109,59 @@ def write_json_atomic(path, obj, indent=None):
 		except OSError:
 			pass
 		raise
+
+
+def forget_presets(state_dir, names):
+	"""Delete every stored request and calibration entry of the named presets.
+
+	requests.jsonl is read leniently (bad lines are skipped) and rewritten once, in the old
+	order, when any of its lines names a preset; calibration.json is rewritten when any entry's
+	preset does. The state folder is never created. Returns {name: (requests removed,
+	calibration entries removed)} for each distinct name, in the order given."""
+	names = list(dict.fromkeys(names))
+	req_path = os.path.join(state_dir, "requests.jsonl")
+	cal_path = os.path.join(state_dir, "calibration.json")
+	reqs = []
+	if os.path.isfile(req_path):
+		try:
+			with open(req_path, encoding="utf-8") as f:
+				for line in f:
+					try:
+						reqs.append(json.loads(line))
+					except ValueError:
+						continue
+		except OSError:
+			reqs = []
+	reqs = [r for r in reqs if isinstance(r, dict)]
+	req_counts = {name: sum(1 for r in reqs if r.get("preset") == name) for name in names}
+	if any(req_counts.values()):
+		keep = [r for r in reqs if r.get("preset") not in req_counts]
+		tmp = req_path + ".tmp"
+		try:
+			with open(tmp, "w", encoding="utf-8") as f:
+				for r in keep:
+					f.write(json.dumps(r, separators=(",", ":")) + "\n")
+			os.replace(tmp, req_path)
+		except Exception:
+			try:
+				os.remove(tmp)
+			except OSError:
+				pass
+			raise
+	calib = {}
+	if os.path.isfile(cal_path):
+		try:
+			with open(cal_path, encoding="utf-8") as f:
+				raw = json.load(f)
+			if isinstance(raw, dict):
+				calib = raw
+		except (OSError, ValueError):
+			calib = {}
+	cal_counts = {name: sum(1 for e in calib.values() if isinstance(e, dict) and e.get("preset") == name) for name in names}
+	if any(cal_counts.values()):
+		kept = {k: e for k, e in calib.items() if not (isinstance(e, dict) and e.get("preset") in cal_counts)}
+		write_json_atomic(cal_path, kept, indent=1)
+	return {name: (req_counts[name], cal_counts[name]) for name in names}
 
 
 def scale_thresholds(cfg, ram_mib=None, commit_max_mib=None, budget_mib=None, user_set=()):

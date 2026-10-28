@@ -943,6 +943,46 @@ class TestState(unittest.TestCase):
 			self.assertNotIn("spilled", c.calib["spilled"])
 			self.assertEqual(c.calib["spilled"]["idle_shared"], 370)
 
+	def test_forget_presets_removes_requests_and_calibration(self):
+		with tempfile.TemporaryDirectory() as tmp:
+			state_dir = os.path.join(tmp, "state")
+			os.makedirs(state_dir)
+			req_path = os.path.join(state_dir, "requests.jsonl")
+			cal_path = os.path.join(state_dir, "calibration.json")
+			with open(req_path, "w", encoding="utf-8") as f:
+				f.write('{"preset": "x", "pn": 100, "wall": 1700000000.0}\n')
+				f.write('{"preset": "y", "pn": 200, "wall": 1700000100.0}\n')
+				f.write("not json at all\n")
+				f.write('{"preset": "x", "pn": 300, "wall": 1700000200.0}\n')
+				f.write('{"preset": "z", "pn": 400, "wall": 1700000300.0}\n')
+			calib = {
+				"kx": {"v": 4, "overhead": 100, "at": 1700000100.0, "preset": "x"},
+				"kz": {"v": 4, "overhead": 300, "at": 1700000100.0, "preset": "z"},
+				"k3": {"v": 4, "idle_shared": 30},  # no preset field
+			}
+			state.write_json_atomic(cal_path, calib, indent=1)
+
+			counts = state.forget_presets(state_dir, ["x", "y"])
+			self.assertEqual(counts, {"x": (2, 1), "y": (1, 0)})
+			with open(req_path, encoding="utf-8") as f:
+				kept = [json.loads(ln) for ln in f if ln.strip()]
+			self.assertEqual([r["preset"] for r in kept], ["z"])  # the other preset survives, the corrupt line is dropped
+			with open(cal_path, encoding="utf-8") as f:
+				self.assertEqual(set(json.load(f)), {"kz", "k3"})
+			self.assertFalse(os.path.exists(req_path + ".tmp"))
+
+			# nothing stored for the name: the files are left as they are
+			self.assertEqual(state.forget_presets(state_dir, ["nope"]), {"nope": (0, 0)})
+			with open(req_path, encoding="utf-8") as f:
+				self.assertEqual([json.loads(ln)["preset"] for ln in f if ln.strip()], ["z"])
+			with open(cal_path, encoding="utf-8") as f:
+				self.assertEqual(set(json.load(f)), {"kz", "k3"})
+
+			# a state folder that does not exist is not created
+			absent = os.path.join(tmp, "absent")
+			self.assertEqual(state.forget_presets(absent, ["x"]), {"x": (0, 0)})
+			self.assertFalse(os.path.exists(absent))
+
 	def test_calibration_sample_gates(self):
 		with tempfile.TemporaryDirectory() as tmp, _patch_win():
 			cfg = dict(state.CFG, state_dir=os.path.join(tmp, "state"), persist=False, calibrate=False, load_grace_s=15.0, spill_mib=256.0, idle_headroom_mib=1024.0)
@@ -1417,6 +1457,7 @@ CASES = [
 	("requests_in_memory_capped", TestState("test_requests_in_memory_capped")),
 	("calibration_write_is_atomic", TestState("test_calibration_write_is_atomic")),
 	("calibration_load_drops_spilled_and_negative", TestState("test_calibration_load_drops_spilled_and_negative")),
+	("forget_presets_removes_requests_and_calibration", TestState("test_forget_presets_removes_requests_and_calibration")),
 	("calibration_sample_gates", TestState("test_calibration_sample_gates")),
 	("fit_projection_cached_per_configuration", TestState("test_fit_projection_cached_per_configuration")),
 	("fit_cache_persisted_and_reloaded", TestState("test_fit_cache_persisted_and_reloaded")),

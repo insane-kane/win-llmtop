@@ -552,6 +552,31 @@ class TestCLI(unittest.TestCase):
 		self.assertEqual(proc.returncode, 0, "stderr: %s" % proc.stderr)
 		self.assertNotIn("\x1b[", proc.stdout)
 
+	def test_forget_preset_option(self):
+		with tempfile.TemporaryDirectory() as tmp:
+			state_dir = os.path.join(tmp, "state")
+			os.makedirs(state_dir)
+			req_path = os.path.join(state_dir, "requests.jsonl")
+			cal_path = os.path.join(state_dir, "calibration.json")
+			with open(req_path, "w", encoding="utf-8") as f:
+				f.write(json.dumps({"preset": "x", "pn": 100, "wall": 1700000000.0}) + "\n")
+				f.write(json.dumps({"preset": "y", "pn": 200, "wall": 1700000100.0}) + "\n")
+			with open(cal_path, "w", encoding="utf-8") as f:
+				json.dump({"kx": {"v": 4, "overhead": 100, "at": 1700000100.0, "preset": "x"}}, f)
+			# --no-persist does not stop the writes
+			proc = subprocess.run([sys.executable, "-I", LLMTOP_PY, "--forget-preset", "x", "--forget-preset", "y", "--no-persist", "--state-dir", state_dir], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+			self.assertEqual(proc.returncode, 0, "stderr: %s" % proc.stderr)
+			self.assertIn("forgot x: 1 request, 1 calibration entry", proc.stdout)
+			self.assertIn("forgot y: 1 request, 0 calibration entries", proc.stdout)
+			with open(req_path, encoding="utf-8") as f:
+				self.assertEqual([json.loads(ln) for ln in f if ln.strip()], [])
+			with open(cal_path, encoding="utf-8") as f:
+				self.assertEqual(json.load(f), {})
+			# a name with nothing stored: exit 1 and a line saying so
+			proc = subprocess.run([sys.executable, "-I", LLMTOP_PY, "--forget-preset", "no-such-preset", "--state-dir", state_dir], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+			self.assertEqual(proc.returncode, 1, "stderr: %s" % proc.stderr)
+			self.assertIn("nothing stored for no-such-preset", proc.stdout)
+
 
 CASES = [
 	("help_generic_and_no_local_names", TestCLI("test_help_generic_and_no_local_names")),
@@ -575,6 +600,7 @@ CASES = [
 	("bad_threshold_values_exit_1", TestCLI("test_bad_threshold_values_exit_1")),
 	("plan_unknown_preset_exits_1", TestCLI("test_plan_unknown_preset_exits_1")),
 	("no_color_env_turns_colour_off", TestCLI("test_no_color_env_turns_colour_off")),
+	("forget_preset_option", TestCLI("test_forget_preset_option")),
 ]
 
 

@@ -255,6 +255,29 @@ def test_requests_v2_colours_notes_and_nested_turns():
 	assert any("▸ " in ln for ln in recent), rec_text
 
 
+def test_requests_hides_gone_presets():
+	# a preset the server no longer lists is hidden once its newest request is older than hide_after_days (7)
+	c = collector([req(preset="old", wall=2000.0 - 10 * 86400.0), req(preset="new", wall=1900.0)], cfg=dict(CFG))
+	c.models = {"new": {}}
+	snap = {"t": 2000.0}
+	text = "\n".join(plain_requests(c))
+	assert "old" not in text, text
+	assert "1 hidden (h shows them)" in text, text
+	assert "new" in text, text
+
+	# h (view.show_hidden) brings the hidden preset back
+	view = pages.View()
+	view.show_hidden = True
+	text = "\n".join(plain(pages.requests(c, snap, view, 200, 60)))
+	assert "old" in text and "new" in text, text
+
+	# the server unreachable (no models): nothing is hidden
+	c.models = {}
+	text = "\n".join(plain_requests(c))
+	assert "old" in text and "new" in text, text
+	assert "hidden" not in text, text
+
+
 def test_prompt_and_turn_rows_have_hit_and_draft():
 	r1 = dict(req(preset="alpha", pn=500, pp=400.0, tn=40, tg=50.0, wall=1000.0), slot=0, cached=2000, kv=2540, acc=0.88, dacc=308, dgen=350)
 	r2 = dict(req(preset="alpha", pn=300, pp=420.0, tn=30, tg=52.0, wall=1005.0), slot=0, cached=2540, kv=2870, acc=0.91, dacc=30, dgen=33)
@@ -1230,6 +1253,7 @@ CASES = [
 	("uma_vram_bar_scales_against_budget", test_uma_vram_bar_scales_against_budget),
 	("header_mode_none_server_down_says_not_found", test_header_mode_none_server_down_says_not_found),
 	("requests_v2_colours_notes_and_nested_turns", test_requests_v2_colours_notes_and_nested_turns),
+	("requests_hides_gone_presets", test_requests_hides_gone_presets),
 	("prompt_and_turn_rows_have_hit_and_draft", test_prompt_and_turn_rows_have_hit_and_draft),
 	("requests_fit_width_100", test_requests_fit_width_100),
 	("by_context_tables_ranked_colours", test_by_context_tables_ranked_colours),

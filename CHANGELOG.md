@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--fit-params auto|never`: `auto` (the default) skips `llama-fit-params` while resident VRAM is within `fit_headroom_mib` (256 MiB) of the OS budget and retries after 60 s; `never` turns it off. `--plan` always runs it.
 - `NO_COLOR` (any non-empty value) turns colour off, like `--no-color`.
 - A `slots` line on the Live page for a server with more than one slot: how many are busy, which one is shown, and the tokens in a shared cache.
+- `--forget-preset NAME` (repeatable) deletes a preset's stored requests and calibration, then exits.
+- The Requests page hides presets the server no longer lists once their newest request is more than `hide_after_days` (7) days old; `h` shows them.
 - `tests/README.md` on how the tests are written, and `python -I tests/run_all.py --quiet`, which prints only failing suites.
 
 ### Changed
@@ -22,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Charts of 1 h and longer are drawn from 10 s and 60 s summaries (a 24 h chart now takes about 0.1 ms instead of 15 ms), and prompt grouping reruns only when a request arrives (a full history went from about 390 ms to 8 ms per frame).
 - `requests.jsonl` keeps the newest 50,000 requests (trimmed at start-up once it holds twice that), and win-llmtop holds at most 60,000 in memory.
 - Out-of-range `--hz`, `--history-hours`, `--width` and `--spill-mib` values exit with status 2; a bad `--threshold` value or an unknown `--plan` preset exits with status 1 and a message instead of a traceback.
+- Each Memory page category keeps one colour on every model, on the bar and in the rows; the KV cache, compute buffers, unattributed memory and the learned overhead each have a colour no weights category uses.
+- The Live page's model line no longer shows the preset's reasoning level: it was the configured default, not what a request asked for.
 
 ### Fixed
 
@@ -32,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A corrupt GGUF header stops after 256 MiB instead of reading the whole model file.
 - A machine without a page file no longer shows an empty one; the address-space walk opens `llama-server` with less access.
 - An unexpected `/slots` reply is reported as a slot error instead of stopping the collector.
+- A long prompt no longer flickers between PREFILL and DECODE on the Live page. `llama-server` reports the prompt's length one batch at a time, so while the total is unknown the line shows the tokens processed so far and the rate, without a bar or ETA. A sample more than 2 s old says how old it is.
+- The Memory page's learned runtime overhead is learned only once a model has settled and is fully resident and not spilled, so it is never negative. A spilled or negative overhead stored by an earlier version is dropped on start-up, and `--plan` shows `?` until a new one is learned.
+- The `/slots` alert no longer says to start the server with `--slots`: the endpoint is on unless the server was started with `--no-slots`.
 
 ## [0.3.1] - 2026-10-27
 

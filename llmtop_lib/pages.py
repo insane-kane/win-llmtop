@@ -26,6 +26,7 @@ class View:
 		self.page, self.win, self.scroll, self.msel, self.rsel, self.level, self.paused, self.msg = 0, window, 0, 0, 0, 0, False, ""
 		self.gh, self.tmode, self.dev, self.turns = 0, 0, 0, False  # graph height (0 = fit the terminal), tensor view mode, tensor device filter, nested turns
 		self.live_prompts = False  # the Live page's bottom table: recent prompts instead of recent turns
+		self.show_hidden = False  # the Requests page: show the presets hidden by hide_after_days
 		self.detail = False  # the Events page's detail toggle: show each event's detail line(s)
 		self.cache, self.cache_sec = {}, 0
 
@@ -278,7 +279,7 @@ def notice_lines(snap, n=4):
 def footer(view, W):
 	page = View.PAGES[view.page]
 	keys = "1-6 or ←/→ page   [ ] time window   g graph height   s graph style   p pause   ↑↓ PgUp PgDn scroll"
-	keys += {"Live": "   t prompts/turns", "Memory": "   m next model", "System": "", "Requests": "   m preset   t turns", "Events": "   f level filter   d detail", "Tensors": "   t layers/tensors   d device   m next model"}[page]
+	keys += {"Live": "   t prompts/turns", "Memory": "   m next model", "System": "", "Requests": "   m preset   t turns   h show hidden", "Events": "   f level filter   d detail", "Tensors": "   t layers/tensors   d device   m next model"}[page]
 	return "%s %s   q quit%s%s" % (C.bold, keys, C.reset, "   " + view.msg if view.msg else "")
 
 
@@ -1076,14 +1077,37 @@ def preset_summary(c, preset, ps=None):
 		"pp_min": pp_min, "tg_min": tg_min}
 
 
+def hidden_presets(c, snap):
+	"""(every preset with stored requests, sorted, and the set hidden). A preset is hidden when the server no longer lists it and its newest request finished more than hide_after_days ago; with no models from the server nothing is hidden."""
+	newest = {}
+	for r in c.requests:
+		wall = r.get("wall")
+		if wall and wall == wall:
+			newest[r["preset"]] = max(newest.get(r["preset"], wall), wall)
+	models = getattr(c, "models", None)
+	if not models:  # the server is unreachable: nothing is gone, hide nothing
+		return sorted({r["preset"] for r in c.requests}), set()
+	days = c.cfg.get("hide_after_days", S.CFG["hide_after_days"])
+	now = (snap or {}).get("t") or time.time()
+	hidden = {p for p in newest if p not in models and now - newest[p] > days * 86400}
+	return sorted({r["preset"] for r in c.requests}), hidden
+
+
 def requests(c, snap, view, W, H):
-	presets = sorted({r["preset"] for r in c.requests})
-	sel = presets[view.rsel - 1] if view.rsel and presets else None
-	shown = [p for p in presets if sel is None or p == sel]
+	presets, hidden = hidden_presets(c, snap)
+	plist = presets if view.show_hidden else [p for p in presets if p not in hidden]
+	sel = plist[view.rsel - 1] if view.rsel and view.rsel <= len(plist) else None
+	shown = [p for p in plist if sel is None or p == sel]
 	all_ps, _ = prompt_groups(c, view, snap)
-	ps = [p for p in all_ps if sel is None or p["preset"] == sel]
-	rs = [r for r in c.requests if sel is None or r["preset"] == sel]
-	head = [section("REQUESTS", W, "%d prompts · %d turns · %s   (m: preset  t: turns)" % (len(ps), len(rs), sel or "all presets"))]
+	keep = set(plist)
+	if sel is None:
+		ps = [p for p in all_ps if p["preset"] in keep]
+		rs = [r for r in c.requests if r["preset"] in keep]
+	else:
+		ps = [p for p in all_ps if p["preset"] == sel]
+		rs = [r for r in c.requests if r["preset"] == sel]
+	hidden_note = "" if not hidden else " · %d gone, shown (h hides them)" % len(hidden) if view.show_hidden else " · %d hidden (h shows them)" % len(hidden)
+	head = [section("REQUESTS", W, "%d prompts · %d turns · %s%s   (m: preset  t: turns)" % (len(ps), len(rs), sel or "all presets", hidden_note))]
 	if not rs:
 		empty = "no finished requests in %s yet" % c.cfg["log_dir"] if c.cfg.get("log_dir") else "no finished requests yet"
 		return head + ["", "  %s%s%s" % (C.grey, empty, C.reset)]
@@ -1128,10 +1152,10 @@ def requests(c, snap, view, W, H):
 		head += ["", section(title, W, sub_b), C.grey + "  " + pad("preset", 24) + "".join(rpad(lb, 13) for lb in DEC_LABELS) + C.reset]
 		cols = []  # ranked colours per column, over every preset so a filter does not change them
 		for b in range(len(DEC_LABELS)):
-			values = [(S.median(table[(q, b)]) if table.get((q, b)) else NAN, len(table.get((q, b), []))) for q in presets]
+			values = [(S.median(table[(q, b)]) if table.get((q, b)) else NAN, len(table.get((q, b), []))) for q in plist]
 			cols.append(rank_colours(values))
 		for p in shown:
-			i = presets.index(p)
+			i = plist.index(p)
 			cells = []
 			for b in range(len(DEC_LABELS)):
 				xs = table.get((p, b), [])

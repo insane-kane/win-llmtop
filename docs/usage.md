@@ -43,7 +43,7 @@ Run `win-llmtop` with no arguments for the interactive full-screen view (sampled
 | `1` | **Live** | Active alerts; GPU VRAM bar against the OS budget, `llama-server` resident and shared memory (`llama-server shared`: expected share and what is beyond it), engine load and other apps' VRAM; system RAM, commit charge, paging and CPU load (`llama-server` cores, clock, processor queue) with trend charts; running request phase, progress, ETA and tokens/s; recent turns or recent prompts (`t` toggles; `▸` marks the first turn of each prompt) and events |
 | `2` | **Memory** | For one preset (`m` cycles presets, loaded or unloaded): VRAM by component (weights, KV cache, recurrent state, compute buffers, draft, overhead) against the OS budget; `llama-server` host RAM breakdown; layer placement overview |
 | `3` | **System** | CPU model, core and thread counts, per-core load, L1/L2/L3 cache topology, and CPU load and clock trend charts; system RAM by consumer (`llama-server`, other processes, kernel remainder, file cache, free) with top working sets; page file size, use, peak and commit limit; RAM and paging trend charts |
-| `4` | **Requests** | Per-preset prompt and turn volume, busy time, loads and issues; median, slow-10% and sample-count speeds; prefill and decode t/s by context depth (`<8k`, `8–32k`, `32–64k`, `64k+`); per-turn charts; and every prompt with nested turns, each with its cache hit and draft acceptance (`m` filters by preset, `t` toggles nested turns) |
+| `4` | **Requests** | Per-preset prompt and turn volume, busy time, loads and issues; median, slow-10% and sample-count speeds; prefill and decode t/s by context depth (`<8k`, `8–32k`, `32–64k`, `64k+`); per-turn charts; and every prompt with nested turns, each with its cache hit and draft acceptance (`m` filters by preset, `t` toggles nested turns, `h` shows the hidden presets) |
 | `5` | **Events** | Threshold alerts raised and cleared, model loads, request queueing, preset evictions, prompt-cache misses, request errors and context truncation. Each event is a short headline; `f` filters by severity level and `d` toggles the detail line(s) (the comparisons, thresholds and deductions the headline leaves out) |
 | `6` | **Tensors** | Every layer (`t` toggles individual tensors) with GGUF type, shape, size, `■ GPU` / `■ CPU` badge, and the flag or rule that placed CPU tensors (`d` filters by device) |
 
@@ -61,6 +61,7 @@ Run `win-llmtop` with no arguments for the interactive full-screen view (sampled
 | `m` | **Requests** | Filter the Requests page by preset |
 | `t` | **Live** | Switch the bottom table between recent turns and recent prompts |
 | `t` | **Requests** | Show or hide individual turns nested under each prompt |
+| `h` | **Requests** | Show the hidden presets (those the server no longer lists and whose newest request is older than `hide_after_days`, 7 days by default, settable with [`--threshold`](llmtop.1.md#options) `hide_after_days=N`) |
 | `f` | **Events** | Cycle the event severity filter (`all`, `warn+`, `crit`) |
 | `d` | **Events** | Toggle the detail line(s) under each event (the comparisons, thresholds and deductions the headline leaves out) |
 | `t` | **Tensors** | Switch between per-layer summary and every individual tensor |
@@ -120,5 +121,7 @@ By default, `win-llmtop` stores persisted history in `%LOCALAPPDATA%\win-llmtop\
 - `requests.jsonl` — finished request records, preserved across restarts because `llama-server` truncates and rewrites a preset's log file every time that model loads.
 - `calibration.json` — the per-configuration VRAM overhead and idle shared-memory baseline learned when a single model is resident.
 - `fit-cache.json` — the per-configuration `llama-fit-params` projection cache, so the helper is not re-run for a configuration it has already projected.
+
+To drop a preset's stored history, pass [`--forget-preset`](llmtop.1.md#options) `NAME` (repeatable): it deletes the preset's lines from `requests.jsonl` and its entries from `calibration.json` and exits, printing one line per preset. Quit a running `win-llmtop` first: it keeps the history in memory and would write the calibration back.
 
 Pass [`--no-persist`](llmtop.1.md#options) to disable all disk writes (persistence is also disabled automatically for [`--check`](llmtop.1.md#options), [`--once`](llmtop.1.md#options) and [`--plan`](llmtop.1.md#options)). Read-only runs still replay whatever history is already present in the state folder.

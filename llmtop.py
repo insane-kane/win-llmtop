@@ -84,9 +84,13 @@ def handle(key, c, view, snap, H):
 	elif key == "m" and page in ("Memory", "Tensors"):
 		view.msel, view.scroll = view.msel + 1, 0
 	elif key == "m" and page == "Requests":
-		view.rsel, view.scroll = (view.rsel + 1) % (len({r["preset"] for r in c.requests}) + 1), 0
+		presets, hidden = pages.hidden_presets(c, snap)
+		visible = presets if view.show_hidden else [p for p in presets if p not in hidden]
+		view.rsel, view.scroll = (view.rsel + 1) % (len(visible) + 1), 0
 	elif key == "t" and page == "Requests":
 		view.turns = not view.turns
+	elif key == "h" and page == "Requests":
+		view.show_hidden, view.scroll = not view.show_hidden, 0
 	elif key == "t" and page == "Live":
 		view.live_prompts = not view.live_prompts
 	elif key == "f" and page == "Events":
@@ -562,6 +566,7 @@ def main():
 	ap.add_argument("--spill-mib", type=_spill_mib_value, default=state.CFG["spill_mib"], help="excess shared GPU memory (MiB) that raises an alert (0 or more)")
 	ap.add_argument("--threshold", action="append", default=[], metavar="NAME=VALUE", help="override an alert threshold (see CFG in llmtop_lib/state.py); repeatable")
 	ap.add_argument("--no-persist", action="store_true", help="do not mirror history to disk")
+	ap.add_argument("--forget-preset", action="append", default=[], metavar="NAME", help="delete the named preset's stored requests and calibration, then exit; repeatable")
 	ap.add_argument("--graph-style", choices=("braille", "blocks", "coarse", "ascii"), default=None, help="braille line plots, block-character charts, a code-page-437 coarse style for the classic console, or plain ascii")
 	ap.add_argument("--no-color", action="store_true")
 	ap.add_argument("--width", type=_width_value, default=0, help="line width for --once and --plan (0, or at least 40)")
@@ -576,6 +581,17 @@ def main():
 		sys.exit("llmtop reads Windows performance counters and runs on Windows only.")
 	if not win.IS_64:
 		sys.exit("win-llmtop needs 64-bit Python (32-bit Python cannot read a 64-bit llama-server's memory)")
+	if args.forget_preset:
+		# Pure file work in the state folder: no collector, no server, no state folder created. --no-persist does not apply.
+		counts = state.forget_presets(args.state_dir, args.forget_preset)
+		rc = 0
+		for name, (n_req, n_cal) in counts.items():
+			if n_req or n_cal:
+				print("forgot %s: %d request%s, %d calibration entr%s" % (name, n_req, "" if n_req == 1 else "s", n_cal, "y" if n_cal == 1 else "ies"))
+			else:
+				print("nothing stored for %s" % name)
+				rc = 1
+		sys.exit(rc)
 	args.style_explicit = args.graph_style is not None
 	if not args.style_explicit:
 		args.graph_style = ui.detect_style(os.environ)

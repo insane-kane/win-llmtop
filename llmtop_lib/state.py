@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import socket
 import statistics
 import threading
 import time
@@ -72,11 +73,27 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 		raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
 
+_LOOPBACK_OPENERS = {}
+_REMOTE_OPENERS = {}
+
+
 def opener_for(url):
 	"""The opener for a request to `url`: no redirect is followed, and a loopback server is reached directly (never through a proxy) while any other
-	server goes through the system proxy settings. Built per request, so the environment and registry settings are read as they are now."""
-	proxies = urllib.request.ProxyHandler({}) if is_loopback_host(urllib.parse.urlsplit(url).hostname) else urllib.request.ProxyHandler()
-	return urllib.request.build_opener(proxies, _NoRedirect())
+	server goes through the system proxy settings. Loopback openers are cached per URL; remote openers are rebuilt at most once every 60 s so proxy changes still apply."""
+	host = urllib.parse.urlsplit(url).hostname
+	if is_loopback_host(host):
+		op = _LOOPBACK_OPENERS.get(url)
+		if op is None:
+			op = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+			_LOOPBACK_OPENERS[url] = op
+		return op
+	now = time.time()
+	entry = _REMOTE_OPENERS.get(url)
+	if entry is not None and now - entry[1] < 60.0:
+		return entry[0]
+	op = urllib.request.build_opener(urllib.request.ProxyHandler(), _NoRedirect())
+	_REMOTE_OPENERS[url] = (op, now)
+	return op
 
 
 def is_loopback_host(host):
@@ -273,6 +290,135 @@ class Ring:
 				if sec >= self.l60[i60]:
 					self.v60[i60], self.l60[i60] = x, sec
 
+	def put_run(self, t, n, x):
+		if n <= 0:
+			return
+		span = self.span
+		if n > span:
+			t += (n - span)
+			n = span
+		sec = int(t)
+		end_sec = sec + n
+		s_arr, v_arr = self.s, self.v
+		i0 = sec % span
+
+		recomp10 = recomp60 = None
+		if i0 + n <= span:
+			if n == 5 and (s_arr[i0] == sec or s_arr[i0+1] == sec+1 or s_arr[i0+2] == sec+2 or s_arr[i0+3] == sec+3 or s_arr[i0+4] == sec+4):
+				recomp10, recomp60 = set(), set()
+				for dt in range(5):
+					idx = i0 + dt
+					s_val = sec + dt
+					if s_arr[idx] == s_val:
+						recomp10.add(s_val // 10)
+						recomp60.add(s_val // 60)
+					v_arr[idx] = x
+					s_arr[idx] = s_val
+			elif n == 5:
+				v_arr[i0] = v_arr[i0+1] = v_arr[i0+2] = v_arr[i0+3] = v_arr[i0+4] = x
+				s_arr[i0] = sec
+				s_arr[i0+1] = sec + 1
+				s_arr[i0+2] = sec + 2
+				s_arr[i0+3] = sec + 3
+				s_arr[i0+4] = sec + 4
+			else:
+				for dt in range(n):
+					idx = i0 + dt
+					s_val = sec + dt
+					if s_arr[idx] == s_val:
+						if recomp10 is None:
+							recomp10, recomp60 = set(), set()
+						recomp10.add(s_val // 10)
+						recomp60.add(s_val // 60)
+					v_arr[idx] = x
+					s_arr[idx] = s_val
+		else:
+			for s_val in range(sec, end_sec):
+				idx = s_val % span
+				if s_arr[idx] == s_val:
+					if recomp10 is None:
+						recomp10, recomp60 = set(), set()
+					recomp10.add(s_val // 10)
+					recomp60.add(s_val // 60)
+				v_arr[idx] = x
+				s_arr[idx] = s_val
+
+		self._put_bucket(sec, end_sec, n, x, 10, self.span10, self.s10, recomp10)
+		self._put_bucket(sec, end_sec, n, x, 60, self.span60, self.s60, recomp60)
+
+	def _put_bucket(self, sec, end_sec, n, x, size, span_b, sb, recomp):
+		b_start = sec // size
+		b_end = (end_sec - 1) // size
+		how = self.how
+		if how == "mean":
+			sum_arr = self.sum10 if size == 10 else self.sum60
+			cnt_arr = self.cnt10 if size == 10 else self.cnt60
+		elif how == "last":
+			v_arr = self.v10 if size == 10 else self.v60
+			l_arr = self.l10 if size == 10 else self.l60
+		else:
+			v_arr = self.v10 if size == 10 else self.v60
+
+		if b_start == b_end and not recomp:
+			ib = b_start % span_b
+			if how == "mean":
+				if sb[ib] != b_start:
+					sb[ib] = b_start
+					sum_arr[ib], cnt_arr[ib] = x * n, n
+				else:
+					sum_arr[ib] += x * n
+					cnt_arr[ib] += n
+			elif how == "last":
+				last_sec = end_sec - 1
+				if sb[ib] != b_start:
+					sb[ib] = b_start
+					v_arr[ib], l_arr[ib] = x, last_sec
+				elif last_sec >= l_arr[ib]:
+					v_arr[ib], l_arr[ib] = x, last_sec
+			elif how == "max":
+				if sb[ib] != b_start:
+					sb[ib] = b_start
+					v_arr[ib] = x
+				elif x > v_arr[ib]:
+					v_arr[ib] = x
+			else:
+				if sb[ib] != b_start:
+					sb[ib] = b_start
+					v_arr[ib] = x
+				elif x < v_arr[ib]:
+					v_arr[ib] = x
+		else:
+			for b in range(b_start, b_end + 1):
+				if recomp and b in recomp:
+					self._recompute(b * size, size)
+					continue
+				ib = b % span_b
+				s_a = max(sec, b * size)
+				s_b = min(end_sec, (b + 1) * size)
+				k = s_b - s_a
+				last_sec = s_b - 1
+				if sb[ib] != b:
+					sb[ib] = b
+					if how == "mean":
+						sum_arr[ib], cnt_arr[ib] = x * k, k
+					elif how == "last":
+						v_arr[ib], l_arr[ib] = x, last_sec
+					else:
+						v_arr[ib] = x
+				else:
+					if how == "max":
+						if x > v_arr[ib]:
+							v_arr[ib] = x
+					elif how == "min":
+						if x < v_arr[ib]:
+							v_arr[ib] = x
+					elif how == "mean":
+						sum_arr[ib] += x * k
+						cnt_arr[ib] += k
+					elif how == "last":
+						if last_sec >= l_arr[ib]:
+							v_arr[ib], l_arr[ib] = x, last_sec
+
 	def _recompute(self, sec, size):
 		b = sec // size
 		span_b = self.span10 if size == 10 else self.span60
@@ -459,6 +605,19 @@ class History:
 			return [], []
 		for name in names:
 			if not (name.startswith("samples-") and name.endswith(".jsonl")):
+				continue
+			date_str = name[8:-6]
+			try:
+				if len(date_str) != 8:
+					raise ValueError("invalid date length")
+				st = time.strptime(date_str, "%Y%m%d")
+			except (ValueError, TypeError):
+				st = time.localtime()
+			try:
+				day_end = time.mktime((st.tm_year, st.tm_mon, st.tm_mday + 1, 0, 0, 0, -1, -1, -1))
+			except (ValueError, OverflowError):
+				day_end = float("inf")
+			if day_end <= since:
 				continue
 			try:
 				with open(os.path.join(self.dir, name), encoding="utf-8") as f:
@@ -701,6 +860,7 @@ class Collector:
 		self.router_discovery, self.router_tried, self.mode = None, [], None
 		self._discover_idx = 0
 		self._discover_tried = []
+		self._models_backoff = 0
 		self._alias_cache = {}
 		self._alias_threads = {}
 		self._alias_lock = threading.Lock()
@@ -1011,12 +1171,17 @@ class Collector:
 		if self.hist and not self.state_error:
 			samples, events = self.hist.load(time.time() - self.cfg["history_hours"] * 3600)
 			now = time.time()
+			now_sec = int(now)
+			rings = self.rings
 			for t, vals in samples:
+				t_sec = int(t)
+				n = 5 if t_sec + 4 <= now_sec else max(0, min(5, now_sec - t_sec + 1))
+				if n <= 0:
+					continue
 				for k, x in vals.items():
-					if k in self.rings:
-						for dt in range(5):  # one persisted sample stands for the 5 s around it
-							if t + dt <= now:
-								self.rings[k].put(t + dt, x)
+					r = rings.get(k)
+					if r is not None:
+						r.put_run(t_sec, n, x)
 			self.add_events(events)
 		spawns = logmod.session_starts(self.cfg.get("log_dir"))
 		self.poll_models(time.time())
@@ -1155,6 +1320,7 @@ class Collector:
 		now = now or time.time()
 		if self.cfg.get("api_key") != self._last_api_key:
 			self._last_api_key = self.cfg.get("api_key")
+			self._models_backoff = 0
 			for k in [k for k in self.due if k == "models" or k.startswith("slots:")]:
 				self.due.pop(k, None)
 		new_events = []
@@ -1244,6 +1410,12 @@ class Collector:
 	def poll_models(self, now):
 		self.watched_exe(refresh=True)
 		try:
+			if not self.router_up:
+				u = urllib.parse.urlsplit(self.cfg["router"])
+				if is_loopback_host(u.hostname):
+					port = u.port or (443 if u.scheme == "https" else 80)
+					s = socket.create_connection((u.hostname, port), 0.25)
+					s.close()
 			data = self.get("/models")["data"]
 			if not self.router_explicit and not self.router_discovery:
 				self.router_discovery = "server found at %s (default)" % self.cfg["router"]
@@ -1261,16 +1433,24 @@ class Collector:
 			else:
 				data, err = self._discover_router(e)
 			if data is None:
-				if isinstance(err, urllib.error.HTTPError) and err.code in (401, 403):
-					self.router_auth_error = "HTTP %d" % err.code
-					self.router_up = False
-					self.router_error = "%s (%s)" % (self.router_auth_error, "pass --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY" if self.key_allowed else
-						"no API key was sent to the default address: pass --router with --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY")
-					self.models, self.mode = {}, None
+				if isinstance(err, urllib.error.HTTPError):
+					self._models_backoff = 0
+					if err.code in (401, 403):
+						self.router_auth_error = "HTTP %d" % err.code
+						self.router_up = False
+						self.router_error = "%s (%s)" % (self.router_auth_error, "pass --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY" if self.key_allowed else
+							"no API key was sent to the default address: pass --router with --api-key or set LLMTOP_API_KEY / LLAMA_API_KEY")
+						self.models, self.mode = {}, None
+					else:
+						self.router_auth_error = None
+						self.router_up, self.router_error, self.mode = False, str(err)[:80], None
 				else:
+					self._models_backoff = 5 if not self._models_backoff else min(30, self._models_backoff * 2)
+					self.due["models"] = now + self._models_backoff
 					self.router_auth_error = None
 					self.router_up, self.router_error, self.mode = False, str(err)[:80], None
 				return
+		self._models_backoff = 0
 		self.router_auth_error = None
 		self.models = {m["id"]: m for m in data if isinstance(m, dict) and "id" in m}
 		self.router_up, self.router_error = True, ""

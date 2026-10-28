@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Out-of-range `--hz`, `--history-hours`, `--width` and `--spill-mib` values exit with status 2; a bad `--threshold` value or an unknown `--plan` preset exits with status 1 and a message instead of a traceback.
 - Each Memory page category keeps one colour on every model, on the bar and in the rows; the KV cache, compute buffers, unattributed memory and the learned overhead each have a colour no weights category uses.
 - The Live page's model line no longer shows the preset's reasoning level: it was the configured default, not what a request asked for.
+- Faster start-up: the saved history is replayed in 5-second runs, and sample files older than the history window are skipped unread.
+- Requests reuse their HTTP opener (rebuilt at most once a minute for a remote server, so proxy changes still apply) instead of loading the system certificate store each time.
 
 ### Fixed
 
@@ -38,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An unexpected `/slots` reply is reported as a slot error instead of stopping the collector.
 - A long prompt no longer flickers between PREFILL and DECODE on the Live page. `llama-server` reports the prompt's length one batch at a time, so while the total is unknown the line shows the tokens processed so far and the rate, without a bar or ETA. A sample more than 2 s old says how old it is.
 - The Memory page's learned runtime overhead is learned only once a model has settled and is fully resident and not spilled, so it is never negative. A spilled or negative overhead stored by an earlier version is dropped on start-up, and `--plan` shows `?` until a new one is learned.
+- Keys work while the server is down. An unreachable server is retried after 5 s, doubling up to 30 s, and a server on this machine is checked with a quick connect first, so the screen no longer waits a second on every update.
 - The `/slots` alert no longer says to start the server with `--slots`: the endpoint is on unless the server was started with `--no-slots`.
 
 ## [0.3.1] - 2026-10-27

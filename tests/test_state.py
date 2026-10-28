@@ -14,6 +14,7 @@ import os
 import pathlib
 import random
 import re
+import socket
 import sys
 import tempfile
 import threading
@@ -1170,6 +1171,179 @@ class TestState(unittest.TestCase):
 				self.assertEqual(calls["n"], 1)  # auto with room: run
 				self.assertIsNone(c.mem["p"]["fit_skipped"])
 
+	def test_models_backoff_connection_error_and_reset(self):
+		"""When /models fails with connection error or timeout, poll interval backs off: 5s, 10s, 20s, 30s, 30s."""
+		import urllib.error
+		c = state.Collector(cfg=dict(state.CFG, router="http://127.0.0.1:8080", persist=False))
+
+		polls = []
+		def fail_conn(path, **k):
+			polls.append(now[0])
+			raise urllib.error.URLError("connection refused")
+
+		c.get = fail_conn
+		now = [1000.0]
+
+		dummy_sock = mock.MagicMock()
+		with mock.patch("socket.create_connection", return_value=dummy_sock):
+			# 1st failure: backoff is 5s (due at 1005.0)
+			c.tick(now[0])
+			self.assertEqual(len(polls), 1)
+			self.assertEqual(c.due["models"], 1005.0)
+
+			# Intermediate tick before due: does not poll
+			now[0] = 1002.0
+			c.tick(now[0])
+			self.assertEqual(len(polls), 1)
+
+			# 2nd failure at 1005.0: backoff is 10s (due at 1015.0)
+			def fail_timeout(path, **k):
+				polls.append(now[0])
+				raise TimeoutError("timed out")
+			c.get = fail_timeout
+			now[0] = 1005.0
+			c.tick(now[0])
+			self.assertEqual(len(polls), 2)
+			self.assertEqual(c.due["models"], 1015.0)
+
+			# 3rd failure at 1015.0: backoff is 20s (due at 1035.0)
+			now[0] = 1015.0
+			c.tick(now[0])
+			self.assertEqual(len(polls), 3)
+			self.assertEqual(c.due["models"], 1035.0)
+
+			# 4th failure at 1035.0: backoff caps at 30s (due at 1065.0)
+			now[0] = 1035.0
+			c.tick(now[0])
+			self.assertEqual(len(polls), 4)
+			self.assertEqual(c.due["models"], 1065.0)
+
+			# 5th failure at 1065.0: backoff stays 30s (due at 1095.0)
+			now[0] = 1065.0
+			c.tick(now[0])
+			self.assertEqual(len(polls), 5)
+			self.assertEqual(c.due["models"], 1095.0)
+
+			# Success at 1095.0: resets backoff to normal 1s (due at 1096.0)
+			c.get = lambda path, **k: (polls.append(now[0]), {"data": []})[1]
+			now[0] = 1095.0
+			c.tick(now[0])
+			self.assertEqual(len(polls), 6)
+			self.assertEqual(c._models_backoff, 0)
+			self.assertEqual(c.due["models"], 1096.0)
+
+			# HTTPError 401 at 1096.0: does not back off (next poll in 1s, due at 1097.0)
+			def fail_401(path, **k):
+				polls.append(now[0])
+				raise urllib.error.HTTPError("http://127.0.0.1:8080/models", 401, "Unauthorized", {}, None)
+			c.get = fail_401
+			now[0] = 1096.0
+			c.tick(now[0])
+			self.assertEqual(len(polls), 7)
+			self.assertEqual(c._models_backoff, 0)
+			self.assertEqual(c.due["models"], 1097.0)
+
+			# Another connection failure initiates backoff again
+			c.get = fail_conn
+			now[0] = 1097.0
+			c.tick(now[0])
+			self.assertEqual(len(polls), 8)
+			self.assertEqual(c.due["models"], 1102.0)
+
+			# Changing API key resets backoff and forces immediate poll
+			c.cfg["api_key"] = "secret"
+			now[0] = 1098.0  # Before 1102.0
+			c.tick(now[0])
+			self.assertEqual(len(polls), 9)  # Polled immediately!
+			self.assertEqual(c.due["models"], 1103.0)  # Starts fresh 5s backoff
+
+	def test_opener_for_caching_and_rebuild(self):
+		"""Two calls for a loopback URL return the same opener; a remote one is rebuilt after 60 s."""
+		op1 = state.opener_for("http://127.0.0.1:8080/models")
+		op2 = state.opener_for("http://127.0.0.1:8080/models")
+		self.assertIs(op1, op2)
+
+		remote_url = "http://192.168.1.100:8080/models"
+		cur_time = 1000000.0
+		with mock.patch("time.time", side_effect=lambda: cur_time):
+			r_op1 = state.opener_for(remote_url)
+			cur_time += 30.0
+			r_op2 = state.opener_for(remote_url)
+			self.assertIs(r_op1, r_op2)
+			cur_time += 31.0
+			r_op3 = state.opener_for(remote_url)
+			self.assertIsNot(r_op1, r_op3)
+
+	def test_history_load_skips_old_day_file_unopened(self):
+		"""History.load skips samples-YYYYMMDD.jsonl when its day ends at or before since; unparsable names read as today."""
+		with tempfile.TemporaryDirectory() as td:
+			now = time.time()
+			today_str = time.strftime("%Y%m%d", time.localtime(now))
+			old_time = now - 5 * 86400
+			old_str = time.strftime("%Y%m%d", time.localtime(old_time))
+
+			old_file = os.path.join(td, "samples-%s.jsonl" % old_str)
+			cur_file = os.path.join(td, "samples-%s.jsonl" % today_str)
+
+			cur_sec = int(now) - 60
+			with open(cur_file, "w", encoding="utf-8") as f:
+				f.write(json.dumps({"t": cur_sec, "v": {"cpu": 12.5}}) + "\n")
+
+			# Old file is corrupt/unreadable JSON
+			with open(old_file, "w", encoding="utf-8") as f:
+				f.write("CORRUPT NOT JSON\n")
+
+			hist = state.History(td)
+			since = now - 86400
+
+			opened = []
+			real_open = open
+			def tracking_open(path, *args, **kwargs):
+				opened.append(os.path.normpath(str(path)))
+				return real_open(path, *args, **kwargs)
+
+			with mock.patch("builtins.open", side_effect=tracking_open):
+				samples, events = hist.load(since)
+
+			self.assertNotIn(os.path.normpath(old_file), opened)
+			self.assertIn(os.path.normpath(cur_file), opened)
+			self.assertEqual(len(samples), 1)
+			self.assertEqual(samples[0][0], cur_sec)
+			self.assertEqual(samples[0][1], {"cpu": 12.5})
+
+			# An unparsable name is read as today (opened)
+			bad_name = os.path.join(td, "samples-nondate.jsonl")
+			with open(bad_name, "w", encoding="utf-8") as f:
+				f.write(json.dumps({"t": cur_sec, "v": {"ram": 10.0}}) + "\n")
+
+			opened.clear()
+			with mock.patch("builtins.open", side_effect=tracking_open):
+				samples, events = hist.load(since)
+
+			self.assertNotIn(os.path.normpath(old_file), opened)
+			self.assertIn(os.path.normpath(cur_file), opened)
+			self.assertIn(os.path.normpath(bad_name), opened)
+			self.assertEqual(len(samples), 2)
+
+	def test_down_loopback_server_fails_fast(self):
+		"""A closed local port fails within 0.4 s and applies back-off without making urllib request."""
+		s = socket.socket()
+		s.bind(("127.0.0.1", 0))
+		closed_port = s.getsockname()[1]
+		s.close()
+
+		cfg = dict(state.CFG, router="http://127.0.0.1:%d" % closed_port, persist=False)
+		c = state.Collector(cfg=cfg)
+		self.assertFalse(c.router_up)
+
+		t0 = time.monotonic()
+		c.poll_models(time.time())
+		elapsed = time.monotonic() - t0
+
+		self.assertFalse(c.router_up)
+		self.assertLess(elapsed, 0.4, "down loopback probe took %.4f s (expected < 0.4 s)" % elapsed)
+		self.assertEqual(c._models_backoff, 5)
+
 
 class _Emit:
 	"""A stand-in for Collector.emit: records each event it is called with."""
@@ -1424,6 +1598,54 @@ class TestRing(unittest.TestCase):
 		self.assertEqual(len(cols), 10)
 		self.assertEqual(cols[-1], 5.0)
 
+	def test_ring_put_run_equals_n_puts_all_how(self):
+		"""put_run equals n put calls for every how, crossing 10s and 60s boundaries and overlapping filled seconds."""
+		rng = random.Random(12345)
+		base = 1700000000
+
+		for kind in ("max", "min", "mean", "last"):
+			r_ref = state.Ring(3600, how=kind)
+			r_run = state.Ring(3600, how=kind)
+
+			# 1. Runs crossing 10s and 60s boundaries
+			cur = base
+			for _ in range(50):
+				n = rng.randint(1, 75)
+				val = rng.uniform(-100.0, 100.0)
+				for dt in range(n):
+					r_ref.put(cur + dt, val)
+				r_run.put_run(cur, n, val)
+				cur += n + rng.randint(0, 15)
+
+			# 2. Runs overlapping already-filled seconds
+			for _ in range(30):
+				start = base + rng.randint(0, 1500)
+				n = rng.randint(1, 40)
+				val = rng.uniform(-100.0, 100.0)
+				for dt in range(n):
+					r_ref.put(start + dt, val)
+				r_run.put_run(start, n, val)
+
+			# Compare per-second values
+			for s in range(base, cur):
+				v_ref, v_run = r_ref.at(s), r_run.at(s)
+				if math.isnan(v_ref) or math.isnan(v_run):
+					self.assertTrue(math.isnan(v_ref) and math.isnan(v_run), "how=%s at(%d) nan mismatch" % (kind, s))
+				else:
+					self.assertAlmostEqual(v_ref, v_run, places=4, msg="how=%s at(%d) mismatch" % (kind, s))
+
+			# Compare 10s and 60s summaries via cols()
+			for secs in (300, 900, 3600):
+				cols_ref = r_ref.cols(cur, secs, 60, kind)
+				cols_run = r_run.cols(cur, secs, 60, kind)
+				self.assertEqual(len(cols_ref), len(cols_run))
+				for j in range(len(cols_ref)):
+					c1, c2 = cols_ref[j], cols_run[j]
+					if math.isnan(c1) or math.isnan(c2):
+						self.assertTrue(math.isnan(c1) and math.isnan(c2), "how=%s cols(%d) col %d nan mismatch" % (kind, secs, j))
+					else:
+						self.assertAlmostEqual(c1, c2, places=4, msg="how=%s cols(%d) col %d mismatch" % (kind, secs, j))
+
 
 CASES = [
 	("router_mode_preset_loaded_and_flags_parsed", TestState("test_router_mode_preset_loaded_and_flags_parsed")),
@@ -1467,6 +1689,11 @@ CASES = [
 	("ring_overwrite_keeps_buckets_exact", TestRing("test_ring_overwrite_keeps_buckets_exact")),
 	("ring_stale_buckets_read_empty", TestRing("test_ring_stale_buckets_read_empty")),
 	("ring_default_kind_works", TestRing("test_ring_default_kind_works")),
+	("models_backoff_connection_error_and_reset", TestState("test_models_backoff_connection_error_and_reset")),
+	("ring_put_run_equals_n_puts_all_how", TestRing("test_ring_put_run_equals_n_puts_all_how")),
+	("opener_for_caching_and_rebuild", TestState("test_opener_for_caching_and_rebuild")),
+	("history_load_skips_old_day_file_unopened", TestState("test_history_load_skips_old_day_file_unopened")),
+	("down_loopback_server_fails_fast", TestState("test_down_loopback_server_fails_fast")),
 ]
 
 

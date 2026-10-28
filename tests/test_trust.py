@@ -356,12 +356,15 @@ class TestTrust(unittest.TestCase):
 			proxy.close()
 
 	def test_opener_is_built_per_request_from_the_current_environment(self):
-		"""The system proxy settings are read when the request is made, not when the module is imported."""
-		with mock.patch.dict(os.environ, {"HTTP_PROXY": "http://proxy-one.invalid:3128", "http_proxy": "http://proxy-one.invalid:3128"}):
-			first = state.opener_for("http://remote.invalid:8080")
-			os.environ["http_proxy"] = os.environ["HTTP_PROXY"] = "http://proxy-two.invalid:3128"
-			second = state.opener_for("http://remote.invalid:8080")
-			loop = state.opener_for("http://127.0.0.1:8080")
+		"""The system proxy settings are read when the request is made, not when the module is imported; remote openers rebuild at most once every 60 s."""
+		cur_time = 1000000.0
+		with mock.patch("time.time", side_effect=lambda: cur_time):
+			with mock.patch.dict(os.environ, {"HTTP_PROXY": "http://proxy-one.invalid:3128", "http_proxy": "http://proxy-one.invalid:3128"}):
+				first = state.opener_for("http://remote.invalid:8080")
+				os.environ["http_proxy"] = os.environ["HTTP_PROXY"] = "http://proxy-two.invalid:3128"
+				cur_time += 61.0
+				second = state.opener_for("http://remote.invalid:8080")
+				loop = state.opener_for("http://127.0.0.1:8080")
 
 		def proxies(opener):
 			return next(h.proxies for h in opener.handlers if isinstance(h, urllib.request.ProxyHandler))

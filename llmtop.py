@@ -234,16 +234,23 @@ def live(c, view):
 				out.write(text)
 				out.flush()
 				prev = text
-			deadline = t0 + 1.0 / c.cfg["hz"]
-			while time.time() < deadline:
-				key = read_key()
-				if key == "q":
-					return
-				if key:
-					handle(key, c, view, snap, size.lines)
-					prev = None
-					break
-				time.sleep(0.01)
+			key = read_key()
+			if key == "q":
+				return
+			if key:
+				handle(key, c, view, snap, size.lines)
+				prev = None
+			else:
+				deadline = t0 + 1.0 / c.cfg["hz"]
+				while time.time() < deadline:
+					key = read_key()
+					if key == "q":
+						return
+					if key:
+						handle(key, c, view, snap, size.lines)
+						prev = None
+						break
+					time.sleep(0.01)
 	finally:
 		out.write("\x1b[?25h\x1b[?1049l")
 		out.flush()

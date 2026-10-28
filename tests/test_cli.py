@@ -577,6 +577,40 @@ class TestCLI(unittest.TestCase):
 			self.assertEqual(proc.returncode, 1, "stderr: %s" % proc.stderr)
 			self.assertIn("nothing stored for no-such-preset", proc.stdout)
 
+	def test_live_keys_read_when_tick_overruns_frame(self):
+		"""Keys are read even when tick() takes longer than one frame (1/hz)."""
+		import contextlib
+		import io
+		import llmtop
+		from llmtop_lib import pages
+		from types import SimpleNamespace
+
+		snap = {"t": 1000.0, "router_up": False, "mode": None}
+		tick_count = [0]
+		fake_time = [1000.0]
+
+		def slow_tick(t0=None):
+			tick_count[0] += 1
+			fake_time[0] += 1.0  # tick took 1.0s, frame period is 0.25s (hz=4)
+			return snap
+
+		c = SimpleNamespace(
+			cfg={"hz": 4.0},
+			tick=slow_tick,
+			alerts=SimpleNamespace(ordered=lambda: []),
+			state_dir=None,
+			state_error="no state folder",
+		)
+		view = pages.View()
+		buf = io.StringIO()
+
+		with mock.patch("time.time", side_effect=lambda: fake_time[0]), \
+		     mock.patch.object(llmtop, "read_key", return_value="q"), \
+		     contextlib.redirect_stdout(buf):
+			llmtop.live(c, view)
+
+		self.assertLessEqual(tick_count[0], 2, "live() should have exited within two iterations")
+
 
 CASES = [
 	("help_generic_and_no_local_names", TestCLI("test_help_generic_and_no_local_names")),
@@ -601,6 +635,7 @@ CASES = [
 	("plan_unknown_preset_exits_1", TestCLI("test_plan_unknown_preset_exits_1")),
 	("no_color_env_turns_colour_off", TestCLI("test_no_color_env_turns_colour_off")),
 	("forget_preset_option", TestCLI("test_forget_preset_option")),
+	("live_keys_read_when_tick_overruns_frame", TestCLI("test_live_keys_read_when_tick_overruns_frame")),
 ]
 
 

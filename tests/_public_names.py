@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Shared forbidden-content patterns for public-tree and documentation tests.
 
 	Built from string pieces so this module never matches its own patterns.

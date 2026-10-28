@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Run CI's lint check (ruff, at the pinned version) in the local test suite.
 
 	Nothing is installed: ruff runs as a throwaway tool at the exact version

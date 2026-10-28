@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Trust-boundary tests for win-llmtop: what a server's say-so may start, open or receive.
 
 	A program is started only from the folder of the running llama-server that serves the watched URL; a file path a server reports is opened

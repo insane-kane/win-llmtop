@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """llama-server log parsing for llmtop: finished requests with their timings, model sessions, router lifecycle events.
 
 Child logs (one per model process) carry per-request timings; the router log (llama-server-<yyyymmdd-hhmmss>.log) carries model loads,

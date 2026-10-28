@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Unit tests for llmtop_lib/log.py: stock llama.cpp logs (no timestamps, ANSI colours, router-forwarded lines, older wording).
 
 	Standard library only. The main fixture is a real child log (b11669), already free of paths and names.

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Static analysis of a GGUF model for llmtop: where every tensor lives and what the KV cache and recurrent state cost.
 
 llama-server prints no memory map at its default log level, so this derives one from the GGUF header and the preset's flags, and

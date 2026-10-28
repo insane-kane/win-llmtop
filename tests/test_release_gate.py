@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Unit tests for .github/scripts/release_gate.py (no network).
 
 	python -I tools/win-llmtop/tests/test_release_gate.py

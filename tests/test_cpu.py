@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Unit tests for CPU telemetry in win.py, state.py and pages.py.
 
 	Standard library only. Tests per-core instance ordering/filtering, hybrid and non-hybrid

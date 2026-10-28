@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Unit tests for llmtop_lib/pages.py: speed figures for short requests, GPUs that report no VRAM, and wording that must not assume a router.
 
 	Standard library only. The functions are tested directly with hand-built inputs: a SimpleNamespace collector

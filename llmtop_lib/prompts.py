@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Group llama-server turns (requests) into multi-turn prompts and compute per-prompt figures.
 
 Pure functions over turn dicts produced by `llmtop_lib.log.Assembler`; no I/O.

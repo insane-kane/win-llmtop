@@ -98,4 +98,6 @@ If you use `win-llmtop` in research or benchmarks, see [`CITATION.cff`](https://
 
 ## Licence
 
+Copyright (C) 2026 Aaron Kane.
+
 GNU General Public License v3.0 or later (`GPL-3.0-or-later`); see [`LICENSE`](https://github.com/insane-kane/win-llmtop/blob/main/LICENSE).

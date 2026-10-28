@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Deterministic regression tests running seeds and mutated inputs against fuzz harnesses.
 
 Standard library only. Runs on Windows without Atheris installed.

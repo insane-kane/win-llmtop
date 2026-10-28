@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Unit tests for llmtop_lib.model: flags, draft models, split GGUFs, and fit-params parsing.
 
 Standard library only. All GGUF headers are synthesized in temporary folders using struct.pack.

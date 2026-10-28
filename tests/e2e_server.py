@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """End-to-end test for win-llmtop against a real llama-server process.
 
 	python -I tools/win-llmtop/tests/e2e_server.py --server <llama-server.exe> --model <file.gguf>

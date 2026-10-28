@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Live terminal panel for llama.cpp's llama-server on Windows: what's loaded, what it's doing, how fast, and where the memory goes.
 
 	win-llmtop                    live view, [ ] change the history window, q quits

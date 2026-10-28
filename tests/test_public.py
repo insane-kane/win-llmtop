@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Public-tree hygiene tests for win-llmtop.
 
 	Every tracked text file under the folder, except LICENSE, must be free of
@@ -84,8 +85,27 @@ def contact_shields_only_the_address():
 		raise AssertionError("forbidden text beside the address was not caught")
 
 
+def every_py_file_has_licence_and_copyright_lines():
+	# The address is built from pieces so this file never matches its own patterns.
+	copyright_line = "# SPDX-FileCopyrightText: 2026 Aaron Kane <" + CONTACT + ">"
+	for path in tracked_files():
+		if not path.name.endswith(".py"):
+			continue
+		try:
+			text = path.read_text(encoding="utf-8")
+		except (OSError, UnicodeDecodeError):
+			continue
+		head = text.splitlines()[:3]
+		rel = path.relative_to(ROOT).as_posix()
+		if "# SPDX-License-Identifier: GPL-3.0-or-later" not in head:
+			raise AssertionError("missing licence line in " + rel)
+		if copyright_line not in head:
+			raise AssertionError("missing copyright line in " + rel)
+
+
 CASES = [(label, lambda rx=rx: check_pattern(rx)) for label, rx in _public_names.PATTERNS]
 CASES.append(("contact_shields_only_the_address", contact_shields_only_the_address))
+CASES.append(("every_py_file_has_licence_and_copyright_lines", every_py_file_has_licence_and_copyright_lines))
 
 
 def main():

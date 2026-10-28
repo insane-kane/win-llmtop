@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Unit tests for llmtop_lib/prompts.py: prompt grouping rules and time-weighted figures.
 
 	python -I tools/win-llmtop/tests/test_prompts.py

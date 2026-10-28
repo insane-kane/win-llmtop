@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Run e2e_server.py's page checks against a rendered demo frame, so a layout change that breaks the e2e checks fails run_all.py first.
 
 	Standard library only. e2e_server.py and docs/make_screenshot.py are loaded by path with importlib.util (neither is a package);

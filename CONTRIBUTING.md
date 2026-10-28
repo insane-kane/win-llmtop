@@ -12,6 +12,7 @@ Thanks for your interest in win-llmtop. Contributions of every kind are welcome.
 - [Coding conventions](#coding-conventions)
 - [Releases](#releases)
 - [Labels](#labels)
+- [Licence of contributions](#licence-of-contributions)
 - [Code of conduct](#code-of-conduct)
 
 ## What helps
@@ -67,6 +68,10 @@ To cut a release, the maintainer bumps the version in `pyproject.toml` and `CITA
 
 - `good first issue` — a good place to start.
 - `help wanted` — the maintainer would like a hand.
+
+## Licence of contributions
+
+win-llmtop is licensed under the GNU General Public License v3.0 or later (`GPL-3.0-or-later`). By opening a pull request you agree that your contribution is licensed under the same licence, so the terms are the same inbound and outbound; no sign-off line is needed.
 
 ## Code of conduct
 

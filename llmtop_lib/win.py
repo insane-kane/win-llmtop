@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Windows telemetry for llmtop. ctypes only, no third-party packages.
 
 	PDH     per-process dedicated / shared / committed VRAM, GPU engine load, paging rates (a few ms per sample)

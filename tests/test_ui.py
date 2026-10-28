@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Unit tests for llmtop_lib/ui.py: safe terminal output, SGR zero-width rules, and clipping.
 
 	Standard library only. Tests safe(), vlen(), clip(), pad(), and rendered frames.

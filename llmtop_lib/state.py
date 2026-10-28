@@ -89,6 +89,23 @@ def agg(xs, how):
 	return max(xs) if how == "max" else min(xs) if how == "min" else sum(xs) / len(xs) if how == "mean" else xs[-1]
 
 
+def write_json_atomic(path, obj, indent=None):
+	"""Write `obj` as JSON to `path` through a temporary file in the same folder and os.replace, so `path` holds either the old or the new content, never a partial one."""
+	tmp = path + ".tmp"
+	try:
+		with open(tmp, "w", encoding="utf-8") as f:
+			json.dump(obj, f, indent=indent)
+			f.flush()
+			os.fsync(f.fileno())
+		os.replace(tmp, path)
+	except Exception:
+		try:
+			os.remove(tmp)
+		except OSError:
+			pass
+		raise
+
+
 def scale_thresholds(cfg, ram_mib=None, commit_max_mib=None, budget_mib=None, user_set=()):
 	"""Scale memory and VRAM alert thresholds to fit the machine unless explicitly set by the user."""
 	if ram_mib and ram_mib > 0:
@@ -1601,8 +1618,7 @@ class Collector:
 				if self.cfg["calibrate"] and self.calib_file:
 					try:
 						os.makedirs(os.path.dirname(self.calib_file), exist_ok=True)
-						with open(self.calib_file, "w", encoding="utf-8") as f:
-							json.dump(self.calib, f, indent=1)
+						write_json_atomic(self.calib_file, self.calib, indent=1)
 					except (OSError, ValueError) as err:
 						self._fail_state_dir(err)
 

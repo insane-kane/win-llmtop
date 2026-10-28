@@ -778,6 +778,27 @@ class TestState(unittest.TestCase):
 		self.assertEqual(obj.requests[-1]["wall"], 1700000000.0 + 60000)
 		self.assertGreater(obj.req_seq, 0)  # the counter changed
 
+	def test_calibration_write_is_atomic(self):
+		with tempfile.TemporaryDirectory() as tmp:
+			path = os.path.join(tmp, "calibration.json")
+			first = {"abc123def456": {"v": 4, "overhead": 1234, "at": 1700000100.0, "preset": "m1"}}
+			state.write_json_atomic(path, first, indent=1)
+			with open(path, encoding="utf-8") as f:
+				self.assertEqual(json.load(f), first)
+
+			def broken_dump(obj, f, indent=None):
+				f.write('{"par')  # a few characters, then the write fails
+				raise OSError("disk full")
+
+			with mock.patch.object(state.json, "dump", side_effect=broken_dump):
+				self.assertRaises(OSError, state.write_json_atomic, path, {"new": 1})
+			with open(path, encoding="utf-8") as f:
+				self.assertEqual(json.load(f), first)  # the old content survives a failed write
+			self.assertFalse(os.path.exists(path + ".tmp"))  # no temp file left behind
+			state.write_json_atomic(path, {"new": 1}, indent=1)
+			with open(path, encoding="utf-8") as f:
+				self.assertEqual(json.load(f), {"new": 1})  # a normal write replaces the content
+
 
 class _Emit:
 	"""A stand-in for Collector.emit: records each event it is called with."""
@@ -1060,6 +1081,7 @@ CASES = [
 	("slots_reply_bad_types_and_empty", TestState("test_slots_reply_bad_types_and_empty")),
 	("request_log_trimmed_only_when_persisting", TestState("test_request_log_trimmed_only_when_persisting")),
 	("requests_in_memory_capped", TestState("test_requests_in_memory_capped")),
+	("calibration_write_is_atomic", TestState("test_calibration_write_is_atomic")),
 	("ring_random_data_24h_bucket_aligned", TestRing("test_ring_random_data_24h_bucket_aligned")),
 	("ring_short_windows_legacy_exact", TestRing("test_ring_short_windows_legacy_exact")),
 	("ring_overwrite_keeps_buckets_exact", TestRing("test_ring_overwrite_keeps_buckets_exact")),

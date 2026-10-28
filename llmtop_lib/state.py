@@ -630,6 +630,7 @@ class Collector:
 		self.reqlog = RequestLog(self.state_dir if not self.state_error else None, on_error=self._fail_state_dir)
 		self.rec = Recorder(self.rings, self.hist if self.cfg["persist"] else None)
 		self.events, self.requests, self.follow, self.router_tail, self.router_start = [], [], {}, None, None
+		self.req_seq = 0
 		self.models, self.flags, self.mem, self.rate = {}, {}, {}, {}
 		self.router_up, self.router_error, self.router_auth_error, self.last = False, "", None, None
 		self.ws_hist = deque(maxlen=48)
@@ -926,6 +927,7 @@ class Collector:
 				if r.get("wall"):
 					self.reqlog.append(r)
 		self.requests = saved + fresh
+		self.req_seq += 1
 		self.requests.sort(key=lambda r: r.get("wall") or 0)
 		self.events.sort(key=lambda e: e["wall"])
 		for f in self.follow.values():
@@ -978,6 +980,7 @@ class Collector:
 				sp_list = [created]
 		logmod.resolve_walls(asm, reqs, evs, sp_list)
 		self.requests += reqs
+		self.req_seq += 1
 		self.add_events([e for e in evs if e.get("wall")])
 		self.follow[preset] = (tail, asm)
 
@@ -1184,6 +1187,7 @@ class Collector:
 		r["wall"] = r.get("wall") or now
 		r["wall0"] = r.get("wall0") or r["wall"] - r.get("ms", 0) / 1e3
 		self.requests.append(r)
+		self.req_seq += 1
 		if self.cfg["persist"]:
 			self.reqlog.append(r)
 

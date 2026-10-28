@@ -370,6 +370,33 @@ def test_prompt_row_compared_turn_by_turn():
 	assert pages.C.bcyan not in line, line  # not blue: each turn is at its own bucket median
 
 
+def test_prompt_groups_recomputes_only_on_new_requests():
+	r1 = dict(req(preset="alpha", pn=500, pp=400.0, tn=40, tg=50.0, wall=1000.0), slot=0, cached=2000, kv=2540)
+	r2 = dict(req(preset="alpha", pn=300, pp=420.0, tn=30, tg=52.0, wall=1005.0), slot=0, cached=2540, kv=2870)
+	c = collector([r1, r2], cfg=dict(CFG))
+	c.req_seq = 1
+	view = pages.View()
+	orig = pages.prompts.group
+	calls = [0]
+
+	def counting(*args, **kwargs):
+		calls[0] += 1
+		return orig(*args, **kwargs)
+
+	pages.prompts.group = counting
+	try:
+		for sec in range(10):
+			snap = {"t": float(sec)}
+			pages.series(c, view, snap, "vram", 100)  # the Live page draws its charts here, resetting view.cache each second
+			pages.prompt_groups(c, view, snap)
+		assert calls[0] == 1, calls  # ten different seconds, no new request: the grouping survives the per-second reset
+		c.req_seq = 2
+		pages.prompt_groups(c, view, {"t": 99.0})
+		assert calls[0] == 2, calls  # a new request re-triggers the grouping
+	finally:
+		pages.prompts.group = orig
+
+
 def test_live_shows_recent_prompts_when_toggled():
 	r1 = dict(req(preset="alpha", pn=500, pp=400.0, tn=40, tg=50.0, wall=1000.0), slot=0, cached=2000, kv=2540)
 	r2 = dict(req(preset="alpha", pn=300, pp=420.0, tn=30, tg=52.0, wall=1005.0), slot=0, cached=2540, kv=2870)
@@ -980,6 +1007,7 @@ CASES = [
 	("rank_colours", test_rank_colours),
 	("prompt_table_has_no_cached_column", test_prompt_table_has_no_cached_column),
 	("prompt_row_compared_turn_by_turn", test_prompt_row_compared_turn_by_turn),
+	("prompt_groups_recomputes_only_on_new_requests", test_prompt_groups_recomputes_only_on_new_requests),
 	("live_shows_recent_prompts_when_toggled", test_live_shows_recent_prompts_when_toggled),
 	("banner_one_line_per_alert_at_each_width", test_banner_one_line_per_alert_at_each_width),
 	("banner_caps_alerts_with_more_line", test_banner_caps_alerts_with_more_line),

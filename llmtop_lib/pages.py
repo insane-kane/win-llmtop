@@ -157,28 +157,36 @@ def ctx_of(r):
 
 
 def bucket_stats(c, view, snap):
-	"""Median throughput of similar turns: prefill and decode by context depth, per preset (cached per second)."""
-	sec = int(snap["t"])
-	if view.cache.get("bk_sec") != sec or view.cache.get("bk_len") != len(c.requests):
+	"""Median throughput of similar turns: prefill and decode by context depth, per preset (cached per request change)."""
+	cache = view.__dict__.setdefault("req_cache", {})
+	seq = getattr(c, "req_seq", None)
+	if seq is None:
+		seq = (int(snap["t"]), len(c.requests))  # fixtures without the counter: the old per-second behaviour
+	key = seq
+	if cache.get("bk_key") != key:
 		pre, dec = defaultdict(list), defaultdict(list)
 		for r in c.requests:
 			if "pp" in r and r["pp"] == r["pp"] and r.get("pn", 0) >= 256:
 				pre[(r["preset"], bucket(ctx_of(r), DEC_EDGES))].append(r["pp"])
 			if "tg" in r and r["tg"] == r["tg"] and r.get("tn", 0) >= 20:
 				dec[(r["preset"], bucket(r.get("kv", 0), DEC_EDGES))].append(r["tg"])
-		view.cache["bk"], view.cache["bk_sec"], view.cache["bk_len"] = (pre, dec), sec, len(c.requests)
-	return view.cache["bk"]
+		cache["bk"], cache["bk_key"] = (pre, dec), key
+	return cache["bk"]
 
 
 def prompt_groups(c, view, snap):
-	"""Grouped prompts and the set of `id(turn)` for each prompt's first turn (cached per second)."""
-	sec = int(snap["t"])
+	"""Grouped prompts and the set of `id(turn)` for each prompt's first turn (cached per request change)."""
+	cache = view.__dict__.setdefault("req_cache", {})
 	gap_s = c.cfg.get("prompt_gap_s", S.CFG["prompt_gap_s"])
-	if view.cache.get("pr_sec") != sec or view.cache.get("pr_len") != len(c.requests) or view.cache.get("pr_gap") != gap_s:
+	seq = getattr(c, "req_seq", None)
+	if seq is None:
+		seq = (int(snap["t"]), len(c.requests))  # fixtures without the counter: the old per-second behaviour
+	key = (seq, gap_s)
+	if cache.get("pr_key") != key:
 		ps = prompts.group(c.requests, gap_s)
 		firsts = {id(p["turns"][0]) for p in ps if p["turns"]}
-		view.cache["pr"], view.cache["pr_sec"], view.cache["pr_len"], view.cache["pr_gap"] = (ps, firsts), sec, len(c.requests), gap_s
-	return view.cache["pr"]
+		cache["pr"], cache["pr_key"] = (ps, firsts), key
+	return cache["pr"]
 
 
 def ref(xs):

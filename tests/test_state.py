@@ -799,6 +799,88 @@ class TestState(unittest.TestCase):
 			with open(path, encoding="utf-8") as f:
 				self.assertEqual(json.load(f), {"new": 1})  # a normal write replaces the content
 
+	def test_fit_projection_cached_per_configuration(self):
+		with tempfile.TemporaryDirectory() as tmp, _patch_win():
+			bin_dir = os.path.join(tmp, "bin")
+			os.mkdir(bin_dir)
+			exe = os.path.join(bin_dir, "llama-server.exe")
+			with open(exe, "wb") as f:
+				f.write(b"fake")
+			fit_exe = os.path.join(bin_dir, "llama-fit-params.exe")
+			with open(fit_exe, "wb") as f:
+				f.write(b"fake")
+			model_path = os.path.join(tmp, "model.gguf")
+			with open(model_path, "wb") as f:
+				f.write(b"fake model")
+			cfg = dict(state.CFG, state_dir=os.path.join(tmp, "state"), persist=False, calibrate=False)
+			c = state.Collector(cfg)
+			c.watched_exe = lambda: exe
+			calls = {"n": 0}
+
+			def fake_fit(server_exe, flags, timeout=60):
+				calls["n"] += 1
+				return {"gpu": 1000, "host": 100}
+
+			with mock.patch.object(state.model, "fit_projection", side_effect=fake_fit), \
+					mock.patch.object(state.model, "analyze", return_value={}), \
+					mock.patch.object(state.model, "server_defaults", return_value={}):
+				flags = {"model": model_path, "ctx-size": "8192", "n-gpu-layers": "99"}
+				c.map_job("p", dict(flags), "k1")
+				self.assertEqual(calls["n"], 1)
+				c.map_job("p", dict(flags), "k1")  # the same configuration: served from the in-memory cache
+				self.assertEqual(calls["n"], 1)
+				flags["ctx-size"] = "16384"  # a different configuration: reruns
+				c.map_job("p", dict(flags), "k2")
+				self.assertEqual(calls["n"], 2)
+				st = os.stat(model_path)
+				os.utime(model_path, (st.st_atime, st.st_mtime + 100))  # a newer model file: reruns
+				c.map_job("p", dict(flags), "k3")
+				self.assertEqual(calls["n"], 3)
+
+	def test_fit_cache_persisted_and_reloaded(self):
+		with tempfile.TemporaryDirectory() as tmp, _patch_win():
+			bin_dir = os.path.join(tmp, "bin")
+			os.mkdir(bin_dir)
+			exe = os.path.join(bin_dir, "llama-server.exe")
+			with open(exe, "wb") as f:
+				f.write(b"fake")
+			fit_exe = os.path.join(bin_dir, "llama-fit-params.exe")
+			with open(fit_exe, "wb") as f:
+				f.write(b"fake")
+			model_path = os.path.join(tmp, "model.gguf")
+			with open(model_path, "wb") as f:
+				f.write(b"fake model")
+			flags = {"model": model_path, "ctx-size": "8192", "n-gpu-layers": "99"}
+			calls = {"n": 0}
+
+			def fake_fit(server_exe, flags, timeout=60):
+				calls["n"] += 1
+				return {"gpu": 1000, "host": 100}
+
+			def build(state_dir, calibrate):
+				os.makedirs(state_dir, exist_ok=True)
+				c = state.Collector(dict(state.CFG, state_dir=state_dir, persist=False, calibrate=calibrate))
+				c.watched_exe = lambda: exe
+				return c
+
+			with mock.patch.object(state.model, "fit_projection", side_effect=fake_fit), \
+					mock.patch.object(state.model, "analyze", return_value={}), \
+					mock.patch.object(state.model, "server_defaults", return_value={}):
+				state1 = os.path.join(tmp, "state1")
+				c1 = build(state1, True)
+				c1.map_job("p", dict(flags), "k1")
+				self.assertEqual(calls["n"], 1)
+				self.assertTrue(os.path.isfile(os.path.join(state1, "fit-cache.json")))  # persisted with calibrate on
+				c2 = build(state1, True)
+				self.assertTrue(c2.fit_cache)  # the new Collector loads it from disk
+				c2.map_job("p", dict(flags), "k1")
+				self.assertEqual(calls["n"], 1)  # the same configuration is served from the reloaded cache
+				state2 = os.path.join(tmp, "state2")
+				c3 = build(state2, False)
+				c3.map_job("p", dict(flags), "k1")
+				self.assertEqual(calls["n"], 2)  # a fresh folder: computed once
+				self.assertFalse(os.path.isfile(os.path.join(state2, "fit-cache.json")))  # calibrate off: nothing written
+
 
 class _Emit:
 	"""A stand-in for Collector.emit: records each event it is called with."""
@@ -1082,6 +1164,8 @@ CASES = [
 	("request_log_trimmed_only_when_persisting", TestState("test_request_log_trimmed_only_when_persisting")),
 	("requests_in_memory_capped", TestState("test_requests_in_memory_capped")),
 	("calibration_write_is_atomic", TestState("test_calibration_write_is_atomic")),
+	("fit_projection_cached_per_configuration", TestState("test_fit_projection_cached_per_configuration")),
+	("fit_cache_persisted_and_reloaded", TestState("test_fit_cache_persisted_and_reloaded")),
 	("ring_random_data_24h_bucket_aligned", TestRing("test_ring_random_data_24h_bucket_aligned")),
 	("ring_short_windows_legacy_exact", TestRing("test_ring_short_windows_legacy_exact")),
 	("ring_overwrite_keeps_buckets_exact", TestRing("test_ring_overwrite_keeps_buckets_exact")),

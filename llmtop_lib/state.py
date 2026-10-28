@@ -683,6 +683,17 @@ class Collector:
 					self.calib = {k: v for k, v in json.load(f).items() if isinstance(v, dict) and v.get("v") == 4}  # older files held baselines learned under a headroom test on resident memory alone
 			except (OSError, ValueError):
 				pass
+		self.fit_cache_file = os.path.join(self.state_dir, "fit-cache.json") if self.state_dir and not self.state_error else None
+		self.fit_cache = {}
+		if self.fit_cache_file and os.path.isfile(self.fit_cache_file):
+			try:
+				with open(self.fit_cache_file, encoding="utf-8") as f:
+					cached = json.load(f)
+				if isinstance(cached, dict):
+					self.fit_cache = cached
+			except (OSError, ValueError):
+				pass
+		self._fit_lock = threading.Lock()
 		self.alerts = Alerts(self.cfg, self.emit)
 		self.started = time.time()
 
@@ -1672,6 +1683,24 @@ class Collector:
 			use.pop("spec-draft-model", None)
 		return use
 
+	def _fit_key(self, exe, flags):
+		"""The configuration a cached llama.cpp memory projection is good for: its flags, the model file, and the llama-fit-params binary. None when any of them cannot be stat'd (no caching for that call)."""
+		try:
+			ms = os.stat(flags["model"])
+			fit_exe = os.path.join(os.path.dirname(exe), "llama-fit-params.exe")
+			fit = None
+			if os.path.isfile(fit_exe):
+				fs = os.stat(fit_exe)
+				fit = {"path": fit_exe, "size": fs.st_size, "mtime": int(fs.st_mtime)}
+			return json.dumps({
+				"flags": {k: flags.get(k) for k in model.FIT_FLAGS},
+				"model_size": ms.st_size,
+				"model_mtime": int(ms.st_mtime),
+				"fit": fit,
+			}, sort_keys=True)
+		except (OSError, KeyError):
+			return None
+
 	def map_job(self, preset, flags, key):
 		try:
 			exe = self.watched_exe()  # the only program ever started, and only from its own folder
@@ -1681,7 +1710,21 @@ class Collector:
 				t = self._alias_threads.get(exe)
 			if t and t.is_alive() and t != threading.current_thread():
 				t.join()
-			fit = model.fit_projection(exe, flags)
+			fit_key = self._fit_key(exe, flags)
+			if fit_key in self.fit_cache:
+				fit = self.fit_cache[fit_key]  # a cached projection
+			else:
+				fit = model.fit_projection(exe, flags)
+				if fit_key is not None and fit is not None:  # a failed run (no projection, a timeout) is retried on the next load, not cached
+					with self._fit_lock:
+						self.fit_cache[fit_key] = fit
+						while len(self.fit_cache) > 64:
+							self.fit_cache.pop(next(iter(self.fit_cache)))  # drop the oldest-inserted
+						if self.cfg["calibrate"] and self.fit_cache_file:
+							try:
+								write_json_atomic(self.fit_cache_file, self.fit_cache, indent=1)
+							except (OSError, ValueError):
+								pass
 			n_slots = self.rate.get(preset, {}).get("p", {}).get("n_slots")
 			map_res = model.analyze(flags, fit, model.server_defaults(exe), n_slots=n_slots)
 			self.mem[preset] = {"key": key, "state": "ready", "map": map_res, "at": time.time()}

@@ -121,25 +121,204 @@ def _win_err(fn, pid):
 class Ring:
 	"""One value per wall-clock second over `span` seconds; NaN where nothing was recorded."""
 
-	def __init__(self, span=24 * 3600):
-		self.span, self.v, self.s = span, array("f", [NAN]) * span, array("q", [0]) * span
+	def __init__(self, span=24 * 3600, how="max"):
+		self.span, self.how = span, how
+		self.v, self.s = array("f", [NAN]) * span, array("q", [0]) * span
+		self.span10, self.span60 = max(1, span // 10), max(1, span // 60)
+		self.s10, self.s60 = array("q", [-1]) * self.span10, array("q", [-1]) * self.span60
+		if how == "mean":
+			self.sum10 = array("f", [0.0]) * self.span10
+			self.cnt10 = array("h", [0]) * self.span10
+			self.sum60 = array("f", [0.0]) * self.span60
+			self.cnt60 = array("h", [0]) * self.span60
+		else:
+			self.v10 = array("f", [NAN]) * self.span10
+			self.v60 = array("f", [NAN]) * self.span60
+			if how == "last":
+				self.l10 = array("q", [-1]) * self.span10
+				self.l60 = array("q", [-1]) * self.span60
 
 	def put(self, t, x):
 		sec = int(t)
-		self.v[sec % self.span], self.s[sec % self.span] = x, sec
+		isec = sec % self.span
+		old_sec = self.s[isec]
+		self.v[isec], self.s[isec] = x, sec
+		if old_sec == sec:
+			self._recompute(sec, 10)
+			self._recompute(sec, 60)
+			return
+
+		# 10s
+		b10 = sec // 10
+		i10 = b10 % self.span10
+		if self.s10[i10] != b10:
+			self.s10[i10] = b10
+			if self.how == "mean":
+				self.sum10[i10], self.cnt10[i10] = x, 1
+			elif self.how == "last":
+				self.v10[i10], self.l10[i10] = x, sec
+			else:
+				self.v10[i10] = x
+		else:
+			if self.how == "max":
+				if x > self.v10[i10]:
+					self.v10[i10] = x
+			elif self.how == "min":
+				if x < self.v10[i10]:
+					self.v10[i10] = x
+			elif self.how == "mean":
+				self.sum10[i10] += x
+				self.cnt10[i10] += 1
+			elif self.how == "last":
+				if sec >= self.l10[i10]:
+					self.v10[i10], self.l10[i10] = x, sec
+
+		# 60s
+		b60 = sec // 60
+		i60 = b60 % self.span60
+		if self.s60[i60] != b60:
+			self.s60[i60] = b60
+			if self.how == "mean":
+				self.sum60[i60], self.cnt60[i60] = x, 1
+			elif self.how == "last":
+				self.v60[i60], self.l60[i60] = x, sec
+			else:
+				self.v60[i60] = x
+		else:
+			if self.how == "max":
+				if x > self.v60[i60]:
+					self.v60[i60] = x
+			elif self.how == "min":
+				if x < self.v60[i60]:
+					self.v60[i60] = x
+			elif self.how == "mean":
+				self.sum60[i60] += x
+				self.cnt60[i60] += 1
+			elif self.how == "last":
+				if sec >= self.l60[i60]:
+					self.v60[i60], self.l60[i60] = x, sec
+
+	def _recompute(self, sec, size):
+		b = sec // size
+		span_b = self.span10 if size == 10 else self.span60
+		sb = self.s10 if size == 10 else self.s60
+		ib = b % span_b
+		start_s = b * size
+		vals = []
+		last_s = -1
+		last_v = NAN
+		for s in range(start_s, start_s + size):
+			isec = s % self.span
+			if self.s[isec] == s:
+				v = self.v[isec]
+				vals.append(v)
+				last_s = s
+				last_v = v
+		if not vals:
+			sb[ib] = -1
+			return
+		sb[ib] = b
+		if self.how == "max":
+			v_arr = self.v10 if size == 10 else self.v60
+			v_arr[ib] = max(vals)
+		elif self.how == "min":
+			v_arr = self.v10 if size == 10 else self.v60
+			v_arr[ib] = min(vals)
+		elif self.how == "mean":
+			sum_arr = self.sum10 if size == 10 else self.sum60
+			cnt_arr = self.cnt10 if size == 10 else self.cnt60
+			sum_arr[ib] = sum(vals)
+			cnt_arr[ib] = len(vals)
+		elif self.how == "last":
+			v_arr = self.v10 if size == 10 else self.v60
+			l_arr = self.l10 if size == 10 else self.l60
+			v_arr[ib] = last_v
+			l_arr[ib] = last_s
 
 	def at(self, sec):
 		i = sec % self.span
 		return self.v[i] if self.s[i] == sec else NAN
 
-	def cols(self, t_end, seconds, n, how="max"):
+	def cols(self, t_end, seconds, n, how=None):
 		"""`n` columns covering the last `seconds` seconds up to `t_end`; NaN for gaps."""
-		start = int(t_end) + 1 - seconds
+		kind = self.how if how is None else how
+		if kind == self.how:
+			ratio = seconds / n
+			size = 60 if ratio >= 120 else 10 if ratio >= 20 else 0
+		else:
+			size = 0
+
+		if not size:
+			start = int(t_end) + 1 - seconds
+			out = []
+			for j in range(n):
+				a, b = start + seconds * j // n, start + seconds * (j + 1) // n
+				xs = [x for x in map(self.at, range(a, max(b, a + 1))) if x == x]
+				out.append(agg(xs, kind) if xs else NAN)
+			return out
+
+		span_b = self.span60 if size == 60 else self.span10
+		sb = self.s60 if size == 60 else self.s10
+		b_end = int(t_end) // size
+		n_buckets = seconds // size
+		b_start = b_end + 1 - n_buckets
 		out = []
-		for j in range(n):
-			a, b = start + seconds * j // n, start + seconds * (j + 1) // n
-			xs = [x for x in map(self.at, range(a, max(b, a + 1))) if x == x]
-			out.append(agg(xs, how) if xs else NAN)
+		if kind == "max":
+			vb = self.v60 if size == 60 else self.v10
+			for j in range(n):
+				bj_a = b_start + n_buckets * j // n
+				bj_b = b_start + n_buckets * (j + 1) // n
+				m = -float("inf")
+				found = False
+				for b in range(bj_a, bj_b):
+					ib = b % span_b
+					if sb[ib] == b:
+						v = vb[ib]
+						if v > m:
+							m = v
+						found = True
+				out.append(m if found else NAN)
+		elif kind == "min":
+			vb = self.v60 if size == 60 else self.v10
+			for j in range(n):
+				bj_a = b_start + n_buckets * j // n
+				bj_b = b_start + n_buckets * (j + 1) // n
+				m = float("inf")
+				found = False
+				for b in range(bj_a, bj_b):
+					ib = b % span_b
+					if sb[ib] == b:
+						v = vb[ib]
+						if v < m:
+							m = v
+						found = True
+				out.append(m if found else NAN)
+		elif kind == "mean":
+			sum_b = self.sum60 if size == 60 else self.sum10
+			cnt_b = self.cnt60 if size == 60 else self.cnt10
+			for j in range(n):
+				bj_a = b_start + n_buckets * j // n
+				bj_b = b_start + n_buckets * (j + 1) // n
+				tot_sum = 0.0
+				tot_cnt = 0
+				for b in range(bj_a, bj_b):
+					ib = b % span_b
+					if sb[ib] == b:
+						tot_sum += sum_b[ib]
+						tot_cnt += cnt_b[ib]
+				out.append(tot_sum / tot_cnt if tot_cnt > 0 else NAN)
+		elif kind == "last":
+			vb = self.v60 if size == 60 else self.v10
+			for j in range(n):
+				bj_a = b_start + n_buckets * j // n
+				bj_b = b_start + n_buckets * (j + 1) // n
+				v_last = NAN
+				for b in range(bj_b - 1, bj_a - 1, -1):
+					ib = b % span_b
+					if sb[ib] == b:
+						v_last = vb[ib]
+						break
+				out.append(v_last)
 		return out
 
 	def span_max(self, t0, t1):
@@ -446,7 +625,7 @@ class Collector:
 		self.state_error = None
 		if self.cfg.get("persist") or self.cfg.get("calibrate"):
 			self._validate_state_dir()
-		self.rings = {k: Ring(self.cfg["history_hours"] * 3600) for k in SERIES}
+		self.rings = {k: Ring(self.cfg["history_hours"] * 3600, SERIES[k]) for k in SERIES}
 		self.hist = History(self.state_dir if not self.state_error else None, on_error=self._fail_state_dir)
 		self.reqlog = RequestLog(self.state_dir if not self.state_error else None, on_error=self._fail_state_dir)
 		self.rec = Recorder(self.rings, self.hist if self.cfg["persist"] else None)

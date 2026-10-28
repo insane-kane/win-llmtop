@@ -8,8 +8,10 @@
 import contextlib
 import http.server
 import json
+import math
 import os
 import pathlib
+import random
 import sys
 import tempfile
 import threading
@@ -887,6 +889,124 @@ class TestAlertHeadlines(unittest.TestCase):
 		self.assertEqual(alert["level"], "warn")  # grown past the resident minimum
 
 
+class TestRing(unittest.TestCase):
+	"""Tests for Ring 10 s and 60 s summary rollups and exactness against per-second reference."""
+
+	@staticmethod
+	def _legacy_cols(r, t_end, seconds, n, how="max"):
+		"""Baseline cols implementation from parent commit."""
+		start = int(t_end) + 1 - seconds
+		out = []
+		for j in range(n):
+			a, b = start + seconds * j // n, start + seconds * (j + 1) // n
+			xs = [x for x in map(r.at, range(a, max(b, a + 1))) if x == x]
+			out.append(state.agg(xs, how) if xs else state.NAN)
+		return out
+
+	@staticmethod
+	def _ref_cols(r, t_end, seconds, n, how):
+		"""Reference implementation computing each column over bucket-aligned ranges."""
+		ratio = seconds / n
+		size = 60 if ratio >= 120 else 10 if ratio >= 20 else 0
+		if not size:
+			return TestRing._legacy_cols(r, t_end, seconds, n, how)
+		b_end = int(t_end) // size
+		n_buckets = seconds // size
+		b_start = b_end + 1 - n_buckets
+		out = []
+		for j in range(n):
+			bj_a = b_start + n_buckets * j // n
+			bj_b = b_start + n_buckets * (j + 1) // n
+			xs = [r.at(s) for s in range(bj_a * size, bj_b * size) if r.at(s) == r.at(s)]
+			out.append(state.agg(xs, how) if xs else state.NAN)
+		return out
+
+	@staticmethod
+	def _approx_eq(a, b, tol=1e-4):
+		if math.isnan(a) and math.isnan(b):
+			return True
+		if math.isnan(a) or math.isnan(b):
+			return False
+		return abs(a - b) <= tol * (max(abs(a), abs(b)) + 1.0)
+
+	def test_ring_random_data_24h_bucket_aligned(self):
+		rng = random.Random(42)
+		now = 1700000000
+		for kind in ("max", "min", "mean", "last"):
+			r = state.Ring(24 * 3600, how=kind)
+			for s in range(now - 86400 + 1, now + 1):
+				if rng.random() > 0.3:
+					r.put(s, rng.uniform(0.0, 1000.0))
+			for secs in (3600, 21600, 86400):
+				res = r.cols(now, secs, 112, kind)
+				ref = self._ref_cols(r, now, secs, 112, kind)
+				self.assertEqual(len(res), 112)
+				for j in range(112):
+					self.assertTrue(
+						self._approx_eq(res[j], ref[j]),
+						"kind=%s secs=%d col=%d: got %s, ref %s" % (kind, secs, j, res[j], ref[j]),
+					)
+
+	def test_ring_short_windows_legacy_exact(self):
+		rng = random.Random(42)
+		now = 1700000000
+		for kind in ("max", "min", "mean", "last"):
+			r = state.Ring(24 * 3600, how=kind)
+			for s in range(now - 1000, now + 1):
+				if rng.random() > 0.2:
+					r.put(s, float(s % 50))
+			for secs in (300, 900):
+				res = r.cols(now, secs, 112, kind)
+				leg = self._legacy_cols(r, now, secs, 112, kind)
+				self.assertEqual(len(res), 112)
+				for j in range(112):
+					self.assertTrue(
+						self._approx_eq(res[j], leg[j]),
+						"legacy match kind=%s secs=%d col=%d: got %s, leg %s" % (kind, secs, j, res[j], leg[j]),
+					)
+
+	def test_ring_overwrite_keeps_buckets_exact(self):
+		now = 1700000000
+		for kind in ("max", "min", "mean", "last"):
+			r = state.Ring(24 * 3600, how=kind)
+			base_s = now - 500
+			for s in range(base_s, base_s + 120):
+				r.put(s, 10.0)
+			r.put(base_s + 5, 99.0)
+			r.put(base_s + 65, 1.0)
+			for size in (10, 60):
+				b = (base_s + 5) // size
+				xs = [r.at(s) for s in range(b * size, (b + 1) * size) if r.at(s) == r.at(s)]
+				expected = state.agg(xs, kind)
+				if size == 10:
+					val = r.v10[b % r.span10] if kind != "mean" else (r.sum10[b % r.span10] / r.cnt10[b % r.span10])
+				else:
+					val = r.v60[b % r.span60] if kind != "mean" else (r.sum60[b % r.span60] / r.cnt60[b % r.span60])
+				self.assertTrue(
+					self._approx_eq(val, expected),
+					"overwrite mismatch kind=%s size=%d: got %s, expected %s" % (kind, size, val, expected),
+				)
+
+	def test_ring_stale_buckets_read_empty(self):
+		now = 1700000000
+		r = state.Ring(24 * 3600, how="max")
+		r.put(now, 42.0)
+		far_future = now + 25 * 3600
+		cols = r.cols(far_future, 3600, 112, "max")
+		self.assertEqual(len(cols), 112)
+		for c in cols:
+			self.assertTrue(math.isnan(c), "expected NaN for stale bucket, got %s" % c)
+
+	def test_ring_default_kind_works(self):
+		r = state.Ring(3600)
+		self.assertEqual(r.how, "max")
+		now = 1700000000
+		r.put(now, 5.0)
+		cols = r.cols(now, 300, 10)
+		self.assertEqual(len(cols), 10)
+		self.assertEqual(cols[-1], 5.0)
+
+
 CASES = [
 	("router_mode_preset_loaded_and_flags_parsed", TestState("test_router_mode_preset_loaded_and_flags_parsed")),
 	("single_model_mode_process_counted", TestState("test_single_model_mode_process_counted")),
@@ -912,6 +1032,11 @@ CASES = [
 	("two_slots_processing_primary_is_newer", TestState("test_two_slots_processing_primary_is_newer")),
 	("per_slot_rates_separate", TestState("test_per_slot_rates_separate")),
 	("slots_reply_bad_types_and_empty", TestState("test_slots_reply_bad_types_and_empty")),
+	("ring_random_data_24h_bucket_aligned", TestRing("test_ring_random_data_24h_bucket_aligned")),
+	("ring_short_windows_legacy_exact", TestRing("test_ring_short_windows_legacy_exact")),
+	("ring_overwrite_keeps_buckets_exact", TestRing("test_ring_overwrite_keeps_buckets_exact")),
+	("ring_stale_buckets_read_empty", TestRing("test_ring_stale_buckets_read_empty")),
+	("ring_default_kind_works", TestRing("test_ring_default_kind_works")),
 ]
 
 

@@ -256,8 +256,9 @@ def test_requests_v2_colours_notes_and_nested_turns():
 
 
 def test_requests_hides_gone_presets():
-	# a preset the server no longer lists is hidden once its newest request is older than hide_after_days (7)
-	c = collector([req(preset="old", wall=2000.0 - 10 * 86400.0), req(preset="new", wall=1900.0)], cfg=dict(CFG))
+	# a preset the server no longer lists is hidden once its newest request is older than hide_after_days
+	# (0.01 days = 864 s here, so every wall time stays positive: time.localtime rejects negative times on Windows before Python 3.15)
+	c = collector([req(preset="old", wall=1000.0), req(preset="new", wall=1900.0)], cfg=dict(CFG, hide_after_days=0.01))
 	c.models = {"new": {}}
 	snap = {"t": 2000.0}
 	text = "\n".join(plain_requests(c))

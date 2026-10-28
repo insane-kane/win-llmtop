@@ -173,7 +173,7 @@ Each rule holds while its condition is true and clears after 10 s of quiet. Ever
 | router / exit | crit | router unreachable; a model process exited non-zero |
 
 ### History
-Rings hold one value per second for 24 h. They are mirrored to the state folder's `samples-<date>.jsonl` (one sample per 5 s plus alert events, 14 days kept) and reloaded at start, so sparklines and the event list span restarts. Finished requests are kept in `requests.jsonl` (llama-server rewrites a preset's log file each time that model loads, so the logs alone lose them); model events are rebuilt from the logs each time; wall-clock times of old sessions come from the router log's file name plus its `spawning server instance` lines. `--no-persist` turns writing off; read-only runs still replay what exists.
+Rings hold one value per second for 24 h. They are mirrored to the state folder's `samples-<date>.jsonl` (one sample per 5 s plus alert events, 14 days kept) and reloaded at start, so sparklines and the event list span restarts. Finished requests are kept in `requests.jsonl` (llama-server rewrites a preset's log file each time that model loads, so the logs alone lose them), which keeps the newest 50,000 requests — once it holds twice that, it is trimmed at start-up — while `win-llmtop` holds at most 60,000 in memory; model events are rebuilt from the logs each time; wall-clock times of old sessions come from the router log's file name plus its `spawning server instance` lines. `--no-persist` turns writing off; read-only runs still replay what exists.
 
 ## EXIT STATUS
 In interactive mode, `--once`, and `--plan`, `win-llmtop` exits 0 on normal termination.

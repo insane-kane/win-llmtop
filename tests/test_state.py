@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -752,6 +753,31 @@ class TestState(unittest.TestCase):
 		finally:
 			srv.close()
 
+	def test_request_log_trimmed_only_when_persisting(self):
+		with tempfile.TemporaryDirectory() as tmp:
+			path = os.path.join(tmp, "requests.jsonl")
+			with open(path, "w", encoding="utf-8") as f:
+				for i in range(25):
+					f.write(json.dumps({"n": i}) + "\n")
+			kept = state.RequestLog(tmp, persist=False).load(limit=10)
+			self.assertEqual([r["n"] for r in kept], list(range(15, 25)))  # the last 10 either way
+			with open(path, encoding="utf-8") as f:
+				self.assertEqual(sum(1 for _ in f), 25)  # no persist: the file is untouched
+			kept = state.RequestLog(tmp, persist=True).load(limit=10)
+			self.assertEqual([r["n"] for r in kept], list(range(15, 25)))
+			with open(path, encoding="utf-8") as f:
+				self.assertEqual([json.loads(line)["n"] for line in f], list(range(15, 25)))  # trimmed to the last 10
+			self.assertFalse(os.path.exists(path + ".tmp"))  # no temp file left behind
+
+	def test_requests_in_memory_capped(self):
+		obj = types.SimpleNamespace(requests=[], req_seq=0, cfg={"persist": False}, reqlog=None)
+		for i in range(60001):
+			state.Collector.finish_request(obj, {"preset": "p", "ms": 0}, 1700000000.0 + i)
+		self.assertEqual(len(obj.requests), 50000)
+		self.assertEqual(obj.requests[0]["wall"], 1700000000.0 + 10001)  # the oldest dropped, the newest kept
+		self.assertEqual(obj.requests[-1]["wall"], 1700000000.0 + 60000)
+		self.assertGreater(obj.req_seq, 0)  # the counter changed
+
 
 class _Emit:
 	"""A stand-in for Collector.emit: records each event it is called with."""
@@ -1032,6 +1058,8 @@ CASES = [
 	("two_slots_processing_primary_is_newer", TestState("test_two_slots_processing_primary_is_newer")),
 	("per_slot_rates_separate", TestState("test_per_slot_rates_separate")),
 	("slots_reply_bad_types_and_empty", TestState("test_slots_reply_bad_types_and_empty")),
+	("request_log_trimmed_only_when_persisting", TestState("test_request_log_trimmed_only_when_persisting")),
+	("requests_in_memory_capped", TestState("test_requests_in_memory_capped")),
 	("ring_random_data_24h_bucket_aligned", TestRing("test_ring_random_data_24h_bucket_aligned")),
 	("ring_short_windows_legacy_exact", TestRing("test_ring_short_windows_legacy_exact")),
 	("ring_overwrite_keeps_buckets_exact", TestRing("test_ring_overwrite_keeps_buckets_exact")),

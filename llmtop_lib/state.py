@@ -414,24 +414,44 @@ class History:
 class RequestLog:
 	"""Finished requests, one JSON line each. llama-server rewrites a preset's log file every time that model loads, so the logs alone lose history."""
 
-	def __init__(self, directory, on_error=None):
+	def __init__(self, directory, on_error=None, persist=False):
 		self.path = os.path.join(directory, "requests.jsonl") if directory else None
 		self.on_error = on_error
+		self.persist = persist
 
 	def load(self, limit=50000):
 		if not self.path or not os.path.isfile(self.path):
 			return []
 		out = []
+		lines = 0
+		ok = True
 		try:
 			with open(self.path, encoding="utf-8") as f:
 				for line in f:
+					lines += 1
 					try:
 						out.append(json.loads(line))
 					except ValueError:
 						continue
 		except OSError:
-			pass
+			ok = False
+		if ok and self.persist and lines > 2 * limit:
+			self._trim(out[-limit:])
 		return out[-limit:]
+
+	def _trim(self, keep):
+		"""Rewrite the file so it holds only the newest lines; a failure leaves it as it was."""
+		tmp = self.path + ".tmp"
+		try:
+			with open(tmp, "w", encoding="utf-8") as f:
+				for r in keep:
+					f.write(json.dumps(r, separators=(",", ":")) + "\n")
+			os.replace(tmp, self.path)
+		except OSError:
+			try:
+				os.remove(tmp)
+			except OSError:
+				pass
 
 	def append(self, r):
 		if not self.path:
@@ -627,7 +647,7 @@ class Collector:
 			self._validate_state_dir()
 		self.rings = {k: Ring(self.cfg["history_hours"] * 3600, SERIES[k]) for k in SERIES}
 		self.hist = History(self.state_dir if not self.state_error else None, on_error=self._fail_state_dir)
-		self.reqlog = RequestLog(self.state_dir if not self.state_error else None, on_error=self._fail_state_dir)
+		self.reqlog = RequestLog(self.state_dir if not self.state_error else None, on_error=self._fail_state_dir, persist=self.cfg["persist"])
 		self.rec = Recorder(self.rings, self.hist if self.cfg["persist"] else None)
 		self.events, self.requests, self.follow, self.router_tail, self.router_start = [], [], {}, None, None
 		self.req_seq = 0
@@ -1188,6 +1208,8 @@ class Collector:
 		r["wall0"] = r.get("wall0") or r["wall"] - r.get("ms", 0) / 1e3
 		self.requests.append(r)
 		self.req_seq += 1
+		if len(self.requests) > 60000:
+			del self.requests[:len(self.requests) - 50000]  # the append's req_seq increment covers the drop too
 		if self.cfg["persist"]:
 			self.reqlog.append(r)
 

@@ -85,23 +85,34 @@ def normalize_line(line):
 
 
 class Tail:
-	"""Incremental line reader for a growing log file. The first poll starts at most `backfill` bytes from the end."""
+	"""Incremental line reader for a growing log file. The first poll starts at most `backfill` bytes from the end; the file's first
+	bytes are remembered so a rewrite (a smaller file, or the same offset into different leading bytes) is read from its start."""
 
 	def __init__(self, path, backfill=8 * MIB):
-		self.path, self.backfill, self.pos, self.rest = path, backfill, None, b""
+		self.path, self.backfill, self.pos, self.rest, self.head = path, backfill, None, b"", b""
+
+	def _read_head(self, n):
+		try:
+			with open(self.path, "rb") as f:
+				return f.read(n)
+		except OSError:
+			return b""
 
 	def poll(self):
 		try:
 			size = os.path.getsize(self.path)
 		except OSError:
 			return []
+		skip = False
 		if self.pos is None:
 			self.pos = max(0, size - self.backfill)
 			skip = self.pos > 0
-		else:
-			skip = False
-			if size < self.pos:
-				self.pos, self.rest = 0, b""
+			self.head = self._read_head(256)
+		elif size != self.pos:
+			if size < self.pos or self._read_head(len(self.head)) != self.head or size < len(self.head):
+				self.pos, self.rest, self.head = 0, b"", self._read_head(256)  # rewritten: read the new file from its start
+			if len(self.head) < 256 and size > len(self.head):
+				self.head = self._read_head(256)
 		if size == self.pos:
 			return []
 		try:

@@ -40,7 +40,7 @@ def _wall0(r):
 	return None
 
 
-def is_compaction(a, b):
+def is_compaction(a, b, gap_s=PROMPT_GAP_S):
 	"""True when turn `b` is the first turn after a compaction of turn `a`'s conversation:
 	the context shrank to a substantial fraction of what it summarised (the summary) rather
 	than to a fresh conversation's small context."""
@@ -50,10 +50,10 @@ def is_compaction(a, b):
 		return False
 	a_wall, b_wall0 = a.get("wall"), _wall0(b)
 	if a_wall is not None and b_wall0 is not None:
-		if b_wall0 - a_wall >= PROMPT_GAP_S:
+		if b_wall0 - a_wall >= gap_s:
 			return False
 	elif a.get("t") is not None and b.get("t0") is not None and (a["t"] > 0 or b["t0"] > 0):
-		if b["t0"] - a["t"] >= PROMPT_GAP_S:
+		if b["t0"] - a["t"] >= gap_s:
 			return False
 	a_kv, b_kv = a.get("kv") or 0, b.get("kv") or 0
 	if a_kv < COMPACT_PREV_MIN or b_kv >= a_kv:
@@ -66,7 +66,7 @@ def _split(a, b, gap_s):
 	"""True when turn `b` starts a new prompt after turn `a` on the same preset and slot."""
 	if a.get("session") != b.get("session"):
 		return True
-	if is_compaction(a, b):
+	if is_compaction(a, b, gap_s):
 		return False
 	if b.get("sel") == "LRU" and (b.get("evicted") or 0) > 0:
 		return True
@@ -84,7 +84,7 @@ def _split(a, b, gap_s):
 	return False
 
 
-def _summarize(ts):
+def _summarize(ts, gap_s=PROMPT_GAP_S):
 	last_r = ts[-1]
 	preset = ts[0]["preset"]
 	slot = next((r.get("slot") for r in reversed(ts) if r.get("slot") is not None), None)
@@ -111,7 +111,7 @@ def _summarize(ts):
 	compactions = 0
 	reset = 0
 	for i, r in enumerate(ts):
-		if i > 0 and is_compaction(ts[i - 1], r):
+		if i > 0 and is_compaction(ts[i - 1], r, gap_s):
 			compactions += 1
 		elif r.get("sel") == "LRU" and (r.get("evicted", 0) > 0):
 			reset += r["evicted"]  # a compaction's eviction is by design, not a cache reset
@@ -192,4 +192,4 @@ def group(turns, gap_s=30):
 		else:
 			prev.append(r)
 			active[key] = prev
-	return [_summarize(ts) for ts in groups]
+	return [_summarize(ts, gap_s) for ts in groups]

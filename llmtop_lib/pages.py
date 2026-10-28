@@ -464,8 +464,9 @@ def row_notes(c, turns):
 	notes = []
 	compactions = 0
 	ev = 0
+	gap_s = c.cfg.get("prompt_gap_s", S.CFG["prompt_gap_s"])
 	for i, r in enumerate(turns):
-		if i > 0 and prompts.is_compaction(turns[i - 1], r):
+		if i > 0 and prompts.is_compaction(turns[i - 1], r, gap_s):
 			compactions += 1
 		elif r.get("sel") == "LRU" and (r.get("evicted") or 0) > 0:
 			ev = max(ev, r.get("evicted", 0))  # a compaction's eviction is by design, not a cache reset

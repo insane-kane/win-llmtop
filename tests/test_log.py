@@ -312,6 +312,41 @@ def test_normalize_line_safe_sequences():
 	assert "\u200e" not in text
 
 
+def tail_sees_a_rewrite_that_grew_past_the_offset():
+	# a rewrite that has already grown past the saved offset must be read from its start, not from the old offset
+	with tempfile.TemporaryDirectory() as td:
+		path = os.path.join(td, "server.log")
+		with open(path, "w") as f:
+			for i in range(60):
+				f.write("line %04d: %s\n" % (i, "x" * 40))
+		t = log.Tail(path)
+		first = t.poll()
+		assert first, "first poll returned no lines"
+		with open(path, "w") as f:  # rewrite with different, longer content; the first line is unique
+			f.write("NEW FILE START\n")
+			for i in range(120):
+				f.write("rewritten %04d: %s\n" % (i, "y" * 40))
+		second = t.poll()
+		assert "NEW FILE START" in second, second[:3]
+		assert "rewritten 0119: " + "y" * 40 in second, second[-2:]
+	# the same tail on a file that only grows returns just the appended lines
+	with tempfile.TemporaryDirectory() as td:
+		path = os.path.join(td, "server.log")
+		with open(path, "w") as f:
+			for i in range(60):
+				f.write("line %04d: %s\n" % (i, "x" * 40))
+		t = log.Tail(path)
+		first = t.poll()
+		assert first, "first poll returned no lines"
+		with open(path, "a") as f:
+			for i in range(60, 120):
+				f.write("line %04d: %s\n" % (i, "x" * 40))
+		second = t.poll()
+		assert len(second) == 60, "expected only the appended lines, got %d" % len(second)
+		assert "line 0060: " + "x" * 40 in second and "line 0119: " + "x" * 40 in second
+		assert "line 0000: " + "x" * 40 not in second
+
+
 CASES = [
 	("b11669_with_timestamps", test_b11669_with_timestamps),
 	("no_timestamps", test_no_timestamps),
@@ -331,6 +366,7 @@ CASES = [
 	("trunc_is_crit", test_trunc_is_crit),
 	("request_failed_is_crit_with_detail", test_request_failed_is_crit_with_detail),
 	("normalize_line_safe_sequences", test_normalize_line_safe_sequences),
+	("tail_sees_a_rewrite_that_grew_past_the_offset", tail_sees_a_rewrite_that_grew_past_the_offset),
 ]
 
 

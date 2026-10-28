@@ -425,6 +425,11 @@ class Collector:
 		self.router_explicit = bool(raw_router)
 		self.cfg["router"] = (raw_router or "http://127.0.0.1:8080").rstrip("/")
 		self.router_discovery, self.router_tried, self.mode = None, [], None
+		self._discover_idx = 0
+		self._discover_tried = []
+		self._alias_cache = {}
+		self._alias_threads = {}
+		self._alias_lock = threading.Lock()
 		self._last_api_key = self.cfg.get("api_key")
 		self.router_keyed = False  # True once the URL in use was taken from a running llama-server's command line; the API key goes only to such a URL or one the user gave
 		self._trust, self.trust_reason, self.rejected = None, "", {}  # the trusted server (see watched_exe), why there is none, and the server-supplied paths refused: {(preset, flag): notice}
@@ -592,7 +597,30 @@ class Collector:
 		return exe, ""
 
 	def _aliases(self):
-		return model.server_aliases(self.watched_exe())
+		exe = self.watched_exe()
+		if not exe:
+			return {}
+		with self._alias_lock:
+			if exe in self._alias_cache:
+				return self._alias_cache[exe]
+			if exe in getattr(model, "_ALIASES", {}):
+				self._alias_cache[exe] = model._ALIASES[exe]
+				return self._alias_cache[exe]
+			if exe not in self._alias_threads:
+				def _fetch():
+					try:
+						res = model.server_aliases(exe)
+						with self._alias_lock:
+							self._alias_cache[exe] = res or {}
+					except Exception:
+						pass
+					finally:
+						with self._alias_lock:
+							self._alias_threads.pop(exe, None)
+				t = threading.Thread(target=_fetch, daemon=True)
+				self._alias_threads[exe] = t
+				t.start()
+			return {}
 
 	@property
 	def key_allowed(self):
@@ -775,13 +803,51 @@ class Collector:
 		self.follow[preset] = (tail, asm)
 
 	# ---- HTTP -------------------------------------------------------------------------------------------------------
-	def get(self, path, timeout=0.8):
+	def get(self, path, timeout=None):
 		"""GET `path` from the watched server as JSON. No redirect is followed, and the API key (an unredirected header) goes only where `key_allowed` says."""
+		budget = (0.5 if path.startswith("/slots") else 1.0) if timeout is None else float(timeout)
+		t0 = time.monotonic()
+		deadline = t0 + budget
 		req = urllib.request.Request(self.cfg["router"] + path)
 		if self.cfg.get("api_key") and self.key_allowed:
 			req.add_unredirected_header("Authorization", "Bearer " + str(self.cfg["api_key"]))
-		with opener_for(self.cfg["router"]).open(req, timeout=timeout) as r:
-			return json.load(r)
+		rem = deadline - time.monotonic()
+		if rem <= 0:
+			raise TimeoutError("request timed out before connect")
+		with opener_for(self.cfg["router"]).open(req, timeout=rem) as r:
+			headers = getattr(r, "headers", None)
+			if headers and hasattr(headers, "get"):
+				try:
+					cl = int(headers.get("Content-Length") or 0)
+					if cl > 8 * MIB:
+						raise OSError("reply body exceeded 8 MiB limit")
+				except (ValueError, TypeError):
+					pass
+			body = bytearray()
+			read_fn = getattr(r, "read1", r.read)
+			while True:
+				rem = deadline - time.monotonic()
+				if rem <= 0:
+					raise TimeoutError("request timed out")
+				sock = getattr(r, "sock", None)
+				if sock is None:
+					fp = getattr(r, "fp", None)
+					raw = getattr(fp, "raw", None) if fp else None
+					sock = getattr(raw, "_sock", None) if raw else None
+				if sock and hasattr(sock, "settimeout"):
+					try:
+						sock.settimeout(max(0.001, rem))
+					except (OSError, ValueError):
+						pass
+				chunk = read_fn(65536)
+				if not chunk:
+					break
+				if isinstance(chunk, str):
+					chunk = chunk.encode("utf-8")
+				body.extend(chunk)
+				if len(body) > 8 * MIB:
+					raise OSError("reply body exceeded 8 MiB limit")
+			return json.loads(body.decode("utf-8"))
 
 	def is_due(self, key, now, period):
 		if now >= self.due.get(key, 0):
@@ -820,32 +886,62 @@ class Collector:
 		return snap
 
 	def _discover_router(self, first_err):
-		tried = [self.cfg["router"]]
 		if not self.pids and win.WIN:
 			self._update_procs(time.time())
 		kids = {p for p in self.pids if self.procs.get(self.procs.get(p, ("", 0))[1], ("",))[0].startswith("llama-server")}
 		ordered = [p for p in self.pids if p not in kids] + [p for p in self.pids if p in kids]
+		candidates = []
+		seen = set()
 		for pid in ordered:
 			url, _, _ = self._pid_url_and_flags(pid)
-			if not url:
-				continue
-			if url not in tried:
-				tried.append(url)
-			self.cfg["router"] = url
-			self.router_keyed = True  # the URL comes from a running llama-server's own command line: the API key may be sent to it
-			try:
-				data = self.get("/models")["data"]
+			if url and url not in seen:
+				seen.add(url)
+				candidates.append((pid, url))
+		if not candidates:
+			self.router_tried = [self.cfg["router"]]
+			self.router_discovery = None
+			return None, first_err
+
+		if self._discover_idx == 0 or self._discover_idx >= len(candidates):
+			self._discover_idx = 0
+			self._discover_tried = []
+
+		if not self._discover_tried:
+			tried = [self.cfg["router"]]
+		else:
+			tried = list(self._discover_tried)
+
+		pid, url = candidates[self._discover_idx]
+		self._discover_idx = (self._discover_idx + 1) % len(candidates)
+		if url not in tried:
+			tried.append(url)
+		self._discover_tried = tried
+
+		prev_router = self.cfg["router"]
+		prev_keyed = self.router_keyed
+		self.cfg["router"] = url
+		self.router_keyed = True  # the URL comes from a running llama-server's own command line: the API key may be sent to it
+
+		try:
+			data = self.get("/models")["data"]
+			self.router_tried = tried
+			self.router_discovery = "server found at %s from llama-server (pid %d) command line (tried %s)" % (url, pid, ", ".join(tried))
+			self._discover_tried = []
+			self._discover_idx = 0
+			return data, None
+		except urllib.error.HTTPError as e:
+			if e.code in (401, 403):
 				self.router_tried = tried
 				self.router_discovery = "server found at %s from llama-server (pid %d) command line (tried %s)" % (url, pid, ", ".join(tried))
-				return data, None
-			except urllib.error.HTTPError as e:
-				if e.code in (401, 403):
-					self.router_tried = tried
-					self.router_discovery = "server found at %s from llama-server (pid %d) command line (tried %s)" % (url, pid, ", ".join(tried))
-					return None, e
-				first_err = e
-			except (OSError, ValueError, KeyError) as e:
-				first_err = e
+				self._discover_tried = []
+				self._discover_idx = 0
+				return None, e
+			first_err = e
+		except (OSError, ValueError, KeyError) as e:
+			first_err = e
+
+		self.cfg["router"] = prev_router
+		self.router_keyed = prev_keyed
 		self.router_tried = tried
 		self.router_discovery = None
 		return None, first_err
@@ -1297,6 +1393,10 @@ class Collector:
 			exe = self.watched_exe()  # the only program ever started, and only from its own folder
 			if exe is None:
 				raise PermissionError(self.NOT_TRUSTED_ERROR % self.trust_reason)
+			with self._alias_lock:
+				t = self._alias_threads.get(exe)
+			if t and t.is_alive() and t != threading.current_thread():
+				t.join()
 			fit = model.fit_projection(exe, flags)
 			self.mem[preset] = {"key": key, "state": "ready", "map": model.analyze(flags, fit, model.server_defaults(exe)), "at": time.time()}
 		except Exception as e:

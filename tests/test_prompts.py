@@ -274,8 +274,19 @@ def test_shrink_below_floor_splits():
 	assert [p["n"] for p in ps] == [1, 1]
 
 
+def test_compaction_honours_the_configured_gap():
+	# b starts 45 s after a ends and its kv is 20% of a's (a's kv 40000 >= 30000): a compaction only inside the configured gap
+	a = turn(kv=40000, wall0=1000.0, wall=1002.0)
+	b = turn(kv=8000, wall0=1047.0, wall=1087.0, pn=7000, cached=0, tn=50, keep=None)
+	assert prompts.is_compaction(a, b, 60) is True
+	assert prompts.is_compaction(a, b, 30) is False
+	assert len(prompts.group([a, b], 60)) == 1
+	assert prompts.group([a, b], 60)[0]["issues"] == ["compacted"]
+	assert [p["n"] for p in prompts.group([a, b], 30)] == [1, 1]
+
+
 def test_row_notes_compacted_not_cache_reset():
-	c = types.SimpleNamespace(allow_known=False)
+	c = types.SimpleNamespace(allow_known=False, cfg={})
 	a = turn(kv=114101, wall0=1000.0, wall=1002.6, pn=1846, cached=111094)
 	b = turn(kv=18900, wall0=1005.2, wall=1046.2, pn=18378, cached=0, tn=522, keep=None)
 	notes = pages.row_notes(c, [a, b])
@@ -284,7 +295,7 @@ def test_row_notes_compacted_not_cache_reset():
 
 
 def test_row_notes_lru_compaction_not_cache_reset():
-	c = types.SimpleNamespace(allow_known=False)
+	c = types.SimpleNamespace(allow_known=False, cfg={})
 	a = turn(kv=126111, wall0=1000.0, wall=1002.0)
 	b = turn(kv=39632, wall0=1005.8, wall=1046.8, sel="LRU", evicted=126111, keep=1.0, pn=39464, cached=0, tn=168)
 	notes = pages.row_notes(c, [a, b])
@@ -293,7 +304,7 @@ def test_row_notes_lru_compaction_not_cache_reset():
 
 
 def test_row_notes_compacted_twice():
-	c = types.SimpleNamespace(allow_known=False)
+	c = types.SimpleNamespace(allow_known=False, cfg={})
 	a1 = turn(kv=126111, wall0=1000.0, wall=1002.0)
 	b1 = turn(kv=39632, wall0=1005.8, wall=1027.3, sel="LRU", evicted=126111, keep=1.0, pn=39464, cached=0, tn=168)
 	cc = turn(kv=139761, wall0=1048.8, wall=1088.8, pn=100129, cached=39632, tn=0)
@@ -304,7 +315,7 @@ def test_row_notes_compacted_twice():
 
 def test_row_notes_compacted_and_genuine_reset():
 	# real numbers: xhigh, a prompt that starts with a genuine LRU reset, grows to 140142, then compacts to 28128
-	c = types.SimpleNamespace(allow_known=False)
+	c = types.SimpleNamespace(allow_known=False, cfg={})
 	r0 = turn(kv=116266, wall0=1000.0, wall=1040.0, sel="LRU", evicted=114534, keep=1.0, cached=None, pn=0)
 	r1 = turn(kv=140142, wall0=1060.0, wall=1100.0, pn=23876, cached=116266, tn=0)
 	r2 = turn(kv=28128, wall0=1102.29, wall=1142.29, pn=23692, cached=4344, tn=92, keep=0.032)
@@ -336,6 +347,7 @@ CASES = [
 	("cache_reset_without_shrink_splits", test_cache_reset_without_shrink_splits),
 	("reload_splits_despite_compaction_ratio", test_reload_splits_despite_compaction_ratio),
 	("shrink_below_floor_splits", test_shrink_below_floor_splits),
+	("compaction_honours_the_configured_gap", test_compaction_honours_the_configured_gap),
 	("row_notes_compacted_not_cache_reset", test_row_notes_compacted_not_cache_reset),
 	("row_notes_lru_compaction_not_cache_reset", test_row_notes_lru_compaction_not_cache_reset),
 	("row_notes_compacted_twice", test_row_notes_compacted_twice),

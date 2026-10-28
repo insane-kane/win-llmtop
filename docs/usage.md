@@ -90,10 +90,10 @@ Pass `--log-file` (in router mode, each preset's `log-file`) and `--log-timestam
 
 ### Live slot telemetry
 
-Start `llama-server` with `--slots` enabled (and pass [`--api-key`](llmtop.1.md#options) or set `LLMTOP_API_KEY` / `LLAMA_API_KEY` if the server requires authentication). The key is sent only to the URL you give with [`--router`](llmtop.1.md#options) or to one read from a running `llama-server`'s command line; the default address `http://127.0.0.1:8080` is probed without it, so for a server that requires a key and does not show up in the process list, pass `--router` as well (see [`llmtop.1.md#discovery-the-api-key-and-trust`](llmtop.1.md#discovery-the-api-key-and-trust)).
+`llama-server` exposes `/slots` by default at build b11669 (`--no-slots` turns it off). Ensure `/slots` is enabled (and pass [`--api-key`](llmtop.1.md#options) or set `LLMTOP_API_KEY` / `LLAMA_API_KEY` if the server requires authentication). The key is sent only to the URL you give with [`--router`](llmtop.1.md#options) or to one read from a running `llama-server`'s command line; the default address `http://127.0.0.1:8080` is probed without it, so for a server that requires a key and does not show up in the process list, pass `--router` as well (see [`llmtop.1.md#discovery-the-api-key-and-trust`](llmtop.1.md#discovery-the-api-key-and-trust)).
 
-- **What it unlocks:** live in-flight request progress from the server's `/slots` endpoint — whether a slot is in `PREFILL` or `DECODE`, how many prompt tokens have been processed, the prefill ETA, live tokens/s, and current KV cache fill.
-- **What you lose without `--slots`:** `/slots` is disabled (`HTTP 404` or `HTTP 501`), so `win-llmtop` still shows GPU memory, host RAM and finished requests from logs, but cannot show the currently running request and raises a warning to start the server with `--slots`.
+- **What it unlocks:** live in-flight request progress from the server's `/slots` endpoint — whether a slot is in `PREFILL` or `DECODE`, how many prompt tokens have been processed, the prefill ETA, live tokens/s, and current KV cache fill. On servers with multiple parallel slots (`-np` / `--parallel N`), `win-llmtop` monitors all slots, summarizes concurrency on its own line (`slots: K of N busy · showing slot S`), and shows total tokens across all slots when a unified KV cache is shared.
+- **What you lose without `/slots` (or with `--no-slots`):** `/slots` is disabled (`HTTP 404` or `HTTP 501`), so `win-llmtop` still shows GPU memory, host RAM and finished requests from logs, but cannot show the currently running request and raises a warning to start the server with `/slots` (or remove `--no-slots`).
 
 ### Router event log
 

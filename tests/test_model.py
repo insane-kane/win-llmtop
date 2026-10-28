@@ -308,6 +308,64 @@ class TestModelAnalysis(unittest.TestCase):
 				model._read_single(path)
 		self.assertLessEqual(read_total[0], 8 * 1024 * 1024)
 
+	def test_analyze_parallel_auto_with_reported_slots(self):
+		"""analyze with parallel auto and reported slot count of 4: rec['total'] is 4x one slot's state, no assumed note."""
+		meta = {
+			"general.architecture": "ssm_test",
+			"ssm_test.block_count": 1,
+			"ssm_test.context_length": 512,
+			"ssm_test.ssm.conv_kernel": 4,
+			"ssm_test.ssm.state_size": 16,
+			"ssm_test.ssm.inner_size": 32,
+			"ssm_test.ssm.group_count": 1,
+		}
+		tensors = [
+			("token_embd.weight", (64, 128), 0, 0),
+			("blk.0.ssm_in.weight", (64, 32), 0, 32768),
+			("output.weight", (64, 128), 0, 49152),
+		]
+		raw = make_gguf(meta, tensors, data_bytes=b"\x00" * 32768)
+		path = os.path.join(self.tmpdir, "ssm_model.gguf")
+		with open(path, "wb") as f:
+			f.write(raw)
+
+		# Call analyze with reported slot count 4
+		analysis = model.analyze({"model": path}, n_slots=4)
+		self.assertEqual(analysis["parallel"], 4)
+		one_slot_rec = analysis["rec"]["per_layer"] * analysis["rec"]["layers"]
+		self.assertGreater(one_slot_rec, 0.0)
+		self.assertAlmostEqual(analysis["rec"]["total"], 4 * one_slot_rec, places=6)
+		self.assertFalse(any("--parallel" in note for note in analysis["assumed"]), analysis["assumed"])
+
+	def test_analyze_parallel_auto_without_reported_slots(self):
+		"""analyze with parallel auto and without reported count: cited auto value 4 and an assumed note."""
+		meta = {
+			"general.architecture": "ssm_test",
+			"ssm_test.block_count": 1,
+			"ssm_test.context_length": 512,
+			"ssm_test.ssm.conv_kernel": 4,
+			"ssm_test.ssm.state_size": 16,
+			"ssm_test.ssm.inner_size": 32,
+			"ssm_test.ssm.group_count": 1,
+		}
+		tensors = [
+			("token_embd.weight", (64, 128), 0, 0),
+			("blk.0.ssm_in.weight", (64, 32), 0, 32768),
+			("output.weight", (64, 128), 0, 49152),
+		]
+		raw = make_gguf(meta, tensors, data_bytes=b"\x00" * 32768)
+		path = os.path.join(self.tmpdir, "ssm_model.gguf")
+		with open(path, "wb") as f:
+			f.write(raw)
+
+		# Call analyze without reported slot count
+		analysis = model.analyze({"model": path})
+		self.assertEqual(analysis["parallel"], 4)
+		one_slot_rec = analysis["rec"]["per_layer"] * analysis["rec"]["layers"]
+		self.assertGreater(one_slot_rec, 0.0)
+		self.assertAlmostEqual(analysis["rec"]["total"], 4 * one_slot_rec, places=6)
+		self.assertIn("--parallel is auto: 4 slots are assumed", analysis["assumed"])
+
 
 CASES = [
 	("small_model_attn_kv", "test_small_model_attn_kv"),
@@ -319,6 +377,8 @@ CASES = [
 	("fit_projection_output_parser", "test_fit_projection_output_parser"),
 	("gguf_invalid_alignment", "test_gguf_invalid_alignment"),
 	("corrupt_header_read_is_capped", "test_corrupt_header_read_is_capped"),
+	("analyze_parallel_auto_with_reported_slots", "test_analyze_parallel_auto_with_reported_slots"),
+	("analyze_parallel_auto_without_reported_slots", "test_analyze_parallel_auto_without_reported_slots"),
 ]
 
 

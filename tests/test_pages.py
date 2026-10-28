@@ -781,6 +781,176 @@ def test_tensors_page_flagless_model_shows_could_not_analyse():
 	assert "no status.args" in text, text
 
 
+def rendered_live_snap(p):
+	return {
+		"t": 1000.0, "router_up": True, "router_error": "", "router_auth_error": None,
+		"presets": {"m": p},
+		"gpu": {"name": "Test GPU", "vram": 24564.0, "budget": 20000.0, "ded": 17000.0, "shr": 1877.0, "uma": False},
+		"llama": {
+			"present": True, "pids": [2000], "ded": 16000.0, "shr": 1877.0, "com": 16000.0, "ws": 1024.0, "pws": 512.0, "commit": 1100.0,
+			"age": 1000.0, "floor": 1877.0, "floor_known": True, "allow": 525.0, "allow_known": True, "allow_src": "measured",
+			"over": 0.0, "ws_drop": 0.0, "commit_drop": 0.0, "vm": None, "vm_error": None,
+			"eng": {"3D": 50.0}, "cpu": 1.0,
+		},
+		"ram": {"total": 65536.0, "avail": 32768.0, "standby": 16384.0, "commit": 20000.0, "commit_limit": 81920.0, "commit_max": 98304.0, "pagefiles": [], "pages_in": 0.0, "pages_out": 0.0},
+		"cpu": {"pct": 10.0, "cores": 16, "threads": 32, "freq": 3500.0, "top": []},
+		"others": [], "busy": False, "new_events": [], "notices": [],
+	}
+
+
+def test_model_block_three_slots_only_slot_2_processing():
+	c = collector([], cfg=dict(S.CFG))
+	c.alerts.ordered = lambda: []
+	p = {
+		"meta": {}, "status": "loaded", "phase": "decode", "kv": 150,
+		"rate_dec": 25.5, "rate_pre": float("nan"), "eta": float("nan"),
+		"elapsed": 2.0, "n_slots": 3, "n_busy": 1,
+		"slot": {
+			"id": 2, "n_ctx": 8192, "task": 42, "n_prompt": 100, "cached": 0,
+			"done": 100, "todo": 100, "decoded": 50, "remain": 150, "params": {},
+			"speculative": False,
+		},
+	}
+	snap = rendered_live_snap(p)
+	for w in (80, 120, 200):
+		view = pages.View()
+		rendered = pages.render(c, snap, view, w, 40)
+		for ln in rendered:
+			assert ui.vlen(ln) <= w, (w, ln, ui.vlen(ln))
+		slots_lines = [ln for ln in rendered if "slots" in ln and "busy" in ln]
+		assert len(slots_lines) == 1, (w, slots_lines)
+		assert "1 of 3 busy" in slots_lines[0], (w, slots_lines[0])
+		assert "showing slot 2" in slots_lines[0], (w, slots_lines[0])
+		assert "…" not in slots_lines[0], (w, slots_lines[0])
+		lines = pages.model_block(c, snap, view, "m", p, w, 2)
+		assert ui.vlen(lines[2]) <= w, (w, lines[2], ui.vlen(lines[2]))
+		assert "1 of 3 busy" in lines[2], (w, lines[2])
+		assert "showing slot 2" in lines[2], (w, lines[2])
+		assert "…" not in lines[2], (w, lines[2])
+		assert "busy" not in plain(lines)[1], (w, lines[1])
+
+
+def test_model_block_two_slots_processing():
+	c = collector([], cfg=dict(S.CFG))
+	c.alerts.ordered = lambda: []
+	p = {
+		"meta": {}, "status": "loaded", "phase": "decode", "kv": 150,
+		"rate_dec": 25.5, "rate_pre": float("nan"), "eta": float("nan"),
+		"elapsed": 2.0, "n_slots": 3, "n_busy": 2,
+		"slot": {
+			"id": 1, "n_ctx": 8192, "task": 43, "n_prompt": 100, "cached": 0,
+			"done": 100, "todo": 100, "decoded": 50, "remain": 150, "params": {},
+			"speculative": False,
+		},
+	}
+	snap = rendered_live_snap(p)
+	for w in (80, 120, 200):
+		view = pages.View()
+		rendered = pages.render(c, snap, view, w, 40)
+		for ln in rendered:
+			assert ui.vlen(ln) <= w, (w, ln, ui.vlen(ln))
+		slots_lines = [ln for ln in rendered if "slots" in ln and "busy" in ln]
+		assert len(slots_lines) == 1, (w, slots_lines)
+		assert "2 of 3 busy" in slots_lines[0], (w, slots_lines[0])
+		assert "showing slot 1" in slots_lines[0], (w, slots_lines[0])
+		assert "…" not in slots_lines[0], (w, slots_lines[0])
+		lines = pages.model_block(c, snap, view, "m", p, w, 2)
+		assert ui.vlen(lines[2]) <= w, (w, lines[2], ui.vlen(lines[2]))
+		assert "2 of 3 busy" in lines[2], (w, lines[2])
+		assert "showing slot 1" in lines[2], (w, lines[2])
+		assert "…" not in lines[2], (w, lines[2])
+		assert "busy" not in plain(lines)[1], (w, lines[1])
+
+
+def test_model_block_unified_cache_total_tokens():
+	c = collector([], cfg=dict(S.CFG))
+	c.alerts.ordered = lambda: []
+	p = {
+		"meta": {}, "status": "loaded", "phase": "decode", "kv": 5000,
+		"rate_dec": 25.5, "rate_pre": float("nan"), "eta": float("nan"),
+		"elapsed": 2.0, "n_slots": 2, "n_busy": 1, "all_tokens": 12345,
+		"slot": {
+			"id": 0, "n_ctx": 65536, "task": 1, "n_prompt": 5000, "cached": 0,
+			"done": 5000, "todo": 5000, "decoded": 50, "remain": 150, "params": {},
+			"speculative": False,
+		},
+	}
+	snap = rendered_live_snap(p)
+	for w in (80, 120, 200):
+		view = pages.View()
+		rendered = pages.render(c, snap, view, w, 40)
+		for ln in rendered:
+			assert ui.vlen(ln) <= w, (w, ln, ui.vlen(ln))
+		slots_lines = [ln for ln in rendered if "slots" in ln and "busy" in ln]
+		assert len(slots_lines) == 1, (w, slots_lines)
+		assert "1 of 2 busy" in slots_lines[0], (w, slots_lines[0])
+		assert "showing slot 0" in slots_lines[0], (w, slots_lines[0])
+		assert "12,345 tokens in the shared cache" in slots_lines[0], (w, slots_lines[0])
+		assert "…" not in slots_lines[0], (w, slots_lines[0])
+		lines = pages.model_block(c, snap, view, "m", p, w, 2)
+		assert ui.vlen(lines[2]) <= w, (w, lines[2], ui.vlen(lines[2]))
+		assert "1 of 2 busy" in lines[2], (w, lines[2])
+		assert "showing slot 0" in lines[2], (w, lines[2])
+		assert "12,345 tokens in the shared cache" in lines[2], (w, lines[2])
+		assert "…" not in lines[2], (w, lines[2])
+		assert "all slots" not in plain(lines)[3], (w, lines[3])
+
+
+def test_model_block_one_slot_renders_identically_to_baseline():
+	c = collector([])
+	snap = {"t": 1000.0, "llama": {"ded": 1000.0, "present": False}}
+	slot_data = {
+		"id": 0, "n_ctx": 8192, "task": 42, "n_prompt": 100, "cached": 0,
+		"done": 100, "todo": 100, "decoded": 50, "remain": 150, "params": {},
+		"speculative": False,
+	}
+	p_one = {
+		"meta": {}, "status": "loaded", "phase": "decode", "kv": 150,
+		"rate_dec": 25.5, "rate_pre": float("nan"), "eta": float("nan"),
+		"elapsed": 2.0, "n_slots": 1, "n_busy": 1, "slot": slot_data,
+	}
+	p_base = {
+		"meta": {}, "status": "loaded", "phase": "decode", "kv": 150,
+		"rate_dec": 25.5, "rate_pre": float("nan"), "eta": float("nan"),
+		"elapsed": 2.0, "n_slots": 0, "n_busy": 0, "slot": slot_data,
+	}
+	for w in (80, 120, 200):
+		lines_one = pages.model_block(c, snap, pages.View(), "m", p_one, w, 2)
+		lines_base = pages.model_block(c, snap, pages.View(), "m", p_base, w, 2)
+		assert lines_one == lines_base, "One-slot server lines differ from baseline at w=%d:\n%s\nvs\n%s" % (w, lines_one, lines_base)
+		assert not any("slots" in ln and "busy" in ln for ln in lines_one), (w, lines_one)
+
+
+def test_model_block_slot_line_shortens_terms_when_tight():
+	c = collector([], cfg=dict(S.CFG))
+	c.alerts.ordered = lambda: []
+	p = {
+		"meta": {}, "status": "loaded", "phase": "decode", "kv": 5000,
+		"rate_dec": 25.5, "rate_pre": float("nan"), "eta": float("nan"),
+		"elapsed": 2.0, "n_slots": 16, "n_busy": 16, "all_tokens": 99999999,
+		"slot": {
+			"id": 15, "n_ctx": 65536, "task": 42, "n_prompt": 5000, "cached": 0,
+			"done": 5000, "todo": 5000, "decoded": 50, "remain": 150, "params": {},
+			"speculative": False,
+		},
+	}
+	snap = rendered_live_snap(p)
+	for w in (80, 120, 200):
+		view = pages.View()
+		rendered = pages.render(c, snap, view, w, 40)
+		for ln in rendered:
+			assert ui.vlen(ln) <= w, (w, ln, ui.vlen(ln))
+		slots_lines = [ln for ln in rendered if "slots" in ln and "busy" in ln]
+		assert len(slots_lines) == 1, (w, slots_lines)
+		assert "16 of 16 busy" in slots_lines[0], (w, slots_lines[0])
+		assert "showing slot 15" in slots_lines[0], (w, slots_lines[0])
+		assert "…" not in slots_lines[0], (w, slots_lines[0])
+		if w == 80:
+			assert "tokens in shared cache" in slots_lines[0], (w, slots_lines[0])
+		else:
+			assert "tokens in the shared cache" in slots_lines[0], (w, slots_lines[0])
+
+
 CASES = [
 	("summary_short_requests_fall_back", test_summary_short_requests_fall_back),
 	("summary_long_cutoffs_when_reached", test_summary_long_cutoffs_when_reached),
@@ -826,6 +996,11 @@ CASES = [
 	("pick_model_cycles_over_flagless_model", test_pick_model_cycles_over_flagless_model),
 	("memory_page_flagless_model_shows_could_not_analyse", test_memory_page_flagless_model_shows_could_not_analyse),
 	("tensors_page_flagless_model_shows_could_not_analyse", test_tensors_page_flagless_model_shows_could_not_analyse),
+	("model_block_three_slots_only_slot_2_processing", test_model_block_three_slots_only_slot_2_processing),
+	("model_block_two_slots_processing", test_model_block_two_slots_processing),
+	("model_block_unified_cache_total_tokens", test_model_block_unified_cache_total_tokens),
+	("model_block_one_slot_renders_identically_to_baseline", test_model_block_one_slot_renders_identically_to_baseline),
+	("model_block_slot_line_shortens_terms_when_tight", test_model_block_slot_line_shortens_terms_when_tight),
 ]
 
 

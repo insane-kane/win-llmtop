@@ -645,6 +645,111 @@ class TestState(unittest.TestCase):
 		finally:
 			srv.close()
 
+	def test_three_slots_only_slot_2_processing(self):
+		slots_data = [
+			{"id": 0, "n_ctx": 8192, "id_task": 1, "is_processing": False, "n_prompt_tokens": 50, "next_token": [{"n_decoded": 0}]},
+			{"id": 1, "n_ctx": 8192, "id_task": 2, "is_processing": False, "n_prompt_tokens": 60, "next_token": [{"n_decoded": 0}]},
+			{"id": 2, "n_ctx": 8192, "id_task": 3, "is_processing": True, "n_prompt_tokens": 100, "n_prompt_tokens_cache": 0, "n_prompt_tokens_processed": 100, "next_token": [{"n_decoded": 25, "n_remain": 75}]},
+		]
+		models_data = [{"id": "m1", "object": "model", "status": {"value": "loaded", "args": ["llama-server.exe", "-m", "m1.gguf"]}}]
+		srv = _StubServer(models_data, slots_data=slots_data)
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win():
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				c.ensure_map = lambda preset: None
+				snap = c.tick(1700000100.0)
+				self.assertTrue(snap["busy"])
+				p = snap["presets"]["m1"]
+				self.assertEqual(p["phase"], "decode")
+				self.assertEqual(p["slot"]["id"], 2)
+				self.assertEqual(p["n_slots"], 3)
+				self.assertEqual(p["n_busy"], 1)
+		finally:
+			srv.close()
+
+	def test_two_slots_processing_primary_is_newer(self):
+		slots_data = [
+			{"id": 0, "n_ctx": 8192, "id_task": 10, "is_processing": True, "n_prompt_tokens": 50, "n_prompt_tokens_cache": 0, "n_prompt_tokens_processed": 50, "next_token": [{"n_decoded": 10, "n_remain": 40}]},
+			{"id": 1, "n_ctx": 8192, "id_task": 20, "is_processing": True, "n_prompt_tokens": 80, "n_prompt_tokens_cache": 0, "n_prompt_tokens_processed": 80, "next_token": [{"n_decoded": 5, "n_remain": 75}]},
+			{"id": 2, "n_ctx": 8192, "id_task": 5, "is_processing": False, "n_prompt_tokens": 30, "next_token": [{"n_decoded": 0}]},
+		]
+		models_data = [{"id": "m1", "object": "model", "status": {"value": "loaded", "args": ["llama-server.exe", "-m", "m1.gguf"]}}]
+		srv = _StubServer(models_data, slots_data=slots_data)
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win():
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				c.ensure_map = lambda preset: None
+				snap = c.tick(1700000100.0)
+				self.assertTrue(snap["busy"])
+				p = snap["presets"]["m1"]
+				self.assertEqual(p["n_slots"], 3)
+				self.assertEqual(p["n_busy"], 2)
+				self.assertEqual(p["slot"]["id"], 1)  # newer task id 20 vs 10
+		finally:
+			srv.close()
+
+	def test_per_slot_rates_separate(self):
+		slots_state = [
+			{"id": 0, "n_ctx": 8192, "id_task": 10, "is_processing": True, "n_prompt_tokens": 100, "n_prompt_tokens_cache": 0, "n_prompt_tokens_processed": 100, "next_token": [{"n_decoded": 0, "n_remain": 100}]},
+			{"id": 1, "n_ctx": 8192, "id_task": 11, "is_processing": True, "n_prompt_tokens": 100, "n_prompt_tokens_cache": 0, "n_prompt_tokens_processed": 100, "next_token": [{"n_decoded": 0, "n_remain": 100}]},
+		]
+		models_data = [{"id": "m1", "object": "model", "status": {"value": "loaded", "args": ["llama-server.exe", "-m", "m1.gguf"]}}]
+		srv = _StubServer(models_data, slots_data=slots_state)
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win():
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False, hz=4.0)
+				c = state.Collector(cfg)
+				c.ensure_map = lambda preset: None
+				# Tick over 1 second, advancing slot 0 by 10 t/s and slot 1 by 50 t/s
+				for step in range(5):
+					t = 1700000100.0 + step * 0.25
+					c.due.clear()
+					slots_state[0]["next_token"] = [{"n_decoded": int(10 * step * 0.25), "n_remain": 100}]
+					slots_state[1]["next_token"] = [{"n_decoded": int(50 * step * 0.25), "n_remain": 100}]
+					c.tick(t)
+				r0 = c.rate.get(("m1", 0))
+				r1 = c.rate.get(("m1", 1))
+				self.assertIsNotNone(r0)
+				self.assertIsNotNone(r1)
+				self.assertAlmostEqual(r0["dec"], 10.0, delta=2.0)
+				self.assertAlmostEqual(r1["dec"], 50.0, delta=2.0)
+		finally:
+			srv.close()
+
+	def test_slots_reply_bad_types_and_empty(self):
+		models_data = [{"id": "m1", "object": "model", "status": {"value": "loaded", "args": ["llama-server.exe", "-m", "m1.gguf"]}}]
+		srv = _StubServer(models_data)
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win():
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				c.ensure_map = lambda preset: None
+
+				# 1. Dict reply
+				srv.slots_data = {"error": "bad request"}
+				c.due.clear()
+				snap = c.tick(1700000100.0)
+				self.assertEqual(snap["presets"]["m1"]["slot_error"], "unexpected /slots reply")
+
+				# 2. List of strings
+				srv.slots_data = ["slot0", "slot1"]
+				c.due.clear()
+				snap = c.tick(1700000101.0)
+				self.assertEqual(snap["presets"]["m1"]["slot_error"], "unexpected /slots reply")
+
+				# 3. Empty list
+				srv.slots_data = []
+				c.due.clear()
+				snap = c.tick(1700000102.0)
+				self.assertIsNone(snap["presets"]["m1"]["slot_error"])
+				self.assertEqual(snap["presets"]["m1"]["phase"], "idle")
+				self.assertEqual(snap["presets"]["m1"]["n_slots"], 0)
+				self.assertEqual(snap["presets"]["m1"]["n_busy"], 0)
+		finally:
+			srv.close()
+
 
 class _Emit:
 	"""A stand-in for Collector.emit: records each event it is called with."""
@@ -803,6 +908,10 @@ CASES = [
 	("paged_is_info_during_load_grace_and_crit_after", TestAlertHeadlines("test_paged_is_info_during_load_grace_and_crit_after")),
 	("spill_headline_and_detail_wording", TestAlertHeadlines("test_spill_headline_and_detail_wording")),
 	("spill_is_info_when_only_excess_and_warn_when_grew", TestAlertHeadlines("test_spill_is_info_when_only_excess_and_warn_when_grew")),
+	("three_slots_only_slot_2_processing", TestState("test_three_slots_only_slot_2_processing")),
+	("two_slots_processing_primary_is_newer", TestState("test_two_slots_processing_primary_is_newer")),
+	("per_slot_rates_separate", TestState("test_per_slot_rates_separate")),
+	("slots_reply_bad_types_and_empty", TestState("test_slots_reply_bad_types_and_empty")),
 ]
 
 

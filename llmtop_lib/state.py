@@ -1150,7 +1150,7 @@ class Collector:
 			has_status = isinstance(m.get("status"), dict)
 			st = m["status"].get("value", "unloaded") if has_status else "loaded"
 			presets[pid_] = {"status": st, "meta": m.get("meta") or {}, "slot": None, "slot_error": None, "phase": "idle", "kv": 0, "rate_dec": NAN, "rate_pre": NAN,
-				"eta": NAN, "elapsed": NAN, "n_slots": 0, "exit": m["status"].get("exit_code") if has_status else None}
+				"eta": NAN, "elapsed": NAN, "n_slots": 0, "n_busy": 0, "exit": m["status"].get("exit_code") if has_status else None}
 			if st == "loaded":
 				self.sample_slot(pid_, presets[pid_], now)
 		busy = any(p["phase"] != "idle" for p in presets.values())
@@ -1207,52 +1207,110 @@ class Collector:
 			slots = self.get(path)
 		except urllib.error.HTTPError as e:
 			err = "HTTP %d" % e.code
-			r = self.rate.setdefault(preset, {"hist": deque(maxlen=64), "task": None, "t0": now, "dec": NAN, "pre": NAN})
-			prev_p = dict(r.get("p") or {})
+			preset_r = self.rate.setdefault(preset, {})
+			prev_p = dict(preset_r.get("p") or {})
 			prev_p["slot_error"] = err
-			r["p"] = prev_p
+			preset_r["p"] = prev_p
 			p.update(prev_p)
 			return
 		except (OSError, ValueError):
 			p.update(self.rate.get(preset, {}).get("p", {}))
 			return
+		if not isinstance(slots, list) or (slots and not all(isinstance(s, dict) for s in slots)):
+			err = "unexpected /slots reply"
+			preset_r = self.rate.setdefault(preset, {})
+			prev_p = dict(preset_r.get("p") or {})
+			prev_p["slot_error"] = err
+			preset_r["p"] = prev_p
+			p.update(prev_p)
+			return
 		if not slots:
 			p["slot_error"] = None
+			p["n_slots"] = 0
+			p["n_busy"] = 0
+			self.rate.setdefault(preset, {})["p"] = dict(p)
 			return
-		s = slots[0]
-		nt = (s.get("next_token") or [{}])[0]
-		decoded, proc = nt.get("n_decoded", 0), bool(s.get("is_processing"))
-		n_prompt, cached, done = s.get("n_prompt_tokens", 0), s.get("n_prompt_tokens_cache", 0), s.get("n_prompt_tokens_processed", 0)
-		todo, task = max(0, n_prompt - cached), s.get("id_task")
-		r = self.rate.setdefault(preset, {"hist": deque(maxlen=64), "task": None, "t0": now, "dec": NAN, "pre": NAN})
-		if task != r["task"]:
-			r.update(task=task, t0=now, dec=NAN, pre=NAN)
-			r["hist"].clear()
-		r["hist"].append((now, done, decoded))
-		pts = r.setdefault("pre_pts", deque(maxlen=8))
-		if task != r.get("pre_task"):
-			pts.clear()
-			r["pre_task"] = task
-		if proc and (not pts or done != pts[-1][1]):
-			pts.append((now, done))
-		if proc:
-			cur = (asm.cur.get(task) if asm else None) or {}
-			if cur.get("wall0") and cur["wall0"] > now - 3600:
-				r["t0"] = min(r["t0"], cur["wall0"])
-			dec = self.windowed(r["hist"], 2, 2.0, now)
-			pre = self.prefill_rate(pts, now)
-			if decoded > 0 and dec == dec:
-				r["dec"] = dec
-			if decoded == 0 and pre == pre:
-				r["pre"] = pre
-		phase = "idle" if not proc else "prefill" if decoded == 0 and done < todo else "starting" if decoded == 0 else "decode"
-		kv = cached + done + decoded if proc else (self.last_kv(preset) or n_prompt + decoded)
-		eta = (todo - done) / r["pre"] if phase == "prefill" and r["pre"] == r["pre"] and r["pre"] > 0 else NAN
-		out = {"slot": {"id": s.get("id", 0), "n_ctx": s.get("n_ctx", 0), "task": task, "n_prompt": n_prompt, "cached": cached, "done": done, "todo": todo,
-			"decoded": decoded, "remain": nt.get("n_remain", 0), "params": s.get("params") or {}, "speculative": s.get("speculative", False)},
-			"slot_error": None, "phase": phase, "kv": kv, "rate_dec": r["dec"] if proc else NAN, "rate_pre": r["pre"] if proc else NAN, "eta": eta,
-			"elapsed": now - r["t0"] if proc else NAN, "n_slots": len(slots)}
-		r["active"], r["p"] = proc, out
+		slot_records = []
+		for idx, s in enumerate(slots):
+			s_id = s.get("id", idx)
+			raw_nt = s.get("next_token")
+			if isinstance(raw_nt, list) and raw_nt:
+				nt = raw_nt[0] if isinstance(raw_nt[0], dict) else {}
+			elif isinstance(raw_nt, dict):
+				nt = raw_nt
+			else:
+				nt = {}
+			decoded = nt.get("n_decoded", 0)
+			proc = bool(s.get("is_processing"))
+			n_prompt = s.get("n_prompt_tokens", 0)
+			cached = s.get("n_prompt_tokens_cache", 0)
+			done = s.get("n_prompt_tokens_processed", 0)
+			todo = max(0, n_prompt - cached)
+			task = s.get("id_task")
+			r = self.rate.setdefault((preset, s_id), {"hist": deque(maxlen=64), "task": None, "t0": now, "dec": NAN, "pre": NAN})
+			if task != r["task"]:
+				r.update(task=task, t0=now, dec=NAN, pre=NAN)
+				r["hist"].clear()
+			r["hist"].append((now, done, decoded))
+			pts = r.setdefault("pre_pts", deque(maxlen=8))
+			if task != r.get("pre_task"):
+				pts.clear()
+				r["pre_task"] = task
+			if proc and (not pts or done != pts[-1][1]):
+				pts.append((now, done))
+			if proc:
+				cur = (asm.cur.get(task) if asm else None) or {}
+				if cur.get("wall0") and cur["wall0"] > now - 3600:
+					r["t0"] = min(r["t0"], cur["wall0"])
+				dec = self.windowed(r["hist"], 2, 2.0, now)
+				pre = self.prefill_rate(pts, now)
+				if decoded > 0 and dec == dec:
+					r["dec"] = dec
+				if decoded == 0 and pre == pre:
+					r["pre"] = pre
+			phase = "idle" if not proc else "prefill" if decoded == 0 and done < todo else "starting" if decoded == 0 else "decode"
+			kv = cached + done + decoded if proc else (cached + done + decoded if (cached or done) else (n_prompt + decoded))
+			eta = (todo - done) / r["pre"] if phase == "prefill" and r["pre"] == r["pre"] and r["pre"] > 0 else NAN
+			elapsed = now - r["t0"] if proc else NAN
+			r["active"] = proc
+			slot_records.append({
+				"s": s, "s_id": s_id, "proc": proc, "task": task, "t0": r["t0"],
+				"n_prompt": n_prompt, "cached": cached, "done": done, "todo": todo,
+				"decoded": decoded, "remain": nt.get("n_remain", 0), "nt": nt,
+				"phase": phase, "kv": kv, "rate_dec": r["dec"] if proc else NAN,
+				"rate_pre": r["pre"] if proc else NAN, "eta": eta, "elapsed": elapsed,
+			})
+		proc_slots = [sr for sr in slot_records if sr["proc"]]
+		if proc_slots:
+			primary = max(proc_slots, key=lambda sr: (sr["t0"], sr["task"] if isinstance(sr["task"], (int, float)) else -1))
+		else:
+			finished = [sr for sr in slot_records if isinstance(sr["task"], (int, float)) and sr["task"] is not None]
+			if finished:
+				primary = max(finished, key=lambda sr: sr["task"])
+			else:
+				primary = next((sr for sr in slot_records if sr["s_id"] == 0), slot_records[0])
+		ps = primary["s"]
+		p_proc = primary["proc"]
+		p_kv = primary["cached"] + primary["done"] + primary["decoded"] if p_proc else (self.last_kv(preset) or primary["n_prompt"] + primary["decoded"])
+		all_same_n_ctx = len(set(sr["s"].get("n_ctx", 0) for sr in slot_records)) == 1
+		all_toks = [p_kv if sr is primary else sr["kv"] for sr in slot_records]
+		slots_with_tokens = sum(1 for t in all_toks if t > 0)
+		all_tokens = sum(all_toks) if (all_same_n_ctx and slots_with_tokens > 1) else None
+		out = {
+			"slot": {
+				"id": primary["s_id"], "n_ctx": ps.get("n_ctx", 0), "task": primary["task"],
+				"n_prompt": primary["n_prompt"], "cached": primary["cached"], "done": primary["done"],
+				"todo": primary["todo"], "decoded": primary["decoded"], "remain": primary["remain"],
+				"params": ps.get("params") or {}, "speculative": ps.get("speculative", False),
+			},
+			"slot_error": None, "phase": primary["phase"], "kv": p_kv,
+			"rate_dec": primary["rate_dec"], "rate_pre": primary["rate_pre"], "eta": primary["eta"],
+			"elapsed": primary["elapsed"], "n_slots": len(slots), "n_busy": len(proc_slots),
+			"all_tokens": all_tokens,
+		}
+		preset_r = self.rate.setdefault(preset, {})
+		preset_r["active"] = bool(proc_slots)
+		preset_r["p"] = out
 		p.update(out)
 
 	@staticmethod
@@ -1371,7 +1429,12 @@ class Collector:
 				return  # already recorded; do not rewrite it every frame
 			self.mem[preset] = {"key": None, "state": "error", "error": error}
 			return
-		key = json.dumps({k: flags.get(k) for k in model.FIT_FLAGS + ("model-draft", "cache-ram", "swa-checkpoints", "ctx-checkpoints")}, sort_keys=True)
+		key_flags = {k: flags.get(k) for k in model.FIT_FLAGS + ("model-draft", "cache-ram", "swa-checkpoints", "ctx-checkpoints")}
+		if model.setting(flags, {}, "parallel")[0] in (None, -1, "-1", "auto"):
+			n_slots = self.rate.get(preset, {}).get("p", {}).get("n_slots")
+			if n_slots:
+				key_flags["n_slots"] = n_slots
+		key = json.dumps(key_flags, sort_keys=True)
 		if self.mem.get(preset, {}).get("key") == key:
 			return
 		self.mem[preset] = {"key": key, "state": "pending"}
@@ -1398,7 +1461,9 @@ class Collector:
 			if t and t.is_alive() and t != threading.current_thread():
 				t.join()
 			fit = model.fit_projection(exe, flags)
-			self.mem[preset] = {"key": key, "state": "ready", "map": model.analyze(flags, fit, model.server_defaults(exe)), "at": time.time()}
+			n_slots = self.rate.get(preset, {}).get("p", {}).get("n_slots")
+			map_res = model.analyze(flags, fit, model.server_defaults(exe), n_slots=n_slots)
+			self.mem[preset] = {"key": key, "state": "ready", "map": map_res, "at": time.time()}
 		except Exception as e:
 			self.mem[preset] = {"key": key, "state": "error", "error": "%s: %s" % (type(e).__name__, e)}
 

@@ -63,7 +63,7 @@ Notices are grey `· ` lines that say why a figure is missing or a source is abs
 ### Pages (keys `1`–`6`, `Tab`, or `←` `→`)
 | Page | Content |
 | :--- | :--- |
-| **Live** | Alerts; GPU (VRAM bar with the OS budget marked, llama-server resident and shared memory, engine load, other apps' VRAM), RAM (in use, commit, file cache, page file) and CPU (load, llama-server cores, clock, processor queue) with framed trend charts; per loaded preset: phase, prefill or decode progress and live t/s, context fill, last draft acceptance, charts; recent turns or recent prompts (`t` toggles; `▸` marks the first turn of each prompt) and events. |
+| **Live** | Alerts; GPU (VRAM bar with the OS budget marked, llama-server resident and shared memory, engine load, other apps' VRAM), RAM (in use, commit, file cache, page file) and CPU (load, llama-server cores, clock, processor queue) with framed trend charts; per loaded preset: phase (with slot and busy counts on multi-slot servers), prefill or decode progress and live t/s, context fill (with total tokens across slots when cache is unified), last draft acceptance, charts; recent turns or recent prompts (`t` toggles; `▸` marks the first turn of each prompt) and events. |
 | **Memory** | For one preset (`m` cycles presets, loaded or not): VRAM by component against the OS budget, with what would fit; llama-server's own RAM as a short table (working set, commit by kind, mapped files, heap against the `cache-ram` and checkpoint ceilings); layer overview. |
 | **System** | CPU (model, cores and threads, per-core load, L1/L2/L3 cache topology, load and clock trends); system RAM by consumer (llama-server, other processes, kernel, file cache, free) with the largest working sets; llama-server working set and private commit; page file size, use and peak with the commit limit; RAM and paging trends. |
 | **Requests** | Per preset: volume (prompts, turns, busy time, input/new/cached/output tokens, cache hit, loads with mean load time, issues), speed (prefill and decode median, slow 10% and sample count `n`, draft acceptance and mean length), prefill and decode t/s by context depth (`<8k`, `8–32k`, `32–64k`, `64k+`; coloured by rank within each column, green fastest and red slowest), per-turn charts for qualifying turns, and every prompt newest first with its cache hit and draft acceptance (`m` filters by preset, `t` toggles nested turns). |
@@ -108,7 +108,7 @@ llmtop shows what it can measure or read, and marks what it derives. It never st
 | Page file configured sizes and the commit maximum | registry `PagingFiles` | configuration |
 | llama-server working set, commit, CPU time; every process's working set | psapi | measured |
 | Private, mapped-file, image and reserved memory; mapped file names | an address-space walk (`VirtualQueryEx`) | measured |
-| Slot state, token counts, prompt progress, sampler settings | router `/slots` | measured |
+| Slot state across all slots, token counts, prompt progress, sampler settings | router or single-model `/slots` (on by default at b11669; `--no-slots` disables) | measured |
 | Live prefill and decode t/s | change in the `/slots` counters between polls | derived by arithmetic |
 | ETA | remaining prompt tokens divided by the rate over the last batch | derived estimate |
 | Turn timings, draft acceptance, prefix similarity, kept share (`f_keep`), slot id and pick | llama-server log lines, kept in `requests.jsonl` because llama-server rewrites a preset's log each time that model loads | reported by llama.cpp |

@@ -406,7 +406,7 @@ class TestTrust(unittest.TestCase):
 			seen["exe"] = exe
 			return None
 
-		def fake_analyze(flags, fit=None, defaults=None):
+		def fake_analyze(flags, fit=None, defaults=None, n_slots=None):
 			seen["flags"] = dict(flags)
 			return {"stub": True}
 

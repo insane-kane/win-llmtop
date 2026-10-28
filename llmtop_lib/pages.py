@@ -432,6 +432,29 @@ def model_block(c, snap, view, preset, p, W, gh):
 		if last:
 			tail = "   last request %s ago: %s new + %s cached prompt tokens, %s generated" % (ago(snap["t"] - (last.get("wall") or snap["t"])), tok(last.get("pn", 0)), "-" if last.get("cached", 0) is None else tok(last.get("cached", 0)), tok(last.get("tn", 0)))
 		out.append("  %sidle%s%s" % (C.grey, C.reset, tail))
+	n_slots = p.get("n_slots", 0)
+	n_busy = p.get("n_busy", 0)
+	if n_slots > 1:
+		slot_id = s.get("id", 0)
+		base_line = "  slots    %d of %d busy · showing slot %d" % (n_busy, n_slots, slot_id)
+		all_tok = p.get("all_tokens")
+		if all_tok is not None:
+			t_str = tok(all_tok)
+			candidates = [
+				"%s · %s tokens in the shared cache" % (base_line, t_str),
+				"%s · %s tokens in shared cache" % (base_line, t_str),
+				"%s · %s in shared cache" % (base_line, t_str),
+				"%s · %s shared tokens" % (base_line, t_str),
+			]
+			limit = max(40, W - 1)
+			chosen = base_line
+			for cand in candidates:
+				if vlen(cand) <= limit:
+					chosen = cand
+					break
+			out.append(chosen)
+		else:
+			out.append(base_line)
 	frac = p["kv"] / max(1, s["n_ctx"])
 	extra = "     prompt %s = %s cached (%.0f%%) + %s new" % (tok(s["n_prompt"]), tok(s["cached"]), 100 * s["cached"] / max(1, s["n_prompt"]), tok(s["todo"])) if phase != "idle" else "     %safter the last request%s" % (C.grey, C.reset)
 	out.append("  context  %s / %s tokens  %s %s%.1f%%%s%s" % (tok(p["kv"]), tok(s["n_ctx"]), bar(frac, 24, shade(frac)), shade(frac), 100 * frac, C.reset, extra))

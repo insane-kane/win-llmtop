@@ -455,7 +455,7 @@ def _place(name, layer, n_layer, ngl, overrides, flags):
 	return False, ""
 
 
-def analyze(flags, fit=None, defaults=None):
+def analyze(flags, fit=None, defaults=None, n_slots=None):
 	"""Memory map for a preset's flags: weights by component, per-layer sizes, KV cache and recurrent state, checkpoint sizes. MiB throughout."""
 	if not local_path(flags["model"]):
 		raise ValueError("the model path is not an absolute path on a local drive")
@@ -542,8 +542,12 @@ def analyze(flags, fit=None, defaults=None):
 	ctx += -ctx % 256
 	parallel = _int(setting(flags, defaults, "parallel")[0], -1)
 	if parallel < 1:
-		parallel = 1
-		assumed.append("--parallel is auto: 1 slot is assumed")
+		slots_reported = _int(n_slots if n_slots is not None else flags.get("n_slots"), 0)
+		if slots_reported > 0:
+			parallel = slots_reported
+		else:
+			parallel = 4
+			assumed.append("--parallel is auto: 4 slots are assumed")
 	ubatch = _int(setting(flags, defaults, "ubatch-size")[0], 0)
 	if ubatch < 1:
 		ubatch = 512

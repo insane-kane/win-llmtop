@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Polling `/slots` no longer reloads a preset that was just unloaded: router requests now pass `autoload=false`, and "model is not loaded" counts as a normal result.
+
 ## [0.4.1] - 2026-10-30
 
 ### Changed

@@ -19,7 +19,7 @@ Pages:
 Keys: 1-6 or left/right switch pages, [ ] the time window, g graph height, s graph style, p pause, arrows and PgUp/PgDn scroll, q quits.
 
 Sources:
-	/models, /slots?model=<preset>   router API: loaded preset and its flags, context in use, prompt progress, tokens decoded (live)
+	/models, /slots?model=<preset>&autoload=false   router API: loaded preset and its flags, context in use, prompt progress, tokens decoded (live)
 	<preset>.log                     per-request timings from the model process; the router log has loads, queueing and evictions
 	Windows performance counters     dedicated and shared (system RAM) VRAM per process, GPU engine load, paging; DXGI gives the OS VRAM budget
 	                                 (the GPU load comes from the AMD driver's own sensor where there is one)

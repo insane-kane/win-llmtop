@@ -33,7 +33,7 @@ from llmtop_lib import pages, state, win  # noqa: E402
 class _StubServer:
 	"""Ephemeral HTTP server on 127.0.0.1 for testing Collector."""
 
-	def __init__(self, models_data, slots_data=None, require_key=None, slots_status=200, require_key_on_models=False):
+	def __init__(self, models_data, slots_data=None, require_key=None, slots_status=200, require_key_on_models=False, slots_error_body=None):
 		self.models_data = models_data
 		self.slots_data = slots_data if slots_data is not None else [
 			{
@@ -52,6 +52,7 @@ class _StubServer:
 		self.require_key = require_key
 		self.require_key_on_models = require_key_on_models
 		self.slots_status = slots_status
+		self.slots_error_body = slots_error_body
 		self.requests = []
 		parent = self
 
@@ -70,7 +71,7 @@ class _StubServer:
 						self._send_json(401, {"error": {"message": "Invalid API Key", "code": 401}})
 						return
 					if parent.slots_status != 200:
-						self._send_json(parent.slots_status, {"error": {"code": parent.slots_status}})
+						self._send_json(parent.slots_status, parent.slots_error_body or {"error": {"code": parent.slots_status}})
 						return
 					self._send_json(200, parent.slots_data)
 					return
@@ -349,6 +350,40 @@ class TestState(unittest.TestCase):
 				self.assertEqual(p2["slot"]["n_ctx"], 8192)
 				self.assertTrue(any(auth == "Bearer test-token-123" for path, auth in srv.requests if path.startswith("/slots")))
 				self.assertNotIn("slots:preset-a", c.alerts.active)
+		finally:
+			srv.close()
+
+	def test_slots_400_not_loaded_is_normal_between_polls(self):
+		# With autoload=false the router answers 400 "model is not loaded" when the preset
+		# was unloaded between the /models poll and this one: a normal result, not a flag.
+		models_data = [
+			{
+				"id": "preset-x",
+				"object": "model",
+				"status": {"value": "loaded", "args": ["llama-server.exe", "-m", "x.gguf"]},
+			}
+		]
+		srv = _StubServer(
+			models_data,
+			slots_status=400,
+			slots_error_body={"error": {"code": 400, "message": "model is not loaded"}},
+		)
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win():
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				c.ensure_map = lambda preset: None
+				snap = c.tick(1700000100.0)
+				p = snap["presets"]["preset-x"]
+				self.assertIsNone(p["slot_error"])
+				self.assertEqual(p["status"], "loaded")
+				self.assertNotIn("slots:preset-x", c.alerts.active)
+				self.assertTrue(all("autoload=false" in path for path, _ in srv.requests if path.startswith("/slots")), srv.requests)
+
+				srv.slots_error_body = {"error": {"code": 400}}  # a different 400 keeps its handling
+				snap2 = c.tick(1700000104.0)  # beyond the 3 s slot cadence so the poll really runs
+				self.assertEqual(snap2["presets"]["preset-x"]["slot_error"], "HTTP 400")
+				self.assertIn("slots:preset-x", c.alerts.active)
 		finally:
 			srv.close()
 
@@ -1908,6 +1943,7 @@ CASES = [
 	("router_flagless_loaded_model_no_crash_and_notice", TestState("test_router_flagless_loaded_model_no_crash_and_notice")),
 	("single_model_process_not_found_notice_and_no_crash", TestState("test_single_model_process_not_found_notice_and_no_crash")),
 	("slots_401_and_api_key_header", TestState("test_slots_401_and_api_key_header")),
+	("slots_400_not_loaded_is_normal_between_polls", TestState("test_slots_400_not_loaded_is_normal_between_polls")),
 	("uma_zero_vram_adapter", TestState("test_uma_zero_vram_adapter")),
 	("amd_adapter_load_drives_gpu_series", TestState("test_amd_adapter_load_drives_gpu_series")),
 	("high_page_in_rate_raises_no_alert", TestState("test_high_page_in_rate_raises_no_alert")),

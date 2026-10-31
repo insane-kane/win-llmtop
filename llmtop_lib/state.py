@@ -215,6 +215,14 @@ def _win_err(fn, pid):
 	return str(e)
 
 
+def _http_error_body(e):
+	"""The error reply's body from an HTTPError, decoded; "" when it cannot be read."""
+	try:
+		return e.read().decode("utf-8", errors="replace")
+	except Exception:
+		return ""
+
+
 class Ring:
 	"""One value per wall-clock second over `span` seconds; NaN where nothing was recorded."""
 
@@ -1697,10 +1705,22 @@ class Collector:
 		if not self.is_due("slots:" + preset, now, 1.0 / self.cfg["hz"] if active else 3.0):
 			p.update(self.rate.get(preset, {}).get("p", {}))
 			return
-		path = "/slots" if self.mode == "single" else "/slots?model=" + urllib.parse.quote(preset, safe="")
+		# autoload=false: a plain /slots?model= would reload a preset a client just unloaded.
+		# The router then answers 400 "model is not loaded" when the preset was unloaded
+		# between the /models poll and this one, which is a normal not-loaded result.
+		path = "/slots" if self.mode == "single" else "/slots?model=" + urllib.parse.quote(preset, safe="") + "&autoload=false"
 		try:
 			slots = self.get(path)
 		except urllib.error.HTTPError as e:
+			if e.code == 400 and "model is not loaded" in _http_error_body(e):
+				# a normal transient (the preset was unloaded between polls), not a slot error:
+				# keep the rates the preset had and clear the flag
+				preset_r = self.rate.setdefault(preset, {})
+				restored = dict(preset_r.get("p") or {})
+				restored["slot_error"] = None
+				preset_r["p"] = restored
+				p.update(restored)
+				return
 			err = "HTTP %d" % e.code
 			preset_r = self.rate.setdefault(preset, {})
 			prev_p = dict(preset_r.get("p") or {})

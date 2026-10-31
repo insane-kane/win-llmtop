@@ -3,8 +3,9 @@
 # SPDX-FileCopyrightText: 2026 Aaron Kane <software@kanenet.us>
 """Release-gate check for win-llmtop.
 
-	Exits 0 only when the checked-out commit is a new, unreleased version ready
-	to fast-forward onto main:
+	A commit whose version already has a tag is ordinary work: exit 0, and nothing
+	is posted. Any other commit is a release attempt, and must be a new, unreleased
+	version ready to fast-forward onto main, or this exits 1:
 	1. pyproject.toml's project.version is X.Y.Z (three integers);
 	2. CHANGELOG.md has '## [X.Y.Z] - YYYY-MM-DD' with a real calendar date;
 	3. CITATION.cff's version equals project.version;
@@ -12,9 +13,13 @@
 	5. X.Y.Z is strictly greater than every existing v* tag (as integer tuples);
 	6. PyPI's JSON API returns HTTP 404 for win-llmtop X.Y.Z (fails closed on
 	   HTTP 200 or any other status or network error).
+
+	A commit that passes writes release=true to $GITHUB_OUTPUT, and the workflow then
+	posts the release-gate check that main requires. No other commit gets that check.
 """
 
 import datetime
+import os
 import pathlib
 import re
 import subprocess
@@ -145,8 +150,21 @@ def evaluate(version, changelog_text, citation_text, tags, pypi_status, pypi_err
 	if not failures:
 		return True, "release-gate: %s is a new release" % version, []
 	reason = "; ".join(failures)
-	first_line = "release-gate: not a release (%s; failing here is expected on non-release commits)" % reason
+	first_line = "release-gate: %s is not ready to release (%s)" % (version, reason)
 	return False, first_line, failures
+
+
+def is_released(version, tags):
+	"""A version that already has its tag is not a release attempt: this is ordinary work on staging."""
+	return "v" + version in set(tags)
+
+
+def set_output(name, value):
+	"""Pass a value to the workflow's next steps; does nothing outside Actions."""
+	path = os.environ.get("GITHUB_OUTPUT")
+	if path:
+		with open(path, "a", encoding="utf-8") as f:
+			f.write("%s=%s\n" % (name, value))
 
 
 def read_pyproject_version(path=PYPROJECT_PATH):
@@ -190,15 +208,20 @@ def main():
 		citation_text = CITATION_PATH.read_text(encoding="utf-8")
 		tags = get_fetched_tags()
 	except Exception as e:
-		print("release-gate: not a release (input error: %s; failing here is expected on non-release commits)" % e)
-		print(str(e))
+		print("release-gate: input error: %s" % e)
 		return 1
+
+	if is_released(version, tags):
+		print("release-gate: not a release (tag v%s already exists); nothing to check" % version)
+		return 0
 
 	pypi_status, pypi_error = fetch_pypi_status(PYPI_PROJECT, version)
 	ok, first_line, failures = evaluate(version, changelog_text, citation_text, tags, pypi_status, pypi_error)
 	print(first_line)
 	for err in failures:
 		print(err)
+	if ok:
+		set_output("release", "true")
 	return 0 if ok else 1
 
 

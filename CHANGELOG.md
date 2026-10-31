@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The install docs no longer recommend one method over another: `pipx` and `uv tool` are listed as equivalent isolated installs, and the README's install table states when to use each method.
+- Ordinary commits on `staging` no longer show a failed release check: the `release-gate` check is posted only for a new version that is ready to release, and a failure now always means a release that isn't.
 
 ### Fixed
 

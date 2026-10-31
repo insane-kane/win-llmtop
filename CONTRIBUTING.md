@@ -62,7 +62,7 @@ The maintainer aims to respond to a pull request within 7 days.
 
 ## Releases
 
-To cut a release, the maintainer bumps the version in `pyproject.toml` and `CITATION.cff` and adds the dated heading in `CHANGELOG.md` on `staging`; once `release-gate`, `ci-ok` and `Analyze (Python)` pass, `main` is fast-forwarded to `staging` and the signed `v*` tag is pushed. On ordinary `staging` commits, `release-gate` shows red because they aren't releases. The release workflow re-runs all of CI on the tagged commit, and publishing to PyPI waits for the maintainer's approval in the `pypi` environment. Releases are immutable once published. Versions follow Semantic Versioning, and `CHANGELOG.md` follows Keep a Changelog.
+To cut a release, the maintainer bumps the version in `pyproject.toml` and `CITATION.cff` and adds the dated heading in `CHANGELOG.md` on `staging`; once `release-gate`, `ci-ok` and `Analyze (Python)` pass, `main` is fast-forwarded to `staging` and the signed `v*` tag is pushed. Ordinary `staging` commits aren't releases: the `release-check` job passes without posting `release-gate`, which keeps them off `main`, and it fails only on a new version that isn't ready. The release workflow re-runs all of CI on the tagged commit, and publishing to PyPI waits for the maintainer's approval in the `pypi` environment. Releases are immutable once published. Versions follow Semantic Versioning, and `CHANGELOG.md` follows Keep a Changelog.
 
 ## Help wanted
 

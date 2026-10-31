@@ -11,11 +11,15 @@ on:
 permissions: {}
 
 jobs:
-  release-gate:
+  # Named apart from the required release-gate check, which only the last step posts. An
+  # ordinary commit passes this job and gets no release-gate check, so it stays off main; a
+  # job called release-gate could not do that, since a skipped required job counts as success.
+  release-check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
+      checks: write # the last step only; the steps before it never see the token
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -27,4 +31,13 @@ jobs:
         with:
           python-version: "3.13"
       - name: Run release gate
+        id: gate
         run: python -I .github/scripts/release_gate.py
+      - name: Post the release-gate check
+        if: steps.gate.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs"
+          -f name=release-gate -f head_sha="$GITHUB_SHA"
+          -f status=completed -f conclusion=success

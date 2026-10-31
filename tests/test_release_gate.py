@@ -7,13 +7,17 @@
 """
 
 import importlib.util
+import os
 import pathlib
 import re
 import sys
+import tempfile
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT_PATH = ROOT / ".github" / "scripts" / "release_gate.py"
 RELEASE_YML_PATH = ROOT / ".github" / "workflows" / "release.yml"
+GATE_YML_PATH = ROOT / ".github" / "workflows" / "release-gate.yml"
 
 _spec = importlib.util.spec_from_file_location("release_gate", SCRIPT_PATH)
 assert _spec is not None and _spec.loader is not None
@@ -59,8 +63,7 @@ def test_condition_version_format_fails_alone():
 	assert ok is False
 	assert len(failures) == 1, failures
 	assert "pyproject.toml" in failures[0] and "X.Y.Z" in failures[0], failures
-	assert first_line.startswith("release-gate: not a release ("), first_line
-	assert "expected on non-release commits" in first_line, first_line
+	assert first_line.startswith("release-gate: 0.1 is not ready to release ("), first_line
 
 
 def test_condition_changelog_fails_alone():
@@ -70,7 +73,7 @@ def test_condition_changelog_fails_alone():
 	assert ok is False
 	assert len(failures) == 1, failures
 	assert "CHANGELOG.md" in failures[0], failures
-	assert first_line.startswith("release-gate: not a release ("), first_line
+	assert first_line.startswith("release-gate: 0.1.1 is not ready to release ("), first_line
 
 	# Heading present but invalid calendar date (Feb 30)
 	bad_date = "# Changelog\n\n## [0.1.1] - 2026-02-30\n"
@@ -86,7 +89,7 @@ def test_condition_citation_fails_alone():
 	assert ok is False
 	assert len(failures) == 1, failures
 	assert "CITATION.cff" in failures[0], failures
-	assert first_line.startswith("release-gate: not a release ("), first_line
+	assert first_line.startswith("release-gate: 0.1.1 is not ready to release ("), first_line
 
 	missing_citation = "cff-version: 1.2.0\ntitle: win-llmtop\n"
 	ok2, _line2, failures2 = release_gate.evaluate(VALID_VERSION, VALID_CHANGELOG, missing_citation, VALID_TAGS, 404)
@@ -113,7 +116,7 @@ def test_condition_version_greater_fails_alone():
 	assert ok is False
 	assert len(failures) == 1, failures
 	assert "not greater than existing tag v0.2.0" in failures[0], failures
-	assert first_line.startswith("release-gate: not a release ("), first_line
+	assert first_line.startswith("release-gate: 0.1.1 is not ready to release ("), first_line
 
 
 def test_condition_pypi_fails_alone():
@@ -122,7 +125,7 @@ def test_condition_pypi_fails_alone():
 	assert ok is False
 	assert len(failures) == 1, failures
 	assert "HTTP 200" in failures[0], failures
-	assert first_line.startswith("release-gate: not a release ("), first_line
+	assert first_line.startswith("release-gate: 0.1.1 is not ready to release ("), first_line
 
 	# Unexpected HTTP status fails closed
 	ok2, _line2, failures2 = release_gate.evaluate(VALID_VERSION, VALID_CHANGELOG, VALID_CITATION, VALID_TAGS, 503)
@@ -153,7 +156,7 @@ def test_prerelease_version_rejected():
 	assert ok is False
 	assert len(failures) == 1, failures
 	assert "0.1.1rc1" in failures[0], failures
-	assert first_line.startswith("release-gate: not a release ("), first_line
+	assert first_line.startswith("release-gate: 0.1.1rc1 is not ready to release ("), first_line
 
 
 def test_equal_and_lower_versions_rejected():
@@ -187,6 +190,57 @@ def test_changelog_regex_agrees_with_release_yml():
 		assert actual == expected, (sample, actual, expected)
 
 
+def run_main(version, tags, pypi_status=404, changelog=VALID_CHANGELOG):
+	"""Run main() over the given inputs; return (exit code, GITHUB_OUTPUT text, PyPI lookups)."""
+	with tempfile.TemporaryDirectory() as tmp:
+		changelog_path = pathlib.Path(tmp, "CHANGELOG.md")
+		changelog_path.write_text(changelog, encoding="utf-8")
+		citation_path = pathlib.Path(tmp, "CITATION.cff")
+		citation_path.write_text(VALID_CITATION, encoding="utf-8")
+		output = pathlib.Path(tmp, "output")
+		output.write_text("", encoding="utf-8")
+		pypi = mock.Mock(return_value=(pypi_status, None))
+		with (
+			mock.patch.object(release_gate, "read_pyproject_version", return_value=version),
+			mock.patch.object(release_gate, "CHANGELOG_PATH", changelog_path),
+			mock.patch.object(release_gate, "CITATION_PATH", citation_path),
+			mock.patch.object(release_gate, "get_fetched_tags", return_value=tags),
+			mock.patch.object(release_gate, "fetch_pypi_status", pypi),
+			mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}),
+		):
+			rc = release_gate.main()
+		return rc, output.read_text(encoding="utf-8"), pypi.call_count
+
+
+def test_ordinary_commit_passes_and_asks_for_no_check():
+	rc, output, lookups = run_main("0.1.0", ["v0.1.0"])
+	assert (rc, output, lookups) == (0, "", 0), (rc, output, lookups)
+
+
+def test_new_version_asks_for_the_check():
+	rc, output, _lookups = run_main(VALID_VERSION, VALID_TAGS)
+	assert (rc, output) == (0, "release=true\n"), (rc, output)
+
+
+def test_broken_release_fails_and_asks_for_no_check():
+	no_heading = "# Changelog\n\n## [Unreleased]\n"
+	rc, output, _lookups = run_main(VALID_VERSION, VALID_TAGS, changelog=no_heading)
+	assert (rc, output) == (1, ""), (rc, output)
+
+
+def test_version_on_pypi_without_a_tag_is_a_broken_release():
+	rc, output, _lookups = run_main(VALID_VERSION, VALID_TAGS, pypi_status=200)
+	assert (rc, output) == (1, ""), (rc, output)
+
+
+def test_workflow_posts_the_required_check_from_a_differently_named_job():
+	yml = GATE_YML_PATH.read_text(encoding="utf-8")
+	assert re.search(r"^  release-check:$", yml, re.M), "the job must not share the required check's name"
+	assert not re.search(r"^  release-gate:$", yml, re.M), "a skipped job named after a required check counts as success"
+	assert "if: steps.gate.outputs.release == 'true'" in yml
+	assert "-f name=release-gate" in yml
+
+
 CASES = [
 	("all_pass_together", test_all_pass_together),
 	("condition_version_format_fails_alone", test_condition_version_format_fails_alone),
@@ -198,6 +252,11 @@ CASES = [
 	("prerelease_version_rejected", test_prerelease_version_rejected),
 	("equal_and_lower_versions_rejected", test_equal_and_lower_versions_rejected),
 	("changelog_regex_agrees_with_release_yml", test_changelog_regex_agrees_with_release_yml),
+	("ordinary_commit_passes_and_asks_for_no_check", test_ordinary_commit_passes_and_asks_for_no_check),
+	("new_version_asks_for_the_check", test_new_version_asks_for_the_check),
+	("broken_release_fails_and_asks_for_no_check", test_broken_release_fails_and_asks_for_no_check),
+	("version_on_pypi_without_a_tag_is_a_broken_release", test_version_on_pypi_without_a_tag_is_a_broken_release),
+	("workflow_posts_the_required_check_from_a_differently_named_job", test_workflow_posts_the_required_check_from_a_differently_named_job),
 ]
 
 

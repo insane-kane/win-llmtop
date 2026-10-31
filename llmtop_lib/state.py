@@ -107,6 +107,11 @@ def is_loopback_host(host):
 		return False
 
 
+def _finite(x):
+	"""True for a real number: JSON gives None, strings, booleans and, for 1e999, infinity as readily."""
+	return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
 def agg(xs, how):
 	return max(xs) if how == "max" else min(xs) if how == "min" else sum(xs) / len(xs) if how == "mean" else xs[-1]
 
@@ -461,7 +466,7 @@ class Ring:
 		return self.v[i] if self.s[i] == sec else NAN
 
 	def cols(self, t_end, seconds, n, how=None):
-		"""`n` columns covering the last `seconds` seconds up to `t_end`; NaN for gaps."""
+		"""`n` columns covering the last `seconds` seconds up to `t_end`; NaN for gaps. Each column is a fixed slice of time, so a chart scrolls rather than re-slicing every second."""
 		kind = self.how if how is None else how
 		if kind == self.how:
 			ratio = seconds / n
@@ -470,10 +475,10 @@ class Ring:
 			size = 0
 
 		if not size:
-			start = int(t_end) + 1 - seconds
+			k_end = int(t_end) * n // seconds  # the slice that holds t_end
 			out = []
-			for j in range(n):
-				a, b = start + seconds * j // n, start + seconds * (j + 1) // n
+			for k in range(k_end - n + 1, k_end + 1):
+				a, b = -(-k * seconds // n), -(-(k + 1) * seconds // n)
 				xs = [x for x in map(self.at, range(a, max(b, a + 1))) if x == x]
 				out.append(agg(xs, kind) if xs else NAN)
 			return out
@@ -482,13 +487,13 @@ class Ring:
 		sb = self.s60 if size == 60 else self.s10
 		b_end = int(t_end) // size
 		n_buckets = seconds // size
-		b_start = b_end + 1 - n_buckets
+		k_end = b_end * n // n_buckets
+		edge = lambda k: -(-k * n_buckets // n)
 		out = []
 		if kind == "max":
 			vb = self.v60 if size == 60 else self.v10
-			for j in range(n):
-				bj_a = b_start + n_buckets * j // n
-				bj_b = b_start + n_buckets * (j + 1) // n
+			for k in range(k_end - n + 1, k_end + 1):
+				bj_a, bj_b = edge(k), edge(k + 1)
 				m = -float("inf")
 				found = False
 				for b in range(bj_a, bj_b):
@@ -501,9 +506,8 @@ class Ring:
 				out.append(m if found else NAN)
 		elif kind == "min":
 			vb = self.v60 if size == 60 else self.v10
-			for j in range(n):
-				bj_a = b_start + n_buckets * j // n
-				bj_b = b_start + n_buckets * (j + 1) // n
+			for k in range(k_end - n + 1, k_end + 1):
+				bj_a, bj_b = edge(k), edge(k + 1)
 				m = float("inf")
 				found = False
 				for b in range(bj_a, bj_b):
@@ -517,9 +521,8 @@ class Ring:
 		elif kind == "mean":
 			sum_b = self.sum60 if size == 60 else self.sum10
 			cnt_b = self.cnt60 if size == 60 else self.cnt10
-			for j in range(n):
-				bj_a = b_start + n_buckets * j // n
-				bj_b = b_start + n_buckets * (j + 1) // n
+			for k in range(k_end - n + 1, k_end + 1):
+				bj_a, bj_b = edge(k), edge(k + 1)
 				tot_sum = 0.0
 				tot_cnt = 0
 				for b in range(bj_a, bj_b):
@@ -530,9 +533,8 @@ class Ring:
 				out.append(tot_sum / tot_cnt if tot_cnt > 0 else NAN)
 		elif kind == "last":
 			vb = self.v60 if size == 60 else self.v10
-			for j in range(n):
-				bj_a = b_start + n_buckets * j // n
-				bj_b = b_start + n_buckets * (j + 1) // n
+			for k in range(k_end - n + 1, k_end + 1):
+				bj_a, bj_b = edge(k), edge(k + 1)
 				v_last = NAN
 				for b in range(bj_b - 1, bj_a - 1, -1):
 					ib = b % span_b
@@ -626,11 +628,11 @@ class History:
 							d = json.loads(line)
 						except ValueError:
 							continue
-						if d.get("t", 0) < since:
-							continue
-						if "v" in d:
-							samples.append((d["t"], d["v"]))
-						elif "e" in d:
+						if not isinstance(d, dict) or not _finite(d.get("t")) or d["t"] < since:
+							continue  # one damaged line must not stop the program starting
+						if isinstance(d.get("v"), dict):
+							samples.append((d["t"], {k: x for k, x in d["v"].items() if _finite(x)}))
+						elif isinstance(d.get("e"), dict) and d["e"].get("level") in LEVELS and isinstance(d["e"].get("kind"), str) and isinstance(d["e"].get("msg"), str):
 							events.append({"wall": d["t"], "t": 0, "preset": None, "session": None, **d["e"]})
 			except OSError:
 				continue
@@ -664,9 +666,11 @@ class RequestLog:
 				for line in f:
 					lines += 1
 					try:
-						out.append(json.loads(line))
+						r = json.loads(line)
 					except ValueError:
 						continue
+					if isinstance(r, dict):
+						out.append(r)
 		except OSError:
 			ok = False
 		if ok and self.persist and lines > 2 * limit:
@@ -870,6 +874,7 @@ class Collector:
 		self.dx = win.Dxgi() if win.WIN else None
 		self.gpu = self.dx.main() if self.dx else None
 		self.gpu_notice = None
+		self.amd = None
 		self.counters = win.Counters() if win.WIN else None
 		self.procs, self.pids, self.pinfo, self.due, self.prev = {}, (), {}, {}, {}
 		self.pagefile_max = win.pagefile_max() if win.WIN else None
@@ -1196,6 +1201,7 @@ class Collector:
 			self.open_preset(name, spawns.get(name, []))
 		self.follow_router()
 		saved = self.reqlog.load() if self.reqlog and not self.state_error else []  # requests kept from earlier runs, including those whose log has since been rewritten
+		saved = [r for r in saved if "preset" in r and "task" in r]
 		known = defaultdict(list)
 		for r in saved:
 			known[(r["preset"], r["task"])].append(r.get("wall") or 0)
@@ -1513,6 +1519,15 @@ class Collector:
 				return adapters[-best_score[2]]
 		return self.dx.main() if hasattr(self.dx, "main") else max(adapters, key=lambda a: a.get("vram", 0.0), default=None)
 
+	def _adapter_load(self):
+		"""The watched adapter's own load, or None: Windows' engine counters stay the source unless the driver has a sensor for it."""
+		g = self.gpu
+		if not win.WIN or not g or g.get("vendor") != win.AMD_VENDOR:
+			return None
+		if self.amd is None or self.amd.name != g["name"]:
+			self.amd = win.AmdLoad(g["name"])
+		return self.amd.read()
+
 	def _build_notices(self, presets, kids):
 		notices = []
 		if self.state_error:
@@ -1562,8 +1577,10 @@ class Collector:
 			budget = self._gpu_budget(self.gpu)
 			if budget > 0:
 				scale_thresholds(self.cfg, None, None, budget, self.user_thresholds)
+			reading = self._adapter_load()
 			gpu = {"name": self.gpu["name"], "vram": self.gpu["vram"], "shared": self.gpu.get("shared", 0.0), "budget": budget,
-				"ded": ad["ded"], "shr": ad["shr"], "com": ad["com"], "uma": uma}
+				"ded": ad["ded"], "shr": ad["shr"], "com": ad["com"], "uma": uma,
+				"load": reading["load"] if reading else None, "mhz": reading["mhz"] if reading else None}
 		by_luid = pd.get("procs_by_luid")
 		use_luid = bool(luid and isinstance(by_luid, dict) and by_luid)
 		proc_gpu = (lambda pid_: by_luid.get(pid_, {}).get(luid)) if use_luid else (lambda pid_: pd.get("procs", {}).get(pid_))
@@ -1730,11 +1747,12 @@ class Collector:
 				"prompt_max": 0, "prompt_grown": False, "sample_t": now,
 			})
 			if task != r["task"]:
-				r.update(task=task, t0=now, dec=NAN, pre=NAN, prompt_max=n_prompt, prompt_grown=False)
+				r.update(task=task, t0=now, dec=NAN, pre=NAN, prompt_max=n_prompt, prompt_grown=n_prompt == r.get("last_np"), total=None)  # an unchanged count is still the last task's
 				r["hist"].clear()
-			elif n_prompt > r.get("prompt_max", 0):
+			elif n_prompt != r.get("prompt_max", 0):  # a fall counts as well as a rise: the first sample can hold the last task's count
 				r["prompt_grown"] = True
 				r["prompt_max"] = n_prompt
+			r["last_np"] = n_prompt
 			r["sample_t"] = now
 			r["hist"].append((now, done, decoded))
 			pts = r.setdefault("pre_pts", deque(maxlen=8))
@@ -1753,22 +1771,31 @@ class Collector:
 					r["dec"] = dec
 				if decoded == 0 and pre == pre:
 					r["pre"] = pre
+			whole = self.prompt_total(r, asm.progress.get(task) if asm and proc else None, cached)
+			new_total = max(done, whole - cached) if whole is not None else None
+			grown = r.get("prompt_grown", False) or asm is not None  # with a log its lines give the total; until the first one, nothing does
 			phase = "idle" if not proc else "prefill" if decoded == 0 else "decode"
 			kv = cached + done + decoded if proc else (cached + done + decoded if (cached or done) else (n_prompt + decoded))
-			eta = (todo - done) / r["pre"] if phase == "prefill" and not r.get("prompt_grown") and r["pre"] == r["pre"] and r["pre"] > 0 else NAN
+			left = new_total if new_total is not None else None if grown else todo
+			eta = (left - done) / r["pre"] if phase == "prefill" and left is not None and r["pre"] == r["pre"] and r["pre"] > 0 else NAN
 			elapsed = now - r["t0"] if proc else NAN
 			r["active"] = proc
 			slot_records.append({
 				"s": s, "s_id": s_id, "proc": proc, "task": task, "t0": r["t0"],
 				"n_prompt": n_prompt, "cached": cached, "done": done, "todo": todo,
+				"new_total": new_total,
 				"decoded": decoded, "remain": nt.get("n_remain", 0), "nt": nt,
 				"phase": phase, "kv": kv, "rate_dec": r["dec"] if proc else NAN,
 				"rate_pre": r["pre"] if proc else NAN, "eta": eta, "elapsed": elapsed,
-				"prompt_grown": r.get("prompt_grown", False),
+				"prompt_grown": grown,
 				"sample_t": r.get("sample_t", now),
 			})
 		proc_slots = [sr for sr in slot_records if sr["proc"]]
-		if proc_slots:
+		preset_r = self.rate.setdefault(preset, {})
+		shown = next((sr for sr in proc_slots if sr["s_id"] == preset_r.get("shown")), None)  # the slot on screen stays there while it runs
+		if shown:
+			primary = shown
+		elif proc_slots:
 			primary = max(proc_slots, key=lambda sr: (sr["t0"], sr["task"] if isinstance(sr["task"], (int, float)) else -1))
 		else:
 			finished = [sr for sr in slot_records if isinstance(sr["task"], (int, float)) and sr["task"] is not None]
@@ -1787,7 +1814,7 @@ class Collector:
 			"slot": {
 				"id": primary["s_id"], "n_ctx": ps.get("n_ctx", 0), "task": primary["task"],
 				"n_prompt": primary["n_prompt"], "cached": primary["cached"], "done": primary["done"],
-				"todo": primary["todo"], "decoded": primary["decoded"], "remain": primary["remain"],
+				"todo": primary["todo"], "new_total": primary["new_total"], "decoded": primary["decoded"], "remain": primary["remain"],
 				"params": ps.get("params") or {}, "speculative": ps.get("speculative", False),
 				"prompt_grown": primary.get("prompt_grown", False),
 				"sample_t": primary.get("sample_t", now),
@@ -1799,10 +1826,24 @@ class Collector:
 			"prompt_grown": primary.get("prompt_grown", False),
 			"sample_t": primary.get("sample_t", now),
 		}
-		preset_r = self.rate.setdefault(preset, {})
+		preset_r["shown"] = primary["s_id"] if proc_slots else None
 		preset_r["active"] = bool(proc_slots)
 		preset_r["p"] = out
 		p.update(out)
+
+	@staticmethod
+	def prompt_total(r, prog, cached):
+		"""The whole prompt's size from the log's (tokens processed, share done), or None. The share counts the cached prefix and has two decimals, so each line
+		only brackets the total: the bracket narrows batch by batch, which keeps the bar from stepping back when the rounding moves."""
+		if not prog or prog[1] <= 0:
+			return None
+		seen = prog[0] + cached
+		lo, hi = seen / (prog[1] + 0.005), seen / max(0.005, prog[1] - 0.005)
+		was = r.get("total")
+		if was and max(lo, was[0]) <= min(hi, was[1]):
+			lo, hi = max(lo, was[0]), min(hi, was[1])
+		r["total"] = (lo, hi)
+		return round((lo + hi) / 2)
 
 	@staticmethod
 	def prefill_rate(pts, now):
@@ -1832,8 +1873,8 @@ class Collector:
 		if g:
 			v.update(vram=g["ded"], budget=g["budget"], gpu_other=max((o["eng"] for o in snap["others"]), default=0.0))
 		if ll["present"]:
-			v.update(vram_llama=ll["ded"], spill=ll["shr"], gpu_llama=max(ll["eng"].values(), default=0.0), gpu_copy=ll["eng"].get("Copy", 0.0),
-				llama_ws=ll["ws"], llama_cpu=ll["cpu"])
+			v.update(vram_llama=ll["ded"], spill=ll["shr"], gpu_llama=g["load"] if g and g.get("load") is not None else max(ll["eng"].values(), default=0.0),
+				gpu_copy=ll["eng"].get("Copy", 0.0), llama_ws=ll["ws"], llama_cpu=ll["cpu"])
 		if cp:
 			v.update(cpu=cp["cpu"], cpu_mhz=cp["cpu_mhz"])
 		if rm:

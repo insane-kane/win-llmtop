@@ -4,6 +4,7 @@
 
 	PDH     per-process dedicated / shared / committed VRAM, GPU engine load, paging rates (a few ms per sample)
 	DXGI    the VRAM budget the OS reports for the calling process (it can be below the card's capacity)
+	ADL     the adapter's own GPU activity on AMD (atiadlxx.dll, part of the driver)
 	psapi   per-process working set, private bytes, CPU time; system RAM and commit charge
 	iphlpapi  which process listens on a TCP port (the server llmtop trusts for helper programs and file paths)
 """
@@ -14,11 +15,17 @@ import ipaddress
 import os
 import re
 import struct
+import time
 import uuid
+from collections import deque
 
 MIB = 2**20
 NAN = float("nan")
 WIN = os.name == "nt"
+AMD_VENDOR = 0x1002
+ENG_WINDOW_S = 3.0
+ADL_SENSOR_GFXCLK = 1
+ADL_SENSOR_ACTIVITY_GFX = 19
 IS_64 = ctypes.sizeof(ctypes.c_void_p) == 8
 PDH_FMT_DOUBLE = 0x200
 PDH_MORE_DATA = 0x800007D2
@@ -140,11 +147,20 @@ class Counters:
 		self.q = _Query(PATHS)
 		self.q.collect()
 		self.next = None
+		self.eng_hist = {}
 
 	def rebuild(self):
 		if self.next is None:
 			self.next = _Query(PATHS)
 			self.next.collect()
+
+	def _eng_mean(self, name, v, now):
+		"""The mean of an engine's load over ENG_WINDOW_S: one 250 ms PDH sample of busy work alternates between 0 and 100."""
+		h = self.eng_hist.setdefault(name, deque())
+		h.append((now, v))
+		while now - h[0][0] > ENG_WINDOW_S:
+			h.popleft()
+		return sum(x[1] for x in h) / len(h)
 
 	def sample(self):
 		"""{'procs': {pid: {ded, shr, com (MiB), eng: {type: %}}}, 'procs_by_luid': {pid: {luid: {ded, shr, com, eng}}}, 'adapters': {luid: {ded, shr, com}}, 'sys': {...}}"""
@@ -168,14 +184,19 @@ class Counters:
 				m = RE_LUID.search(name)
 				if m:
 					adapters.setdefault(_fmt_luid(m.group(1), m.group(2)), new())[field] += v / MIB
+		now = time.monotonic()
 		for name, v in self.q.read("eng").items():
 			m = RE_ENG.search(name)
-			if m and v > 0:
-				pid, luid, eng = int(m.group(1)), _fmt_luid(m.group(2), m.group(3)), m.group(4)
-				e = procs.setdefault(pid, new())["eng"]
-				e[eng] = min(100.0, e.get(eng, 0.0) + v)
-				el = procs_by_luid.setdefault(pid, {}).setdefault(luid, new())["eng"]
-				el[eng] = min(100.0, el.get(eng, 0.0) + v)
+			if m:
+				v = self._eng_mean(name, v, now)
+				if v > 0:
+					pid, luid, eng = int(m.group(1)), _fmt_luid(m.group(2), m.group(3)), m.group(4)
+					e = procs.setdefault(pid, new())["eng"]
+					e[eng] = min(100.0, e.get(eng, 0.0) + v)
+					el = procs_by_luid.setdefault(pid, {}).setdefault(luid, new())["eng"]
+					el[eng] = min(100.0, el.get(eng, 0.0) + v)
+		for name in [k for k, h in self.eng_hist.items() if now - h[-1][0] > ENG_WINDOW_S]:
+			del self.eng_hist[name]
 		one = lambda k: next(iter(self.q.read(k).values()), 0.0)
 		one_nan = lambda k: next(iter(self.q.read(k).values()), NAN)
 		return {"procs": procs, "procs_by_luid": procs_by_luid, "adapters": adapters, "sys": {
@@ -242,7 +263,7 @@ class Dxgi:
 				a3 = ctypes.c_void_p()
 				if d.flags & 2 or _vcall(ad, 0, ctypes.POINTER(_Guid), ctypes.POINTER(ctypes.c_void_p))(ad, ctypes.byref(iid_adapter3), ctypes.byref(a3)):
 					continue
-				self.adapters.append({"name": d.name, "vram": d.vram / MIB, "shared": d.shared / MIB,
+				self.adapters.append({"name": d.name, "vendor": d.vendor, "vram": d.vram / MIB, "shared": d.shared / MIB,
 					"luid": "0x%08X_0x%08X" % (d.luid.high & 0xFFFFFFFF, d.luid.low),
 					"a3": a3, "budget": 0.0, "budget_shared": 0.0})
 			finally:
@@ -259,6 +280,78 @@ class Dxgi:
 	def main(self):
 		"""The discrete GPU: the adapter with the most dedicated memory."""
 		return max(self.adapters, key=lambda a: a["vram"], default=None)
+
+
+# ---- ADL: AMD's own activity sensor --------------------------------------------------------------------------------
+
+class _AdlSensor(ctypes.Structure):
+	_fields_ = [("supported", ctypes.c_int), ("value", ctypes.c_int)]
+
+
+class _AdlPmLog(ctypes.Structure):
+	_fields_ = [("size", ctypes.c_int), ("sensors", _AdlSensor * 256)]
+
+
+class _AdlAdapter(ctypes.Structure):
+	_fields_ = [("size", ctypes.c_int), ("index", ctypes.c_int), ("udid", ctypes.c_char * 256), ("bus", ctypes.c_int), ("device", ctypes.c_int), ("function", ctypes.c_int),
+		("vendor", ctypes.c_int), ("name", ctypes.c_char * 256), ("display", ctypes.c_char * 256), ("present", ctypes.c_int), ("exist", ctypes.c_int),
+		("driver", ctypes.c_char * 256), ("driver_ext", ctypes.c_char * 256), ("pnp", ctypes.c_char * 256), ("os_display", ctypes.c_int)]
+
+
+class AmdLoad:
+	"""The GPU activity AMD's driver reports for one adapter (the whole adapter, not one process). Windows' engine counters read only 0 or 100 for compute work on these cards.
+
+	`read()` is None when the library or the sensor is missing: the driver has no such library, or this adapter is not listed. The library comes from the system folder only."""
+
+	def __init__(self, name, dll=None):
+		self.name, self.dll, self.ctx, self.index = name, dll, ctypes.c_void_p(), None
+		try:
+			self._open()
+		except (OSError, AttributeError, ValueError):
+			self.index = None
+
+	def _open(self):
+		if self.dll is None:
+			buf = ctypes.create_unicode_buffer(260)
+			if not _k32.GetSystemDirectoryW(buf, 260):
+				return
+			self.dll = ctypes.WinDLL(os.path.join(buf.value, "atiadlxx.dll"))
+		alloc = ctypes.WinDLL("kernel32").GlobalAlloc
+		alloc.argtypes, alloc.restype = [wt.UINT, ctypes.c_size_t], ctypes.c_void_p
+		self._malloc = ctypes.WINFUNCTYPE(ctypes.c_void_p, ctypes.c_int)(lambda n: alloc(0x40, n))  # kept here: ADL calls it for as long as the context lives
+		if self.dll.ADL2_Main_Control_Create(self._malloc, 1, ctypes.byref(self.ctx)):
+			return
+		n = ctypes.c_int()
+		if self.dll.ADL2_Adapter_NumberOfAdapters_Get(self.ctx, ctypes.byref(n)) or n.value <= 0:
+			return
+		info = (_AdlAdapter * n.value)()
+		if self.dll.ADL2_Adapter_AdapterInfo_Get(self.ctx, info, ctypes.sizeof(info)):
+			return
+		want = self.name.strip().casefold()
+		for a in info:
+			if a.name.decode("utf-8", "replace").strip().casefold() == want and self._sensors(a.index) is not None:
+				self.index = a.index  # one card is listed once per output: the first that answers is the one with live sensors
+				return
+
+	def _sensors(self, index):
+		log = _AdlPmLog()
+		log.size = ctypes.sizeof(log)
+		if self.dll.ADL2_New_QueryPMLogData_Get(self.ctx, index, ctypes.byref(log)) or not log.sensors[ADL_SENSOR_ACTIVITY_GFX].supported:
+			return None
+		return log
+
+	def read(self):
+		"""{'load': percent, 'mhz': graphics clock}, or None."""
+		if self.index is None:
+			return None
+		try:
+			log = self._sensors(self.index)
+		except OSError:  # the driver went away, as during an update
+			self.index = None
+			return None
+		if log is None:
+			return None
+		return {"load": float(min(100, max(0, log.sensors[ADL_SENSOR_ACTIVITY_GFX].value))), "mhz": float(log.sensors[ADL_SENSOR_GFXCLK].value)}
 
 
 # ---- processes and system memory ---------------------------------------------------------------------------------
@@ -365,6 +458,8 @@ if WIN:
 	_k32.GetConsoleMode.restype = wt.BOOL
 	_k32.SetConsoleMode.argtypes = [wt.HANDLE, wt.DWORD]
 	_k32.SetConsoleMode.restype = wt.BOOL
+	_k32.GetSystemDirectoryW.argtypes = [wt.LPWSTR, wt.UINT]
+	_k32.GetSystemDirectoryW.restype = wt.UINT
 
 	_psapi.GetProcessMemoryInfo.argtypes = [wt.HANDLE, ctypes.POINTER(_Pmc), wt.DWORD]
 	_psapi.GetProcessMemoryInfo.restype = wt.BOOL

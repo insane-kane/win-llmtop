@@ -385,8 +385,40 @@ class TestModelAnalysis(unittest.TestCase):
 		self.assertEqual(len(overhead_rows), 1)
 		self.assertEqual(overhead_rows[0][1], 150)
 
+	def _analyze(self, meta, tensors, flags):
+		with mock.patch.object(model, "read_gguf", lambda p: (meta, tensors)):
+			return model.analyze({"model": r"C:\m.gguf", **flags})
+
+	def test_host_kv_cache_is_not_a_gpu_row(self):
+		meta = {"general.architecture": "t", "t.block_count": 5, "t.nextn_predict_layers": 1, "t.context_length": 4096, "t.attention.head_count": 8,
+			"t.attention.head_count_kv": 2, "t.attention.key_length": 64, "t.attention.value_length": 64}
+		ten = [("token_embd.weight", (256, 256), 1, 131072), ("output.weight", (256, 256), 1, 131072)]
+		for i in range(5):
+			ten += [("blk.%d.attn_k.weight" % i, (256, 128), 1, 65536), ("blk.%d.attn_v.weight" % i, (256, 128), 1, 65536)]
+		rows = dict((r[0], r[1]) for r in model.memory_rows(self._analyze(meta, ten, {"no-kv-offload": True})))
+		self.assertFalse([k for k, v in rows.items() if v < 0], rows)
+		self.assertFalse([k for k in rows if k.startswith(("KV cache", "MTP head KV"))], rows)
+		on_gpu = dict((r[0], r[1]) for r in model.memory_rows(self._analyze(meta, ten, {})))
+		self.assertGreater(on_gpu["KV cache (f16/f16)"], 0)
+		self.assertGreater(on_gpu["MTP head KV (est.)"], 0)
+
+	def test_head_count_kv_per_layer(self):
+		meta = {"general.architecture": "t", "t.block_count": 2, "t.context_length": 2048, "t.attention.head_count": 8, "t.attention.key_length": 64, "t.attention.value_length": 64}
+		ten = [("token_embd.weight", (256, 256), 1, 131072), ("output.weight", (256, 256), 1, 131072)]
+		ten += [("blk.%d.attn_qkv.weight" % i, (256, 768), 1, 393216) for i in range(2)]
+		scalar = self._analyze(dict(meta, **{"t.attention.head_count_kv": 2}), ten, {})
+		per_layer = self._analyze(dict(meta, **{"t.attention.head_count_kv": [2, 2]}), ten, {})
+		self.assertGreater(scalar["kv"]["full"], 0)
+		self.assertEqual(per_layer["kv"]["full"], scalar["kv"]["full"])
+		self.assertEqual(per_layer["kv"]["per_token"], scalar["kv"]["per_token"])
+		mixed = self._analyze(dict(meta, **{"t.attention.head_count_kv": [2, 8]}), ten, {})
+		self.assertAlmostEqual(mixed["kv"]["full"], 5.0)  # 1 MiB for 2 heads, 4 MiB for 8: each layer by its own count
+		self.assertEqual(mixed["kv"]["per_token"], 2560)
+
 
 CASES = [
+	("host_kv_cache_is_not_a_gpu_row", "test_host_kv_cache_is_not_a_gpu_row"),
+	("head_count_kv_per_layer", "test_head_count_kv_per_layer"),
 	("small_model_attn_kv", "test_small_model_attn_kv"),
 	("fused_attn_qkv", "test_fused_attn_qkv"),
 	("two_shard_split", "test_two_shard_split"),

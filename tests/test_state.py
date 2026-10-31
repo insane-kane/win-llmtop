@@ -26,6 +26,7 @@ from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from llmtop_lib import log as logmod  # noqa: E402
 from llmtop_lib import pages, state, win  # noqa: E402
 
 
@@ -373,6 +374,31 @@ class TestState(unittest.TestCase):
 				self.assertEqual(snap["gpu"]["vram"], 0.0)
 				self.assertEqual(snap["gpu"]["budget"], 14000.0)
 				self.assertNotIn("full", c.alerts.active)
+		finally:
+			srv.close()
+
+	def test_amd_adapter_load_drives_gpu_series(self):
+		models_data = [{"id": "m1", "object": "model", "status": {"value": "loaded", "args": ["llama-server.exe", "-m", "m1.gguf"]}}]
+		srv = _StubServer(models_data)
+		luid = "0x00000000_0x0001C3D4"
+		adapters = [{"name": "Stub Discrete GPU", "vendor": win.AMD_VENDOR, "vram": 20480.0, "shared": 32768.0, "luid": luid, "budget": 19000.0, "budget_shared": 30000.0}]
+		sample_data = {
+			"procs": {2000: {"ded": 16000.0, "shr": 128.0, "com": 16128.0, "eng": {"Compute": 0.0}}},
+			"procs_by_luid": {2000: {luid: {"ded": 16000.0, "shr": 128.0, "com": 16128.0, "eng": {"Compute": 0.0}}}},
+			"adapters": {luid: {"ded": 16200.0, "shr": 200.0, "com": 16400.0}},
+			"sys": {"pages_in": 0.0, "pages_out": 0.0, "standby": 8192.0, "free": 16384.0, "modified": 128.0, "pagefile_pct": 5.0},
+		}
+		stub = types.SimpleNamespace(name="Stub Discrete GPU", read=lambda: {"load": 98.0, "mhz": 2876.0})
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win(adapters=adapters, sample_data=sample_data), mock.patch.object(win, "AmdLoad", return_value=stub):
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				c.ensure_map = lambda preset: None
+				snap = c.tick(1700000100.0)
+				self.assertEqual(snap["gpu"]["load"], 98.0)
+				self.assertEqual(snap["gpu"]["mhz"], 2876.0)
+				# the engine counters read 0 for compute work: the series takes the adapter's own figure instead
+				self.assertEqual(c.series_values(snap)["gpu_llama"], 98.0)
 		finally:
 			srv.close()
 
@@ -802,6 +828,199 @@ class TestState(unittest.TestCase):
 						self.assertIn("tokens so far", pre_line, "step %d missing 'tokens so far': %s" % (step, pre_line))
 						self.assertNotIn("%", pre_line, "step %d has '%%': %s" % (step, pre_line))
 						self.assertNotIn("ETA", pre_line, "step %d has 'ETA': %s" % (step, pre_line))
+		finally:
+			srv.close()
+
+	def test_long_prefill_stale_first_sample_never_draws_a_bar(self):
+		# A 33,965-token prompt at 20 Hz on llama-server b11669: the task's first sample still holds the last task's 96,646
+		recorded_rows = [
+			(96646, 0, 0), (2048, 0, 0), (2048, 0, 2048), (4096, 0, 2048),
+			(4096, 0, 4096), (6144, 0, 4096), (6144, 0, 6144),
+		]
+		slots_state = [
+			{"id": 0, "n_ctx": 16384, "id_task": 100, "is_processing": False,
+			 "n_prompt_tokens": 0, "n_prompt_tokens_cache": 0, "n_prompt_tokens_processed": 0,
+			 "next_token": [{"n_decoded": 0, "n_remain": 100}]},
+		]
+		models_data = [{"id": "m1", "object": "model", "status": {"value": "loaded", "args": ["llama-server.exe", "-m", "m1.gguf"]}}]
+		srv = _StubServer(models_data, slots_data=slots_state)
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win():
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				c.ensure_map = lambda preset: None
+				c.due.clear()
+				c.tick(1700000100.0)  # the previous task, idle: the first row below is a real task change
+				slots_state[0]["id_task"] = 101
+				slots_state[0]["is_processing"] = True
+				for step, (n_prompt, cached, done) in enumerate(recorded_rows):
+					slots_state[0]["n_prompt_tokens"] = n_prompt
+					slots_state[0]["n_prompt_tokens_cache"] = cached
+					slots_state[0]["n_prompt_tokens_processed"] = done
+					c.due.clear()
+					snap = c.tick(1700000100.0 + (step + 1) * 4.2)
+					p = snap["presets"]["m1"]
+					self.assertEqual(p["phase"], "prefill", "step %d expected prefill, got %s" % (step, p["phase"]))
+					text = [re.sub(r"\x1b\[[0-9;]*m", "", ln) for ln in pages.model_block(c, snap, pages.View(), "m1", p, 120, 2)]
+					self.assertNotIn("DECODE", "\n".join(text), "step %d rendered DECODE" % step)
+					if step > 0:  # the stale first sample is gone: the total is unknown, so no bar and no percentage
+						self.assertTrue(p["slot"]["prompt_grown"], "step %d expected prompt_grown=True" % step)
+						self.assertIn("tokens so far", text[1], "step %d: %s" % (step, text[1]))
+						self.assertNotIn("%", text[1], "step %d: %s" % (step, text[1]))
+						self.assertNotIn("ETA", text[1], "step %d: %s" % (step, text[1]))
+		finally:
+			srv.close()
+
+	def test_damaged_history_lines_do_not_stop_the_start(self):
+		now = int(time.time())
+		good_event = {"t": now, "e": {"level": "info", "kind": "alert", "msg": "m"}}
+		with tempfile.TemporaryDirectory() as td:
+			with open(os.path.join(td, "samples-%s.jsonl" % time.strftime("%Y%m%d")), "w", encoding="utf-8") as f:
+				for line in ("12", "[1]", '{"t":"x","v":{}}', '{"t":%d,"v":[1]}' % now, '{"t":%d,"e":{"level":"info"}}' % now, '{"t":1e999,"v":{"cpu":1}}',
+					'{"t":%d,"e":{"level":"ERROR","kind":"log","msg":"x"}}' % now, json.dumps({"t": now, "v": {"cpu": 12.5, "ram": None, "free": "x"}}), json.dumps(good_event)):
+					f.write(line + "\n")
+			samples, events = state.History(td).load(now - 60)
+			self.assertEqual(samples, [(now, {"cpu": 12.5})])
+			self.assertEqual([e["msg"] for e in events], ["m"])
+			with open(os.path.join(td, "requests.jsonl"), "w", encoding="utf-8") as f:
+				f.write('12\n{"wall":1}\n{"preset":"a","task":1,"wall":2}\n')
+			self.assertEqual(state.RequestLog(td).load(), [{"wall": 1}, {"preset": "a", "task": 1, "wall": 2}])
+			with _patch_win():
+				c = state.Collector(dict(state.CFG, router="http://127.0.0.1:9", state_dir=td, log_dir=None, persist=False, calibrate=False))
+				c.poll_models = lambda now: None
+				c.load_history()
+			self.assertEqual([r["preset"] for r in c.requests], ["a"])
+			self.assertEqual(c.rings["cpu"].at(now), 12.5)
+
+	def test_prompt_total_narrows_so_the_bar_never_steps_back(self):
+		# real figures: 21,971 tokens cached, 43,807 in all; one estimate per line wobbled the bar 29 -> 28, 57 -> 56, 85 -> 84
+		cached, whole, r, last = 21971, 43807, {}, -1.0
+		for n in range(2057, 21836, 2048):
+			est = state.Collector.prompt_total(r, (n, round((n + cached) / whole, 2)), cached)
+			pct = 100 * n / (est - cached)
+			self.assertGreater(pct, last, "n=%d estimate %d" % (n, est))
+			last = pct
+		self.assertLess(abs(est - whole) / whole, 0.005, "estimate %d" % est)
+		self.assertIsNone(state.Collector.prompt_total({}, None, cached))
+		self.assertIsNone(state.Collector.prompt_total({}, (0, 0.0), cached))
+
+	def test_long_prefill_bar_from_the_log_never_goes_back(self):
+		recorded_rows = [
+			(96646, 0, 0), (2048, 0, 0), (2048, 0, 2048), (4096, 0, 2048),
+			(4096, 0, 4096), (6144, 0, 4096), (6144, 0, 6144),
+		]
+		total_prompt = 33965  # what the server's log works the prompt out to, cached prefix included
+
+		class _StubTail:
+			path = "stub.log"
+
+			def poll(self):
+				return []
+
+		slots_state = [
+			{"id": 0, "n_ctx": 65536, "id_task": 100, "is_processing": False,
+			 "n_prompt_tokens": 0, "n_prompt_tokens_cache": 0, "n_prompt_tokens_processed": 0,
+			 "next_token": [{"n_decoded": 0, "n_remain": 100}]},
+		]
+		models_data = [{"id": "m1", "object": "model", "status": {"value": "loaded", "args": ["llama-server.exe", "-m", "m1.gguf"]}}]
+		srv = _StubServer(models_data, slots_data=slots_state)
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win():
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				c.ensure_map = lambda preset: None
+				asm = logmod.Assembler("m1")
+				c.follow["m1"] = (_StubTail(), asm)
+				c.due.clear()
+				c.tick(1700000100.0)
+				slots_state[0]["id_task"] = 101
+				slots_state[0]["is_processing"] = True
+				last_pct, last_snap, last_p = -1, None, None
+				for step, (n_prompt, cached, done) in enumerate(recorded_rows):
+					slots_state[0]["n_prompt_tokens"] = n_prompt
+					slots_state[0]["n_prompt_tokens_cache"] = cached
+					slots_state[0]["n_prompt_tokens_processed"] = done
+					if done > 0:  # the server's line for the batch that finished: n_tokens and the share of the prompt it leaves
+						asm.progress[101] = (done, done / total_prompt)
+					c.due.clear()
+					snap = c.tick(1700000100.0 + (step + 1) * 4.2)
+					p = snap["presets"]["m1"]
+					text = [re.sub(r"\x1b\[[0-9;]*m", "", ln) for ln in pages.model_block(c, snap, pages.View(), "m1", p, 120, 2)]
+					line = text[1]
+					self.assertEqual(p["phase"], "prefill", "step %d expected prefill, got %s" % (step, p["phase"]))
+					self.assertNotIn("DECODE", "\n".join(text), "step %d rendered DECODE" % step)
+					self.assertIn("PREFILL", line, "step %d: %s" % (step, line))
+					m = re.search(r"(\d+)%", line) if step > 0 else None  # step 0 is the stale first sample, before any batch line
+					if m:
+						pct = int(m.group(1))
+						self.assertGreaterEqual(pct, last_pct, "step %d: the bar went back: %s" % (step, line))
+						last_pct = pct
+						self.assertIn("~", line, "step %d: the total is from the log and marked as such: %s" % (step, line))
+					if p["rate_pre"] == p["rate_pre"]:  # a rate is known, so the ETA must be a number too
+						self.assertEqual(p["eta"], p["eta"], "step %d: no ETA with a rate: %s" % (step, line))
+					last_snap, last_p = snap, p
+				self.assertGreater(last_pct, 0, "the bar never showed a percentage: %s" % last_p)
+				# the bar case survives each Live width; the model block is not clipped, so ETA is there when a rate is
+				for w in (80, 120, 200):
+					text = [re.sub(r"\x1b\[[0-9;]*m", "", ln) for ln in pages.model_block(c, last_snap, pages.View(), "m1", last_p, w, 2)]
+					pre = next(ln for ln in text if "PREFILL" in ln)
+					self.assertIn("%", pre, (w, pre))
+					self.assertIn("ETA", pre, (w, pre))
+					for ln in pages.render(c, last_snap, pages.View(), w, 40):
+						self.assertLessEqual(pages.vlen(ln), w, (w, ln))  # rendered pages are clipped to the width
+		finally:
+			srv.close()
+
+	def test_busy_slot_stays_on_screen(self):
+		slots_state = [
+			{"id": 0, "n_ctx": 8192, "id_task": 1, "is_processing": True, "n_prompt_tokens": 4096,
+			 "n_prompt_tokens_cache": 0, "n_prompt_tokens_processed": 2048, "next_token": [{"n_decoded": 0, "n_remain": 100}]},
+			{"id": 1, "n_ctx": 8192, "id_task": 0, "is_processing": False, "n_prompt_tokens": 0,
+			 "n_prompt_tokens_cache": 0, "n_prompt_tokens_processed": 0, "next_token": [{"n_decoded": 0, "n_remain": 0}]},
+		]
+		models_data = [{"id": "m1", "object": "model", "status": {"value": "loaded", "args": ["llama-server.exe", "-m", "m1.gguf"]}}]
+		srv = _StubServer(models_data, slots_data=slots_state)
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win():
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				c.ensure_map = lambda preset: None
+				c.due.clear()
+				snap1 = c.tick(1700000100.0)  # slot 0 prefilling alone
+				self.assertEqual(snap1["presets"]["m1"]["slot"]["id"], 0)
+				slots_state[1].update(id_task=2, is_processing=True, n_prompt_tokens=2048, n_prompt_tokens_cache=0,
+					n_prompt_tokens_processed=2048, next_token=[{"n_decoded": 5, "n_remain": 95}])
+				c.due.clear()
+				p2 = c.tick(1700000101.0)["presets"]["m1"]
+				self.assertEqual(p2["slot"]["id"], 0, "the page swapped to the newer request on another slot")
+				self.assertEqual(p2["phase"], "prefill", "PREFILL and DECODE swapped: %s" % p2["phase"])
+				slots_state[0].update(is_processing=False)
+				c.due.clear()
+				p3 = c.tick(1700000102.0)["presets"]["m1"]
+				self.assertEqual(p3["slot"]["id"], 1, "the shown slot did not move on once the old one went idle")
+				self.assertEqual(p3["phase"], "decode")
+		finally:
+			srv.close()
+
+	def test_decode_context_line_counts_generated_tokens_once(self):
+		slots_state = [
+			{"id": 0, "n_ctx": 65536, "id_task": 5, "is_processing": True, "n_prompt_tokens": 36510,
+			 "n_prompt_tokens_cache": 36478, "n_prompt_tokens_processed": 27, "next_token": [{"n_decoded": 5, "n_remain": 95}]},
+		]
+		models_data = [{"id": "m1", "object": "model", "status": {"value": "loaded", "args": ["llama-server.exe", "-m", "m1.gguf"]}}]
+		srv = _StubServer(models_data, slots_data=slots_state)
+		try:
+			with tempfile.TemporaryDirectory() as tmp, _patch_win():
+				cfg = dict(state.CFG, router=srv.url, state_dir=os.path.join(tmp, "state"), log_dir=None, persist=False, calibrate=False)
+				c = state.Collector(cfg)
+				c.ensure_map = lambda preset: None
+				c.due.clear()
+				snap = c.tick(1700000100.0)
+				p = snap["presets"]["m1"]
+				self.assertEqual(p["phase"], "decode")
+				text = "\n".join(re.sub(r"\x1b\[[0-9;]*m", "", ln) for ln in pages.model_block(c, snap, pages.View(), "m1", p, 120, 2))
+				self.assertIn("prompt 36,505 = 36,478 cached", text)  # cached prefix plus the 27 new tokens, not the 36,510 queued with 5 generated
+				self.assertIn("+ 27 new", text)
 		finally:
 			srv.close()
 
@@ -1486,11 +1705,11 @@ class TestRing(unittest.TestCase):
 
 	@staticmethod
 	def _legacy_cols(r, t_end, seconds, n, how="max"):
-		"""Baseline cols implementation from parent commit."""
-		start = int(t_end) + 1 - seconds
+		"""Per-second reference over the same fixed slices: n slices of `seconds`/n ending at t_end, each a whole second at least."""
+		first = int(t_end) * n // seconds - n + 1  # the first of the n fixed slices ending at t_end
 		out = []
-		for j in range(n):
-			a, b = start + seconds * j // n, start + seconds * (j + 1) // n
+		for k in range(first, first + n):
+			a, b = -(-k * seconds // n), -(-(k + 1) * seconds // n)
 			xs = [x for x in map(r.at, range(a, max(b, a + 1))) if x == x]
 			out.append(state.agg(xs, how) if xs else state.NAN)
 		return out
@@ -1504,11 +1723,11 @@ class TestRing(unittest.TestCase):
 			return TestRing._legacy_cols(r, t_end, seconds, n, how)
 		b_end = int(t_end) // size
 		n_buckets = seconds // size
-		b_start = b_end + 1 - n_buckets
+		k_end = b_end * n // n_buckets  # the bucket-aligned slice that holds t_end
+		edge = lambda k: -(-k * n_buckets // n)
 		out = []
-		for j in range(n):
-			bj_a = b_start + n_buckets * j // n
-			bj_b = b_start + n_buckets * (j + 1) // n
+		for k in range(k_end - n + 1, k_end + 1):
+			bj_a, bj_b = edge(k), edge(k + 1)
 			xs = [r.at(s) for s in range(bj_a * size, bj_b * size) if r.at(s) == r.at(s)]
 			out.append(state.agg(xs, how) if xs else state.NAN)
 		return out
@@ -1589,6 +1808,42 @@ class TestRing(unittest.TestCase):
 		for c in cols:
 			self.assertTrue(math.isnan(c), "expected NaN for stale bucket, got %s" % c)
 
+	def test_ring_cols_are_fixed_slices(self):
+		"""A chart scrolls: the spike's column count and index move at most one per second, never re-slicing the window."""
+		base = 1700000000
+		S = base + 500
+		r = state.Ring(24 * 3600, how="max")
+		for s in range(base, base + 1000):
+			r.put(s, 0.0)
+		r.put(S, 100.0)
+		prev_idx = None
+		counts = set()
+		for t_end in range(S + 20, S + 61):
+			cols = r.cols(t_end, 300, 112)
+			self.assertEqual(len(cols), 112)
+			hits = [j for j, v in enumerate(cols) if v == 100.0]
+			counts.add(len(hits))
+			self.assertTrue(hits, "t_end=%d lost the spike: %s" % (t_end, cols))
+			idx = max(hits)
+			if prev_idx is not None:
+				self.assertLessEqual(abs(idx - prev_idx), 1, "t_end=%d spike jumped from col %d to %d" % (t_end, prev_idx, idx))
+				self.assertLessEqual(idx, prev_idx, "t_end=%d spike moved right, from col %d to %d" % (t_end, prev_idx, idx))
+			prev_idx = idx
+		self.assertEqual(counts, {1}, "the spike spanned a varying number of columns: %s" % sorted(counts))
+
+		# The columns are fixed slices of time, so one more second either leaves them alone or scrolls them left by exactly one.
+		d = state.Ring(24 * 3600, how="max")
+		for s in range(base, base + 1000):
+			d.put(s, float(s % 997))
+		prev = d.cols(S + 20, 300, 112)
+		for t_end in range(S + 21, S + 61):
+			cur = d.cols(t_end, 300, 112)
+			self.assertTrue(
+				cur == prev or cur[:-1] == prev[1:],
+				"t_end=%d re-sliced the window instead of scrolling: %s vs %s" % (t_end, cur[:4], prev[:4]),
+			)
+			prev = cur
+
 	def test_ring_default_kind_works(self):
 		r = state.Ring(3600)
 		self.assertEqual(r.how, "max")
@@ -1654,6 +1909,7 @@ CASES = [
 	("single_model_process_not_found_notice_and_no_crash", TestState("test_single_model_process_not_found_notice_and_no_crash")),
 	("slots_401_and_api_key_header", TestState("test_slots_401_and_api_key_header")),
 	("uma_zero_vram_adapter", TestState("test_uma_zero_vram_adapter")),
+	("amd_adapter_load_drives_gpu_series", TestState("test_amd_adapter_load_drives_gpu_series")),
 	("high_page_in_rate_raises_no_alert", TestState("test_high_page_in_rate_raises_no_alert")),
 	("invalid_state_dir_disables_persistence_with_notice", TestState("test_invalid_state_dir_disables_persistence_with_notice")),
 	("log_dir_none_and_no_router_log_touches_no_folder", TestState("test_log_dir_none_and_no_router_log_touches_no_folder")),
@@ -1673,6 +1929,12 @@ CASES = [
 	("per_slot_rates_separate", TestState("test_per_slot_rates_separate")),
 	("rate_survives_sample_where_only_n_prompt_tokens_grows", TestState("test_rate_survives_sample_where_only_n_prompt_tokens_grows")),
 	("long_prefill_recorded_sequence_phase_and_progress", TestState("test_long_prefill_recorded_sequence_phase_and_progress")),
+	("long_prefill_stale_first_sample_never_draws_a_bar", TestState("test_long_prefill_stale_first_sample_never_draws_a_bar")),
+	("damaged_history_lines_do_not_stop_the_start", TestState("test_damaged_history_lines_do_not_stop_the_start")),
+	("prompt_total_narrows_so_the_bar_never_steps_back", TestState("test_prompt_total_narrows_so_the_bar_never_steps_back")),
+	("long_prefill_bar_from_the_log_never_goes_back", TestState("test_long_prefill_bar_from_the_log_never_goes_back")),
+	("busy_slot_stays_on_screen", TestState("test_busy_slot_stays_on_screen")),
+	("decode_context_line_counts_generated_tokens_once", TestState("test_decode_context_line_counts_generated_tokens_once")),
 	("collector_stale_sample_updated_seconds_ago", TestState("test_collector_stale_sample_updated_seconds_ago")),
 	("slots_reply_bad_types_and_empty", TestState("test_slots_reply_bad_types_and_empty")),
 	("request_log_trimmed_only_when_persisting", TestState("test_request_log_trimmed_only_when_persisting")),
@@ -1688,6 +1950,7 @@ CASES = [
 	("ring_short_windows_legacy_exact", TestRing("test_ring_short_windows_legacy_exact")),
 	("ring_overwrite_keeps_buckets_exact", TestRing("test_ring_overwrite_keeps_buckets_exact")),
 	("ring_stale_buckets_read_empty", TestRing("test_ring_stale_buckets_read_empty")),
+	("ring_cols_are_fixed_slices", TestRing("test_ring_cols_are_fixed_slices")),
 	("ring_default_kind_works", TestRing("test_ring_default_kind_works")),
 	("models_backoff_connection_error_and_reset", TestState("test_models_backoff_connection_error_and_reset")),
 	("ring_put_run_equals_n_puts_all_how", TestRing("test_ring_put_run_equals_n_puts_all_how")),

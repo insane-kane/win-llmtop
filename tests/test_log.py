@@ -348,6 +348,47 @@ def tail_sees_a_rewrite_that_grew_past_the_offset():
 		assert "line 0000: " + "x" * 40 not in second
 
 
+def test_damaged_numbers_never_raise():
+	start = "I slot launch_slot_: id  0 | task 7 | processing task, is_child = 0"
+	bodies = (
+		"prompt processing, n_tokens = 5, progress = 1.2.3, t = 1 s / 2 tokens per second",
+		"prompt processing, n_tokens = %s, progress = 0.5" % ("9" * 5000),
+		"prompt eval time = 1.2.3 ms / 5 tokens (x, 1 tokens per second)",
+		"eval time = 10.0 ms / 5 tokens (x, 1.2.3 tokens per second)",
+		"total time = 1.2.3 ms / 5 tokens",
+		"draft acceptance rate = 1.2.3 ( 1 accepted / 2 generated)",
+		"selected slot by LCP similarity, sim_best = 1.2.3",
+		"%s" % ("9" * 9000),
+	)
+	asm = log.Assembler("m")
+	asm.feed(start)
+	for body in bodies:
+		asm.feed("I slot print_timing: id  0 | task 7 | " + body)
+	assert asm.feed("%s.00.000.000 I srv  x" % ("9" * 400)) == ([], [])
+	assert 7 not in asm.progress
+
+
+def test_progress_line_per_batch():
+	lines = [
+		"0.05.110.781 I slot launch_slot_: id  0 | task 22693 | processing task, is_child = 0",
+		"0.08.849.254 I slot print_timing: id  0 | task 22693 | prompt processing, n_tokens =   2048, progress = 0.06, t =   3.15 s / 650.83 tokens per second",
+	]
+	asm = log.Assembler("preset")
+	reqs, evs = [], []
+	for line in lines:
+		d, e = asm.feed(line)
+		reqs += d
+		evs += e
+	assert not reqs and not evs, (reqs, evs)  # a batch line finishes nothing and raises no event
+	assert asm.progress[22693] == (2048, 0.06), asm.progress
+	d, _ = asm.feed("0.09.000.000 I slot      release: id  0 | task 22693 | stop processing: n_tokens = 3000, truncated = 0")
+	assert 22693 not in asm.progress, asm.progress  # released: the progress goes with the request
+	assert len(d) == 1, d
+	r = d[0]
+	assert r["kv"] == 3000 and r["task"] == 22693
+	assert not any("progress" in k for k in r), sorted(r)  # the request record carries no progress keys
+
+
 CASES = [
 	("b11669_with_timestamps", test_b11669_with_timestamps),
 	("no_timestamps", test_no_timestamps),
@@ -368,6 +409,8 @@ CASES = [
 	("request_failed_is_crit_with_detail", test_request_failed_is_crit_with_detail),
 	("normalize_line_safe_sequences", test_normalize_line_safe_sequences),
 	("tail_sees_a_rewrite_that_grew_past_the_offset", tail_sees_a_rewrite_that_grew_past_the_offset),
+	("damaged_numbers_never_raise", test_damaged_numbers_never_raise),
+	("progress_line_per_batch", test_progress_line_per_batch),
 ]
 
 

@@ -230,6 +230,11 @@ def _int(v, default=0):
 		return default
 
 
+def _head_count(v):
+	"""An attention head count: one number, or one per layer (llama.cpp reads either form)."""
+	return max((_int(x) for x in v), default=0) if isinstance(v, list) else _int(v)
+
+
 # ---- GGUF header ---------------------------------------------------------------------------------------------------
 
 def read_gguf(path):
@@ -483,8 +488,9 @@ def analyze(flags, fit=None, defaults=None, n_slots=None):
 			rx, buft = part.rsplit("=", 1)
 			overrides.append((re.compile(rx), buft.strip().upper()))
 
-	n_head = _int(g("attention.head_count"))
-	n_head_kv = _int(g("attention.head_count_kv") or n_head)
+	n_head = _head_count(g("attention.head_count"))
+	head_kv = g("attention.head_count_kv")
+	n_head_kv = _head_count(head_kv) or n_head
 	k_len = _int(g("attention.key_length"))
 	v_len = _int(g("attention.value_length"))
 	if not k_len:
@@ -492,8 +498,6 @@ def analyze(flags, fit=None, defaults=None, n_slots=None):
 		k_len = (embd_len // n_head) if n_head else 0
 	if not v_len:
 		v_len = k_len
-	meta_kd = n_head_kv * k_len
-	meta_vd = n_head_kv * v_len
 
 	by_layer = {}
 	for name, dims, _ty, nbytes in tensors:
@@ -513,8 +517,10 @@ def analyze(flags, fit=None, defaults=None, n_slots=None):
 			v = names.get("attn_v.weight", (None, 0))[0]
 			if k and len(k) > 1:
 				kv_dims[i] = (k[1], v[1] if (v and len(v) > 1) else k[1])
-			elif meta_kd > 0 and meta_vd > 0:
-				kv_dims[i] = (meta_kd, meta_vd)
+			else:
+				heads = _int(head_kv[i]) if isinstance(head_kv, list) and i < len(head_kv) else n_head_kv  # layers can differ
+				if heads * k_len > 0 and heads * v_len > 0:
+					kv_dims[i] = (heads * k_len, heads * v_len)
 		else:
 			kinds[i] = "other"
 		if i >= n_main:
@@ -559,14 +565,17 @@ def analyze(flags, fit=None, defaults=None, n_slots=None):
 		ck, cv = (ck if str(ck) in BPE else "f16"), (cv if str(cv) in BPE else "f16")
 	bk, bv = BPE[str(ck)], BPE[str(cv)]
 	swa_cells = min(ctx, n_swa * parallel + ubatch + (-(n_swa * parallel + ubatch) % 256)) if n_swa and not flags.get("swa-full") else ctx
-	kv = {"full": 0.0, "swa": 0.0, "mtp": 0.0, "gpu": 0.0, "cpu": 0.0, "per_token": 0.0, "layers": {"full": 0, "swa": 0, "mtp": 0}}
+	kv = {"full": 0.0, "swa": 0.0, "mtp": 0.0, "mtp_gpu": 0.0, "gpu": 0.0, "cpu": 0.0, "per_token": 0.0, "layers": {"full": 0, "swa": 0, "mtp": 0}}
 	for i, (kd, vd) in kv_dims.items():
 		kind = kinds[i]
 		cells = swa_cells if kind == "swa" else ctx
 		size = cells * (kd * bk + vd * bv) / MIB
 		kv[kind if kind in ("full", "swa", "mtp") else "full"] += size
 		kv["layers"][kind if kind in ("full", "swa", "mtp") else "full"] += 1
-		kv["cpu" if (layers[i]["gpu"] == 0 and layers[i]["mib"] > 0) or flags.get("no-kv-offload") else "gpu"] += size
+		where = "cpu" if (layers[i]["gpu"] == 0 and layers[i]["mib"] > 0) or flags.get("no-kv-offload") else "gpu"
+		kv[where] += size
+		if kind == "mtp" and where == "gpu":
+			kv["mtp_gpu"] += size
 		if kind == "full":
 			kv["per_token"] += kd * bk + vd * bv
 	d_conv, d_state, d_inner, n_group = _int(g("ssm.conv_kernel")), _int(g("ssm.state_size")), _int(g("ssm.inner_size")), _int(g("ssm.group_count"))
@@ -613,19 +622,20 @@ def memory_rows(m, measured=None, overhead=None):
 		if name != "MTP head" and d["gpu"] >= 0.5:
 			rows.append(("weights: " + name, d["gpu"], ""))
 	kv = m["kv"]
-	if kv["layers"]["full"] or kv["layers"]["swa"]:
+	mtp_gpu = kv.get("mtp_gpu", kv["mtp"])  # the rows below are what is on the GPU: --no-kv-offload keeps the cache on the host
+	if (kv["layers"]["full"] or kv["layers"]["swa"]) and kv["gpu"] - mtp_gpu > 0:
 		parts = []
 		if kv["layers"]["full"]:
 			parts.append("%d layers × %s tokens" % (kv["layers"]["full"], format(m["ctx"], ",")))
 		if kv["layers"]["swa"]:
 			parts.append("%d sliding-window layers" % kv["layers"]["swa"])
-		rows.append(("KV cache (%s/%s)" % (m["cache_k"], m["cache_v"]), kv["gpu"] - kv["mtp"], " + ".join(parts) + " · %.0f KiB/token" % (kv["per_token"] / 1024)))
+		rows.append(("KV cache (%s/%s)" % (m["cache_k"], m["cache_v"]), kv["gpu"] - mtp_gpu, " + ".join(parts) + " · %.0f KiB/token" % (kv["per_token"] / 1024)))
 	if m["rec"]["total"]:
 		rows.append(("recurrent state", m["rec"]["total"], "%d layers × %.2f MiB" % (m["rec"]["layers"], m["rec"]["per_layer"])))
 	if m["mtp_mib"]:
 		rows.append(("MTP head weights", m["mtp_mib"], "%d layer, built into the model file" % m["n_mtp"]))
-	if kv["mtp"]:
-		rows.append(("MTP head KV (est.)", kv["mtp"], "estimate"))
+	if mtp_gpu:
+		rows.append(("MTP head KV (est.)", mtp_gpu, "estimate"))
 	if m["draft"]:
 		rows.append(("draft model weights", m["draft"]["mib"], os.path.basename(m["draft"]["path"])))
 	if m["fit"] and "gpu" in m["fit"]:

@@ -64,6 +64,14 @@ The maintainer aims to respond to a pull request within 7 days.
 
 To cut a release, the maintainer bumps the version in `pyproject.toml` and `CITATION.cff` and adds the dated heading in `CHANGELOG.md` on `staging`; once `release-gate`, `ci-ok` and `Analyze (Python)` pass, `main` is fast-forwarded to `staging` and the signed `v*` tag is pushed. On ordinary `staging` commits, `release-gate` shows red because they aren't releases. The release workflow re-runs all of CI on the tagged commit, and publishing to PyPI waits for the maintainer's approval in the `pypi` environment. Releases are immutable once published. Versions follow Semantic Versioning, and `CHANGELOG.md` follows Keep a Changelog.
 
+## Help wanted
+
+**GPU load on NVIDIA and Intel cards needs someone with the hardware.** The maintainer has only an AMD card. There, Windows' `GPU Engine` counters read 0 or 100 from one sample to the next during compute work, so `win-llmtop` reads AMD's driver sensor instead. NVIDIA and Intel cards fall back to a 3-second mean of those counters, and nobody has checked whether that is right.
+
+To report what your card does, run a long prompt and compare the Live page's `GPU load` with your vendor's own tool (for example `nvidia-smi`). Open an issue with your card, driver version and llama.cpp backend, the `gpu` line of `win-llmtop --check`, and both readings.
+
+If the figures disagree, the fix is a reader like `AmdLoad` in `llmtop_lib/win.py`, picked by adapter vendor ID in `Collector._adapter_load`. It must use only ctypes and a library that ships with the driver, load it from the system folder, and fall back to the counters when the library or sensor is missing. A pull request needs a real reading from the hardware alongside its tests.
+
 ## Labels
 
 - `good first issue` — a good place to start.

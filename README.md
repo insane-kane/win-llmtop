@@ -10,7 +10,7 @@ A live, read-only terminal panel for [llama.cpp](https://github.com/ggml-org/lla
 
 ## What it shows
 
-`win-llmtop` is strictly **read-only**: it reads the server's HTTP API, log files and Windows performance counters, and never changes the server. The only programs it runs are two helpers of the `llama-server` it watches — `llama-server --help`, to read each flag's default, and `llama-fit-params`, llama.cpp's own memory projection — and it runs them only from the folder of that running `llama-server`, never from a path the server reports, the current folder or `PATH`.
+`win-llmtop` is strictly **read-only**: it reads the server's HTTP API, log files, Windows performance counters and, on AMD cards, the driver's GPU activity sensor, and never changes the server. The only programs it runs are two helpers of the `llama-server` it watches — `llama-server --help`, to read each flag's default, and `llama-fit-params`, llama.cpp's own memory projection — and it runs them only from the folder of that running `llama-server`, never from a path the server reports, the current folder or `PATH`.
 
 - **Dedicated and shared GPU memory per process** against the DXGI OS budget, with alerts when Windows demotes VRAM into system RAM.
 - **System RAM, commit charge and the page file** — working sets by consumer, private commit headroom and disk page-ins/page-outs.
@@ -32,21 +32,21 @@ win-llmtop --check
 win-llmtop
 ```
 
-- `pipx install win-llmtop` — installs `win-llmtop` into an isolated environment and puts it on `PATH`.
+- `pipx install win-llmtop` — installs `win-llmtop` into an isolated environment and puts it on `PATH`; `uv tool install win-llmtop` does the same if you manage your tools with `uv`.
 - `win-llmtop --check` — checks Windows counters, the GPU budget, the running `llama-server`, logs and state directory, and exits `0` when the server is reachable and either GPU telemetry is present or the machine has no GPU adapters (`1` otherwise).
 - `win-llmtop` — opens the live six-page terminal panel (`1`–`6` or `Tab` switch pages, `q` quits).
 
 ## Install options at a glance
 
-See the [full installation guide (`docs/install.md`)](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md) for commands, upgrades, uninstalls and package verification.
+See the [full installation guide (`docs/install.md`)](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md) for commands, upgrades, uninstalls and package verification. Every method installs the same package; pick the one that matches your setup.
 
-| Method | Command | Best for |
+| Method | Command | Use when |
 | :--- | :--- | :--- |
-| **[pipx](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#pipx-recommended)** (recommended) | `pipx install win-llmtop` | Most users; isolated CLI environment on `PATH` |
-| **[uv tool](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#uv)** | `uv tool install win-llmtop` | Machines that already use `uv` |
-| **[pip](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#pip-virtual-environment-or-user-site)** | `py -m pip install win-llmtop` | Existing virtual environments or `--user` installs |
-| **[GitHub release wheel](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#offline-or-air-gapped-install)** | `py -m pip install win_llmtop-*.whl` | Offline or air-gapped Windows machines |
-| **[From source](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#from-source)** | `py llmtop.py` | Running directly from a git checkout (zero dependencies) |
+| **[pipx](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#pipx)** | `pipx install win-llmtop` | You want `win-llmtop` on `PATH` in an isolated environment, installed from the Python you already have |
+| **[uv tool](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#uv)** | `uv tool install win-llmtop` | The same isolated `PATH` install, when you manage your tools with `uv` |
+| **[pip](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#pip-virtual-environment-or-user-site)** | `py -m pip install win-llmtop` | You have an existing virtual environment, or want a `--user` install |
+| **[GitHub release wheel](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#offline-or-air-gapped-install)** | `py -m pip install win_llmtop-*.whl` | The machine has no internet access (offline or air-gapped) |
+| **[From source](https://github.com/insane-kane/win-llmtop/blob/main/docs/install.md#from-source)** | `py llmtop.py` | You want to run it from a git checkout without installing (zero dependencies) |
 
 ## Requirements
 
@@ -77,6 +77,10 @@ See [`win-llmtop(1)`](https://github.com/insane-kane/win-llmtop/blob/main/docs/l
 | `--router-log PATH` | — | (none) | Path to the router's own log file |
 | `--api-key KEY` | `LLMTOP_API_KEY` or `LLAMA_API_KEY` | (none) | Bearer token for `llama-server` HTTP requests |
 | `--window {1m,5m,15m,1h,6h,24h}` | — | `5m` | Initial time window for trend charts |
+
+## Known issues
+
+- **GPU load on NVIDIA and Intel cards is unverified (help wanted).** AMD cards use the driver's own activity sensor, because Windows' `GPU Engine` counters proved erratic for compute work on an AMD card. Every other GPU, and an AMD card without that sensor, shows a 3-second mean of those counters, which has not been checked on real NVIDIA or Intel hardware and may read wrong. Nothing else depends on it, and `win-llmtop --check` says which source is in use. See [Contributing](https://github.com/insane-kane/win-llmtop/blob/main/CONTRIBUTING.md#help-wanted) for how to help.
 
 ## Documentation
 

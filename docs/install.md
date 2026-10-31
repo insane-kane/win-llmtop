@@ -1,6 +1,6 @@
 # Installing win-llmtop on Windows
 
-**Contents:** [pipx (recommended)](#pipx-recommended) · [uv](#uv) · [pip](#pip-virtual-environment-or-user-site) · [Specific version](#install-a-specific-version) · [Offline install](#offline-or-air-gapped-install) · [Verify downloads](#verify-what-you-downloaded) · [From source](#from-source) · [64-bit Python](#getting-64-bit-python) · [Recommended terminal](#recommended-terminal)
+**Contents:** [pipx](#pipx) · [uv](#uv) · [pip](#pip-virtual-environment-or-user-site) · [Specific version](#install-a-specific-version) · [Offline install](#offline-or-air-gapped-install) · [Verify downloads](#verify-what-you-downloaded) · [From source](#from-source) · [64-bit Python](#getting-64-bit-python) · [Recommended terminal](#recommended-terminal)
 
 The examples below use `py`, the standard Windows Python Launcher (`py.exe`) included with official [python.org](https://www.python.org/downloads/windows/) installers, which selects your installed 64-bit Python without needing `python.exe` on `PATH`.
 
@@ -8,7 +8,7 @@ After installing with any method, run `win-llmtop --check` (see [`usage.md`](usa
 
 ---
 
-## pipx (recommended)
+## pipx
 
 `pipx` installs `win-llmtop` into an isolated virtual environment and exposes the `win-llmtop` command globally on your `PATH`, so it never conflicts with other Python packages on the machine.
 
@@ -71,7 +71,7 @@ py -m pip install --user win-llmtop
 ```
 
 > [!NOTE]
-> **`PATH` caveat for `--user` installs:** Windows does not add the per-user scripts folder (`%APPDATA%\Python\Python3XX\Scripts`) to `PATH` by default. If `win-llmtop` is not found after `py -m pip install --user win-llmtop`, either add that `Scripts` folder to your user `PATH`, run `py -m llmtop`, or use [`pipx`](#pipx-recommended) instead.
+> **`PATH` caveat for `--user` installs:** Windows does not add the per-user scripts folder (`%APPDATA%\Python\Python3XX\Scripts`) to `PATH` by default. If `win-llmtop` is not found after `py -m pip install --user win-llmtop`, either add that `Scripts` folder to your user `PATH`, run `py -m llmtop`, or use [`pipx`](#pipx) instead.
 
 ## Install a specific version
 

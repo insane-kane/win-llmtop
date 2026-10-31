@@ -40,7 +40,7 @@ Run `win-llmtop` with no arguments for the interactive full-screen view (sampled
 
 | Key | Page | What it shows |
 | :--- | :--- | :--- |
-| `1` | **Live** | Active alerts; GPU VRAM bar against the OS budget, `llama-server` resident and shared memory (`llama-server shared`: expected share and what is beyond it), engine load and other apps' VRAM; system RAM, commit charge, paging and CPU load (`llama-server` cores, clock, processor queue) with trend charts; running request phase, progress, ETA and tokens/s; recent turns or recent prompts (`t` toggles; `▸` marks the first turn of each prompt) and events |
+| `1` | **Live** | Active alerts; GPU VRAM bar against the OS budget, `llama-server` resident and shared memory (`llama-server shared`: expected share and what is beyond it), GPU load and other apps' VRAM; system RAM, commit charge, paging and CPU load (`llama-server` cores, clock, processor queue) with trend charts; running request phase, progress, ETA and tokens/s; recent turns or recent prompts (`t` toggles; `▸` marks the first turn of each prompt) and events |
 | `2` | **Memory** | For one preset (`m` cycles presets, loaded or unloaded): VRAM by component (weights, KV cache, recurrent state, compute buffers, draft, overhead) against the OS budget; `llama-server` host RAM breakdown; layer placement overview |
 | `3` | **System** | CPU model, core and thread counts, per-core load, L1/L2/L3 cache topology, and CPU load and clock trend charts; system RAM by consumer (`llama-server`, other processes, kernel remainder, file cache, free) with top working sets; page file size, use, peak and commit limit; RAM and paging trend charts |
 | `4` | **Requests** | Per-preset prompt and turn volume, busy time, loads and issues; median, slow-10% and sample-count speeds; prefill and decode t/s by context depth (`<8k`, `8–32k`, `32–64k`, `64k+`); per-turn charts; and every prompt with nested turns, each with its cache hit and draft acceptance (`m` filters by preset, `t` toggles nested turns, `h` shows the hidden presets) |
@@ -56,7 +56,7 @@ Run `win-llmtop` with no arguments for the interactive full-screen view (sampled
 | `g` | All pages | Cycle trend chart height (`auto`, `1`, `2`, `3` or `4` rows) |
 | `s` | All pages | Switch chart rendering between `braille` and `blocks` (startup default: [`--graph-style`](llmtop.1.md#options)) |
 | `p` or `Space` | All pages | Pause or resume the screen redraw while background sampling continues |
-| `↑` `↓`, `PgUp` `PgDn`, `Home` `End` | All except **Live** | Scroll long tables vertically |
+| `↑` `↓`, `PgUp` `PgDn`, `Home` `End` | All | Scroll vertically (**Live** scrolls when it does not fit the window) |
 | `m` | **Memory**, **Tensors** | Cycle through presets (loaded first, then unloaded) |
 | `m` | **Requests** | Filter the Requests page by preset |
 | `t` | **Live** | Switch the bottom table between recent turns and recent prompts |
@@ -94,7 +94,7 @@ Pass `--log-file` (in router mode, each preset's `log-file`) and `--log-timestam
 
 `llama-server` exposes `/slots` by default at build b11669 (`--no-slots` turns it off). Ensure `/slots` is enabled (and pass [`--api-key`](llmtop.1.md#options) or set `LLMTOP_API_KEY` / `LLAMA_API_KEY` if the server requires authentication). The key is sent only to the URL you give with [`--router`](llmtop.1.md#options) or to one read from a running `llama-server`'s command line; the default address `http://127.0.0.1:8080` is probed without it, so for a server that requires a key and does not show up in the process list, pass `--router` as well (see [`llmtop.1.md#discovery-the-api-key-and-trust`](llmtop.1.md#discovery-the-api-key-and-trust)).
 
-- **What it unlocks:** live in-flight request progress from the server's `/slots` endpoint — whether a slot is in `PREFILL` or `DECODE`, how many prompt tokens have been processed, the prefill ETA, live tokens/s, and current KV cache fill. On servers with multiple parallel slots (`-np` / `--parallel N`), `win-llmtop` monitors all slots, summarizes concurrency on its own line (`slots    K of N busy · showing slot S`), and shows total tokens across all slots when a unified KV cache is shared.
+- **What it unlocks:** live in-flight request progress from the server's `/slots` endpoint — whether a slot is in `PREFILL` or `DECODE`, how many prompt tokens have been processed, the prefill ETA, live tokens/s, and current KV cache fill. `/slots` only counts the prompt tokens queued so far, so a long prefill's progress bar and ETA also need the per-model log (the `~` marks a total worked out from it); until its first line per batch, or without it, the line shows the tokens so far. On servers with multiple parallel slots (`-np` / `--parallel N`), `win-llmtop` monitors all slots, summarizes concurrency on its own line (`slots    K of N busy · showing slot S`, staying on that slot while it runs), and shows total tokens across all slots when a unified KV cache is shared.
 - **What you lose without `/slots` (or with `--no-slots`):** `/slots` is disabled (`HTTP 404` or `HTTP 501`), so `win-llmtop` still shows GPU memory, host RAM and finished requests from logs, but cannot show the currently running request and raises an info alert (the endpoint is on by default; check the server was not started with `--no-slots`).
 
 ### Router event log

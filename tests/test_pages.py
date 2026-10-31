@@ -522,6 +522,29 @@ def make_test_snap(ll_kw=None, gpu_kw=None):
 	}
 
 
+def test_gpu_block_amd_load_note_at_each_width():
+	for W in (80, 120, 200):
+		text = "\n".join(plain(pages.gpu_block(collector([], cfg=dict(S.CFG)), make_test_snap(gpu_kw={"load": 98.0, "mhz": 2876.0}), pages.View(), W, 2)))
+		assert "98%" in text, (W, text)
+		if W >= 120:  # the note fits on the line from here
+			assert "all apps" in text, (W, text)
+			assert "2,876 MHz" in text, (W, text)
+
+
+def test_gpu_block_amd_idle_note():
+	text = "\n".join(plain(pages.gpu_block(collector([], cfg=dict(S.CFG)), make_test_snap(gpu_kw={"load": 1.0, "mhz": 210.0}), pages.View(), 140, 2)))
+	assert "1%" in text, text
+	assert "idle" in text, text
+	assert "all apps" not in text, text
+
+
+def test_gpu_block_without_adapter_load_keeps_engine_note():
+	text = "\n".join(plain(pages.gpu_block(collector([], cfg=dict(S.CFG)), make_test_snap(), pages.View(), 140, 2)))
+	assert "50%" in text, text
+	assert "3D 50%" in text, text
+	assert "all apps" not in text, text
+
+
 def test_shared_row_measured_and_overage():
 	snap = make_test_snap({"shr": 1735.0, "allow": 525.0, "allow_known": True, "allow_src": "measured", "over": 1210.0})
 	view = pages.View()
@@ -1078,6 +1101,43 @@ def test_model_block_short_prompt_lifecycle():
 	assert "10 tokens" in d_ln, d_ln
 
 
+def test_footer_message_expires_but_a_failing_collector_keeps_its_own():
+	view = pages.View()
+	view.msg = "graph style: blocks"
+	pages.age_msg(view, 100.0)
+	pages.age_msg(view, 100.0 + pages.MSG_S)
+	assert view.msg == "graph style: blocks", view.msg
+	pages.age_msg(view, 101.0 + pages.MSG_S)
+	assert view.msg == "", view.msg
+	view.msg = "collector error: boom"
+	for t in (200.0, 210.0, 220.0):
+		pages.age_msg(view, t, True)
+	assert view.msg == "collector error: boom", view.msg
+	pages.age_msg(view, 221.0)
+	assert view.msg == "collector error: boom", view.msg
+	pages.age_msg(view, 222.0 + pages.MSG_S)
+	assert view.msg == "", view.msg
+
+
+def test_prefill_bar_keeps_rate_and_eta_at_each_width():
+	c = collector([], cfg=dict(S.CFG))
+	c.alerts.ordered = lambda: []
+	slot = {
+		"id": 0, "n_ctx": 131072, "task": 22693, "n_prompt": 8192, "cached": 0, "done": 6144, "todo": 8192,
+		"new_total": 133965, "decoded": 0, "remain": 100, "params": {}, "prompt_grown": True,
+	}
+	p = {
+		"meta": {}, "status": "loaded", "phase": "prefill", "kv": 6144, "rate_dec": float("nan"), "rate_pre": 488.0,
+		"eta": 57.0, "elapsed": 30.0, "n_slots": 1, "n_busy": 1, "slot": slot, "prompt_grown": True,
+	}
+	snap = rendered_live_snap(p)
+	for w in (80, 120, 200):
+		pre_ln = next(ln for ln in plain(pages.render(c, snap, pages.View(), w, 40)) if "PREFILL" in ln)
+		for part in ("6,144 / ~133,965", "5%", "488 t/s", "ETA 0:57"):
+			assert part in pre_ln, (w, part, pre_ln)
+	assert "at this rate" in pre_ln, pre_ln
+
+
 def test_model_block_prefill_known_and_unknown_survive_80_columns():
 	c = collector([], cfg=dict(S.CFG))
 	c.alerts.ordered = lambda: []
@@ -1122,6 +1182,83 @@ def test_model_block_prefill_known_and_unknown_survive_80_columns():
 		pre_ln = next(ln for ln in plain(rendered) if "PREFILL" in ln)
 		assert "%" in pre_ln, (w, pre_ln)
 		assert "100%" in pre_ln, (w, pre_ln)
+
+
+def test_live_graph_height_holds_through_transient_lines():
+	extra = [0]
+	lines_for = lambda gh: {3: 49, 2: 40, 1: 31}[gh] + extra[0]
+	view = pages.View()
+	view.term_h = 70
+	t = 1000.0
+	seen = set()
+	for i in range(40):  # 10 s of frames, under GROW_HOLD_S
+		extra[0] = (0, 3, -3)[i % 3]
+		seen.add(pages.auto_height(view, {"t": t}, 140, 60, lines_for))
+		t += 0.25
+	assert seen == {2}, "height moved with transient lines: %s" % sorted(seen)
+
+	extra[0] = -5  # the room holds with a margin: the graphs grow once, after GROW_HOLD_S
+	grew = []
+	for _ in range(400):
+		before = view.auto_gh
+		gh = pages.auto_height(view, {"t": t}, 140, 60, lines_for)
+		if gh != before:
+			grew.append((round(t, 2), gh))
+		t += 0.25
+	assert grew and grew[0][1] == 3, grew
+	assert len(grew) == 1, "height moved more than once while the room held: %s" % grew
+	assert view.auto_gh == 3, view.auto_gh
+
+	extra[0] = 7  # H - lines_for(3) is 4: the request table has nearly gone, so shrink
+	assert pages.auto_height(view, {"t": t}, 140, 60, lines_for) == 2, view.auto_gh
+
+	extra[0] = -3  # a new terminal size picks afresh on that frame
+	view.term_h = 80
+	assert pages.auto_height(view, {"t": t}, 140, 60, lines_for) == 3, view.auto_gh
+
+
+def test_live_page_scrolls_when_it_does_not_fit():
+	c = _coarse_collector()
+	p = {
+		"meta": {}, "status": "loaded", "phase": "decode", "kv": 150,
+		"rate_dec": 25.5, "rate_pre": float("nan"), "eta": float("nan"),
+		"elapsed": 2.0, "n_slots": 1, "n_busy": 1,
+		"slot": {"id": 0, "n_ctx": 8192, "task": 42, "n_prompt": 100, "cached": 0, "done": 100, "todo": 100, "decoded": 50, "remain": 150, "params": {}, "speculative": False},
+	}
+	snap = rendered_live_snap(p)
+	view = pages.View()
+	rendered = plain(pages.render(c, snap, view, 120, 20))
+	assert not any("busy" in ln for ln in rendered), "the short window already shows the bottom of the page"
+	view.scroll = 1000
+	rendered = plain(pages.render(c, snap, view, 120, 20))
+	assert any("busy" in ln for ln in rendered), "scrolling never reaches the bottom of the Live page"
+	assert 0 < view.scroll < 1000, "scroll was not clamped: %d" % view.scroll
+
+
+def test_graph_width_uses_a_wide_window():
+	assert pages.graph_w(80) == 24
+	assert pages.graph_w(120) == 48
+	assert pages.graph_w(200) == 120
+	assert pages.graph_w(300) == 120
+
+
+def test_live_charts_fit_and_are_labelled_at_each_width():
+	c = _coarse_collector()
+	p = {
+		"meta": {}, "status": "loaded", "phase": "decode", "kv": 150,
+		"rate_dec": 25.5, "rate_pre": float("nan"), "eta": float("nan"),
+		"elapsed": 2.0, "n_slots": 1, "n_busy": 1,
+		"slot": {"id": 0, "n_ctx": 8192, "task": 42, "n_prompt": 100, "cached": 0, "done": 100, "todo": 100, "decoded": 50, "remain": 150, "params": {}, "speculative": False},
+	}
+	snap = rendered_live_snap(p)
+	for w in (80, 120, 200):
+		view = pages.View()
+		rendered = plain(pages.render(c, snap, view, w, 70))
+		for ln in rendered:
+			assert ui.vlen(ln) <= w, (w, ln, ui.vlen(ln))
+		text = "\n".join(rendered)
+		assert "GPU load" in text, (w, "GPU load chart is off screen")
+		assert "decode t/s" in text, (w, "decode t/s chart is off screen")
 
 
 def test_memory_category_colours_and_bar_sequence():
@@ -1235,6 +1372,11 @@ def test_memory_category_colours_and_bar_sequence():
 CASES = [
 	("summary_short_requests_fall_back", test_summary_short_requests_fall_back),
 	("summary_long_cutoffs_when_reached", test_summary_long_cutoffs_when_reached),
+	("footer_message_expires_but_a_failing_collector_keeps_its_own", test_footer_message_expires_but_a_failing_collector_keeps_its_own),
+	("prefill_bar_keeps_rate_and_eta_at_each_width", test_prefill_bar_keeps_rate_and_eta_at_each_width),
+	("gpu_block_amd_load_note_at_each_width", test_gpu_block_amd_load_note_at_each_width),
+	("gpu_block_amd_idle_note", test_gpu_block_amd_idle_note),
+	("gpu_block_without_adapter_load_keeps_engine_note", test_gpu_block_without_adapter_load_keeps_engine_note),
 	("gpu_block_no_vram_with_budget", test_gpu_block_no_vram_with_budget),
 	("gpu_block_no_vram_no_budget", test_gpu_block_no_vram_no_budget),
 	("header_single_mode_says_server", test_header_single_mode_says_server),
@@ -1288,6 +1430,10 @@ CASES = [
 	("model_block_stale_sample_updated_seconds_ago", test_model_block_stale_sample_updated_seconds_ago),
 	("model_block_short_prompt_lifecycle", test_model_block_short_prompt_lifecycle),
 	("model_block_prefill_known_and_unknown_survive_80_columns", test_model_block_prefill_known_and_unknown_survive_80_columns),
+	("live_graph_height_holds_through_transient_lines", test_live_graph_height_holds_through_transient_lines),
+	("live_page_scrolls_when_it_does_not_fit", test_live_page_scrolls_when_it_does_not_fit),
+	("graph_width_uses_a_wide_window", test_graph_width_uses_a_wide_window),
+	("live_charts_fit_and_are_labelled_at_each_width", test_live_charts_fit_and_are_labelled_at_each_width),
 	("memory_category_colours_and_bar_sequence", test_memory_category_colours_and_bar_sequence),
 ]
 

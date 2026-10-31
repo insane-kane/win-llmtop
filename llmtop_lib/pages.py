@@ -16,6 +16,8 @@ NAN = float("nan")
 ICON = {"crit": ("◆", "bred"), "warn": ("▲", "byellow"), "info": ("●", "bcyan")}
 DEC_EDGES, DEC_LABELS = (8000, 32000, 64000), ("<8k", "8-32k", "32-64k", "64k+")
 DEVICES = ("all", "GPU", "CPU")
+GROW_HOLD_S = 30  # free room must hold this long before the Live page's graphs grow
+MSG_S = 5  # how long a message stays in the footer
 
 
 class View:
@@ -29,6 +31,8 @@ class View:
 		self.show_hidden = False  # the Requests page: show the presets hidden by hide_after_days
 		self.detail = False  # the Events page's detail toggle: show each event's detail line(s)
 		self.cache, self.cache_sec = {}, 0
+		self.auto_gh, self.auto_key, self.grow_since, self.term_h = None, None, None, 0  # the Live page's automatic graph height, the terminal size it was picked for, when more room appeared, the terminal height
+		self.msg_seen, self.msg_t = "", 0.0  # the footer message as last seen and when it changed
 
 	@property
 	def seconds(self):
@@ -80,7 +84,7 @@ def kvline(label, text):
 
 
 def graph_w(W):
-	return max(24, min(56, W - 72))
+	return max(24, min(120, W - 72))
 
 
 def series(c, view, snap, key, width):
@@ -283,7 +287,16 @@ def footer(view, W):
 	return "%s %s   q quit%s%s" % (C.bold, keys, C.reset, "   " + view.msg if view.msg else "")
 
 
+def age_msg(view, now, failing=False):
+	"""Clear the footer's message MSG_S after it last changed. A collector error stays while the collector keeps failing, and goes once it recovers."""
+	if failing or view.msg != view.msg_seen:
+		view.msg_seen, view.msg_t = view.msg, now
+	elif view.msg and now - view.msg_t > MSG_S:
+		view.msg = view.msg_seen = ""
+
+
 def render(c, snap, view, W, H):
+	view.term_h = H
 	lines = [header(c, snap, view, W)]
 	lines += banner(c, snap, 4 if view.page == 0 else 2, W)
 	body_h = H - len(lines) - 1
@@ -345,7 +358,12 @@ def gpu_block(c, snap, view, W, gh):
 		if note:
 			out.append("%s  %s%s" % (C.grey, note, C.reset))
 		eng = "  ".join("%s %.0f%%" % (k, v) for k, v in sorted(ll["eng"].items(), key=lambda kv: -kv[1]) if v >= 0.5)
-		out += block(c, view, snap, "gpu_llama", G, gh, "GPU load", "%.0f%%" % max(ll["eng"].values(), default=0.0), num, "%", 0.0, 100.0, C.bgreen, True, eng or "idle")
+		load = g.get("load")
+		if load is not None:
+			cur, note = "%.0f%%" % load, ("all apps · %s MHz" % num(g["mhz"])) if load >= 2 else "idle"
+		else:
+			cur, note = "%.0f%%" % max(ll["eng"].values(), default=0.0), eng or "idle"
+		out += block(c, view, snap, "gpu_llama", G, gh, "GPU load", cur, num, "%", 0.0, 100.0, C.bgreen, True, note)
 	if snap["others"]:
 		out.append("%s  other apps  %s%s" % (C.grey, " · ".join("%s %s MiB%s%s" % (o["exe"], num(o["ded"]), " (GPU %.0f%%)" % o["eng"] if o["eng"] >= 5 else "", ", shared %s MiB" % num(o["shr"]) if o["shr"] >= 64 else "") for o in snap["others"][:4]), C.reset))
 	return out
@@ -430,18 +448,20 @@ def model_block(c, snap, view, preset, p, W, gh):
 	sample_t = s.get("sample_t", p.get("sample_t"))
 	stale = " · updated %ds ago" % int(snap["t"] - sample_t) if (sample_t is not None and snap["t"] - sample_t > 2.0) else ""
 	if phase == "prefill":
-		if s.get("prompt_grown", p.get("prompt_grown", False)):
+		total = s.get("new_total")
+		if total is None and s.get("prompt_grown", p.get("prompt_grown", False)):
 			so_far = s.get("done", 0) + s.get("cached", 0)
 			out.append("  %sPREFILL%s  task %s, %s     %s tokens so far     %s t/s%s" % (
 				C.bgreen + C.bold, C.reset, s["task"], mmss(p["elapsed"]),
 				tok(so_far), rate(p["rate_pre"]).strip(), stale))
 		else:
-			frac = s["done"] / max(1, s["todo"])
-			bw = 10 if W < 100 else 24
-			eta = "   ETA %s at this rate" % mmss(p["eta"]) if p["eta"] == p["eta"] else ""
-			out.append("  %sPREFILL%s  task %s, %s     %s / %s new tokens  %s %.0f%%   %s t/s%s%s" % (
-				C.bgreen + C.bold, C.reset, s["task"], mmss(p["elapsed"]),
-				tok(s["done"]), tok(s["todo"]), bar(frac, bw, C.bgreen), 100 * frac,
+			todo = s["todo"] if total is None else total
+			frac = min(1.0, s["done"] / max(1, todo))
+			count = "%s / %s%s" % (tok(s["done"]), "" if total is None else "~", tok(todo))
+			eta = "   ETA %s%s" % (mmss(p["eta"]), " at this rate" if W >= 140 else "") if p["eta"] == p["eta"] else ""
+			head = "%s  %s new" % (mmss(p["elapsed"]), count) if W < 100 else "task %s, %s     %s new tokens" % (s["task"], mmss(p["elapsed"]), count)  # 80 columns: the rate and ETA matter more than the task
+			out.append("  %sPREFILL%s  %s  %s %.0f%%   %s t/s%s%s" % (
+				C.bgreen + C.bold, C.reset, head, bar(frac, 6 if W < 100 else 24, C.bgreen), 100 * frac,
 				rate(p["rate_pre"]).strip(), eta, stale))
 	elif phase == "decode":
 		budget = s["decoded"] + s["remain"]
@@ -479,7 +499,11 @@ def model_block(c, snap, view, preset, p, W, gh):
 		else:
 			out.append(base_line)
 	frac = p["kv"] / max(1, s["n_ctx"])
-	extra = "     prompt %s = %s cached (%.0f%%) + %s new" % (tok(s["n_prompt"]), tok(s["cached"]), 100 * s["cached"] / max(1, s["n_prompt"]), tok(s["todo"])) if phase != "idle" else "     %safter the last request%s" % (C.grey, C.reset)
+	grown = s.get("prompt_grown", p.get("prompt_grown", False))
+	new = s["done"] if phase == "decode" else s["new_total"] if s.get("new_total") is not None else s["done"] if grown else s["todo"]  # n_prompt_tokens holds generated tokens too, and only what is queued so far during a prefill
+	total_prompt = s["cached"] + new
+	so_far_word = " so far" if phase == "prefill" and grown and s.get("new_total") is None else ""
+	extra = "     prompt%s %s = %s cached (%.0f%%) + %s new" % (so_far_word, tok(total_prompt), tok(s["cached"]), 100 * s["cached"] / max(1, total_prompt), tok(new)) if phase != "idle" else "     %safter the last request%s" % (C.grey, C.reset)
 	out.append("  context  %s / %s tokens  %s %s%.1f%%%s%s" % (tok(p["kv"]), tok(s["n_ctx"]), bar(frac, 24, shade(frac)), shade(frac), 100 * frac, C.reset, extra))
 	last = last_request(c, preset)
 	if last and last.get("acc") is not None:
@@ -704,6 +728,31 @@ def recent_events(c, W, n):
 	return out
 
 
+def auto_height(view, snap, W, H, lines_for):
+	"""The Live page's graph height, changed only when it has to be. Alerts, the sampler line and other transient rows move the free room by a few lines; re-picking on
+	every frame made every chart on the page jump. `lines_for(gh)` is the page's line count at that height. Graphs shrink only when the request table has nearly gone, and
+	grow only when the room has held for GROW_HOLD_S with a margin; a new terminal size picks afresh."""
+	need = lambda gh: 13 if gh > 1 else 16
+	best = next((gh for gh in (3, 2) if H - lines_for(gh) >= need(gh)), 1)
+	key = (W, view.term_h)
+	if view.auto_gh is None or view.auto_key != key:
+		view.auto_gh, view.auto_key, view.grow_since = best, key, None
+		return best
+	cur = view.auto_gh
+	if best > cur:
+		if H - lines_for(cur + 1) < need(cur + 1) + 3:
+			view.grow_since = None
+		elif view.grow_since is None:
+			view.grow_since = snap["t"]
+		elif snap["t"] - view.grow_since >= GROW_HOLD_S:
+			view.auto_gh, view.grow_since = cur + 1, None
+		return view.auto_gh
+	view.grow_since = None
+	if cur > 1 and H - lines_for(cur) < 5:
+		view.auto_gh = best
+	return view.auto_gh
+
+
 def live(c, snap, view, W, H):
 	active = [(n, p) for n, p in snap["presets"].items() if p["status"] in ("loaded", "loading")]
 	notices = notice_lines(snap)
@@ -716,11 +765,16 @@ def live(c, snap, view, W, H):
 			out += [""] + model_block(c, snap, view, preset, p, W, gh)
 		return out
 
-	choices = [view.gh] if view.gh else [3, 2, 1]
-	for gh in choices:  # the tallest graphs that still leave room for about eight request rows
-		out = notices + build(gh)
-		if H - len(out) >= (13 if gh > 1 else 16) or gh == choices[-1]:
-			break
+	built = {}
+
+	def lines_for(gh):
+		if gh not in built:
+			built[gh] = notices + build(gh)
+		return len(built[gh])
+
+	gh = view.gh or auto_height(view, snap, W, H, lines_for)
+	lines_for(gh)
+	out = built[gh]
 	room = H - len(out) - 1
 	ev_n = 5 if room >= 24 else 0
 	req_n = max(0, min(20, room - (ev_n + 1 if ev_n else 0)))
@@ -731,7 +785,7 @@ def live(c, snap, view, W, H):
 	evs = recent_events(c, W, ev_n if H - len(out) - 1 >= ev_n else 0)
 	if evs:
 		out += [""] + evs
-	return out
+	return paged(view, out, 0, None, H)
 
 
 # ---- model selection shared by the Memory and Tensors pages --------------------------------------------------------------

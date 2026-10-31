@@ -91,6 +91,7 @@ def test_cpu_core_ordering_and_filtering():
 		"cpu_queue": {"": 3.0},
 	})
 	c.next = None
+	c.eng_hist = {}
 	sy = c.sample()["sys"]
 	assert sy["cpu"] == 112.5, sy
 	assert sy["cpu_mhz"] == 4500.0, sy

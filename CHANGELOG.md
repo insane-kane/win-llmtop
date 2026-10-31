@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The install docs no longer recommend one method over another: `pipx` and `uv tool` are listed as equivalent isolated installs, and the README's install table states when to use each method.
+
+### Fixed
+
+- A damaged line in `requests.jsonl`, a sample file or a server log no longer stops win-llmtop from starting or raises a collector error.
+- A message in the footer clears after 5 s; a collector error clears once the collector recovers, instead of staying until the program exits.
+- With `--no-kv-offload` the Memory page no longer shows a negative KV cache row or counts the MTP head's KV as GPU memory. A per-layer `head_count_kv` no longer projects an empty KV cache.
+- The Live page's charts keep their height while the program runs: transient lines such as alerts no longer resize every chart, and the height is picked afresh only when the terminal changes size. Charts scroll instead of re-slicing every second, use the width of a wide window (up to 120 columns), and the Live page scrolls when it does not fit.
+- The Live page's GPU load no longer flips between 0% and 100%: on AMD cards it comes from the driver's own activity sensor (the whole adapter, all apps), because Windows' engine counters are erratic for compute work there; elsewhere it is the engine counter's mean over 3 s, not yet checked on NVIDIA or Intel cards (a known issue, help wanted; see `CONTRIBUTING.md`).
+- The prefill progress bar no longer hops back and forth during a long prompt. `n_prompt_tokens` only counts what has been queued, so the bar and the ETA now come from the server's log line per batch; until that line appears, or without a log, the line shows the tokens so far. With several busy slots the Live page stays on the slot it is showing instead of swapping to each newer request.
+
 ## [0.4.0] - 2026-10-28
 
 ### Added

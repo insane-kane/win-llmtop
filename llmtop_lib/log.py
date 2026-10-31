@@ -15,21 +15,24 @@ import time
 from . import ui
 
 MIB = 2**20
+MAX_LINE = 4096  # a log line is cut here: Python refuses to parse an integer of more than 4300 digits
+RE_NUM = r"\d{1,15}(?:\.\d+)?(?![\d.])"  # one plain number: "1.2.3" must not match, or float() raises on a damaged line
 RE_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 RE_FWD = re.compile(r"^\[\s*(\d+)\]\s*")  # the router forwards each child's stderr as "[<port>] <line>"
-RE_LINE = re.compile(r"^(\d+)\.(\d\d)\.(\d{3})\.(\d{3}) (\w) (.*)$")
+RE_LINE = re.compile(r"^(\d{1,9})\.(\d\d)\.(\d{3})\.(\d{3}) (\w) (.*)$")
 RE_LEVEL = re.compile(r"^(\w) (.*)$")  # a line without its (default-off) timestamp: level letter, then text
 RE_TASK = re.compile(r"\| task (-?\d+) \|\s*(.*)$")
 RE_SLOT = re.compile(r"\bid\s+(\d+)\s*\|")
-RE_LCP = re.compile(r"selected slot by LCP similarity, (?:f_)?sim_best = ([\d.]+)(?:.*?(?:f_)?keep = ([\d.]+))?")
+RE_LCP = re.compile(r"selected slot by LCP similarity, (?:f_)?sim_best = (" + RE_NUM + r")(?:.*?(?:f_)?keep = (" + RE_NUM + r"))?")
 RE_LRU = re.compile(r"selected slot by LRU, n_tokens = (\d+)")
-RE_RATE = r"([\d.]+|-nan\(ind\)|-nan|nan|inf)"  # tokens per second; 0 new tokens prints inf or nan
-RE_PEVAL = re.compile(r"^prompt eval time =\s*([\d.]+) ms /\s*(\d+) tokens.*?" + RE_RATE + r" tokens per second")
-RE_EVAL = re.compile(r"^eval time =\s*([\d.]+) ms /\s*(\d+) tokens.*?" + RE_RATE + r" tokens per second")
-RE_TOTAL = re.compile(r"^total time =\s*([\d.]+) ms /\s*(\d+) tokens")
+RE_RATE = r"(" + RE_NUM + r"|-nan\(ind\)|-nan|nan|inf)"  # tokens per second; 0 new tokens prints inf or nan
+RE_PEVAL = re.compile(r"^prompt eval time =\s*(" + RE_NUM + r") ms /\s*(\d+) tokens.*?" + RE_RATE + r" tokens per second")
+RE_EVAL = re.compile(r"^eval time =\s*(" + RE_NUM + r") ms /\s*(\d+) tokens.*?" + RE_RATE + r" tokens per second")
+RE_TOTAL = re.compile(r"^total time =\s*(" + RE_NUM + r") ms /\s*(\d+) tokens")
 RE_REALLOC = re.compile(r"graph reallocs =\s*(\d+)\s*/\s*(\d+)")
-RE_DRAFT = re.compile(r"draft acceptance(?: rate)? = ([\d.]+) \(\s*(\d+) accepted /\s*(\d+) generated\)(?:, mean len =\s*([\d.]+))?")
+RE_DRAFT = re.compile(r"draft acceptance(?: rate)? = (" + RE_NUM + r") \(\s*(\d+) accepted /\s*(\d+) generated\)(?:, mean len =\s*(" + RE_NUM + r"))?")
 RE_RELEASE = re.compile(r"stop processing: n_tokens = (\d+)(?:, truncated = (\d+))?")
+RE_PROGRESS = re.compile(r"^prompt processing, n_tokens =\s*(\d{1,12}), progress =\s*(" + RE_NUM + r")")
 RE_ROUTER_FILE = re.compile(r"^llama-server-(\d{8})-(\d{6})\.log$")
 RE_SPAWN = re.compile(rb"^(\d+)\.(\d\d)\.(\d{3})\.(\d{3}) I srv\s+load: spawning server instance with name=(\S+)", re.M)
 # warnings that llama.cpp prints on every load; listed as info rather than warnings
@@ -72,7 +75,7 @@ def rate_of(s):
 def normalize_line(line):
 	"""Strip ANSI colour escapes, an optional router-forwarded "[<port>] " prefix and an optional "M.SS.mmm.uuu L " timestamp
 	(timestamps are off by default in llama.cpp). Returns (t or None, level or None, text, port or None)."""
-	line = RE_ANSI.sub("", line)
+	line = RE_ANSI.sub("", line[:MAX_LINE])
 	line = ui.safe(line)
 	port = None
 	if m := RE_FWD.match(line):
@@ -138,6 +141,7 @@ class Assembler:
 		self.preset = ui.safe(preset)
 		self.sessions = []  # [{'n', 'load_s', 'wall'}]
 		self.cur = {}  # task -> request being assembled
+		self.progress = {}  # task -> (tokens processed, share of the whole prompt done, cached prefix included), from the server's line per batch
 		self.sel = None
 		self.live = False  # set after the backlog has been read: lines are stamped with the current time
 		self.last_t = 0.0
@@ -170,6 +174,7 @@ class Assembler:
 		if "llama_server: initializing" in text:
 			self.sessions.append({"n": len(self.sessions), "load_s": None, "wall": wall})
 			self.cur.clear()
+			self.progress.clear()
 			self.sel = None
 			return done, events
 		if "llama_server: model loaded" in text and self.sessions:
@@ -205,6 +210,9 @@ class Assembler:
 		r = self.cur.get(task)
 		if r is None:
 			return done, events
+		if m := RE_PROGRESS.search(body):
+			self.progress[task] = (int(m.group(1)), float(m.group(2)))
+			return done, events
 		if m := RE_PEVAL.search(body):
 			r.update(pms=float(m.group(1)), pn=int(m.group(2)), pp=rate_of(m.group(3)))
 		elif m := RE_EVAL.search(body):
@@ -220,6 +228,7 @@ class Assembler:
 			r.update(acc=float(m.group(1)), dacc=int(m.group(2)), dgen=int(m.group(3)), mlen=float(m.group(4)) if m.group(4) is not None else None)
 		elif m := RE_RELEASE.search(body):
 			self.cur.pop(task)
+			self.progress.pop(task, None)
 			self.requests_done += 1
 			r.update(t=t, wall=wall, kv=int(m.group(1)), trunc=bool(int(m.group(2))) if m.group(2) is not None else False)
 			r["cached"] = max(0, r["kv"] - r["tn"] - r["pn"]) if "pn" in r and "tn" in r else None  # derived: tokens in the slot at release, minus generated, minus newly evaluated

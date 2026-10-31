@@ -13,6 +13,7 @@ import pathlib
 import sys
 import time
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -33,6 +34,39 @@ class _StubQuery:
 
 	def close(self):
 		pass
+
+
+class _StubAdl:
+	"""A stand-in for atiadlxx.dll: `names` are the adapters it lists, in order; only the indexes in `answers` have a live sensor, and each answer is
+	(activity %, graphics clock MHz). A non-zero `rc` fails every sensor query, like a driver that does not answer."""
+
+	def __init__(self, names, answers, rc=0):
+		self.names, self.answers, self.rc, self.queried = names, answers, rc, []
+
+	def ADL2_Main_Control_Create(self, malloc, enum, ctx):
+		return 0
+
+	def ADL2_Adapter_NumberOfAdapters_Get(self, ctx, n):
+		n._obj.value = len(self.names)
+		return 0
+
+	def ADL2_Adapter_AdapterInfo_Get(self, ctx, info, size):
+		for i, name in enumerate(self.names):
+			info[i].index = i
+			info[i].name = name.encode("utf-8")
+		return 0
+
+	def ADL2_New_QueryPMLogData_Get(self, ctx, index, log):
+		self.queried.append(index)
+		if self.rc or index not in self.answers:
+			return self.rc or -1
+		load, mhz = self.answers[index]
+		pm = log._obj
+		pm.sensors[win.ADL_SENSOR_ACTIVITY_GFX].supported = 1
+		pm.sensors[win.ADL_SENSOR_ACTIVITY_GFX].value = load
+		pm.sensors[win.ADL_SENSOR_GFXCLK].supported = 1
+		pm.sensors[win.ADL_SENSOR_GFXCLK].value = mhz
+		return 0
 
 
 class TestWin(unittest.TestCase):
@@ -83,6 +117,7 @@ class TestWin(unittest.TestCase):
 		c = object.__new__(win.Counters)
 		c.q = _StubQuery(data)
 		c.next = None
+		c.eng_hist = {}
 		out = c.sample()
 
 		p = out["procs"][4200]
@@ -106,6 +141,60 @@ class TestWin(unittest.TestCase):
 		self.assertAlmostEqual(by_luid[dgpu]["shr"], 256.0)
 		self.assertAlmostEqual(by_luid[dgpu]["com"], 2304.0)
 		self.assertEqual(by_luid[dgpu]["eng"], {"3D": 100.0, "High Priority Compute": 33.0})
+
+	def test_counters_engine_load_is_a_mean_over_three_seconds(self):
+		# one compute instance reads 100 or 0 from one 250 ms sample to the next, as Windows' counters do on AMD during compute work
+		name = "pid_4200_luid_0x00000000_0x0001c3d4_phys_0_eng_0_engtype_Compute"
+		c = object.__new__(win.Counters)
+		c.q = _StubQuery({"eng": {name: 100.0}})
+		c.next = None
+		c.eng_hist = {}
+		clock, seen = [0.0], []
+		with mock.patch.object(win.time, "monotonic", side_effect=lambda: clock[0]):
+			for i in range(12):
+				c.q.data["eng"][name] = 100.0 if i % 2 == 0 else 0.0
+				out = c.sample()
+				seen.append(out["procs"].get(4200, {}).get("eng", {}).get("Compute"))
+				clock[0] += 0.25
+		means = [v for v in seen[2:] if v is not None]
+		self.assertEqual(len(means), 10, seen)
+		for v in means:
+			self.assertGreater(v, 25.0)
+			self.assertLess(v, 75.0)
+			self.assertNotIn(v, (0.0, 100.0))
+
+	def test_counters_engine_history_drops_instances_gone_for_longer_than_the_window(self):
+		name = "pid_4200_luid_0x00000000_0x0001c3d4_phys_0_eng_0_engtype_Compute"
+		c = object.__new__(win.Counters)
+		c.q = _StubQuery({"eng": {name: 50.0}})
+		c.next = None
+		c.eng_hist = {}
+		clock = [0.0]
+		with mock.patch.object(win.time, "monotonic", side_effect=lambda: clock[0]):
+			c.sample()
+			self.assertIn(name, c.eng_hist)
+			c.q.data["eng"] = {}  # the instance is not in this sample
+			clock[0] = win.ENG_WINDOW_S - 0.5
+			c.sample()
+			self.assertIn(name, c.eng_hist)  # still inside the window
+			clock[0] = win.ENG_WINDOW_S + 0.5
+			c.sample()
+			self.assertNotIn(name, c.eng_hist)
+
+	def test_amd_load_reads_the_driver_sensor(self):
+		name = "AMD Radeon RX 7900 XT"
+		# one card is listed once per output: only the second listing has live sensors, and the name match ignores case
+		dll = _StubAdl([name, name], {1: (98, 2876)})
+		amd = win.AmdLoad("amd radeon rx 7900 xt", dll=dll)
+		self.assertEqual(amd.index, 1)
+		self.assertEqual(amd.read(), {"load": 98.0, "mhz": 2876.0})
+		dll.rc = -5  # the query fails: no reading rather than a wrong one
+		self.assertIsNone(amd.read())
+		clamped = win.AmdLoad(name, dll=_StubAdl([name], {0: (130, 2000)}))
+		self.assertEqual(clamped.read(), {"load": 100.0, "mhz": 2000.0})
+		other = win.AmdLoad("AMD Radeon PRO W6800", dll=_StubAdl([name], {0: (98, 2876)}))
+		self.assertIsNone(other.index)
+		self.assertIsNone(other.read())
 
 	def test_pmc_ex2_to_ex_fallback(self):
 		real_fn = win._psapi.GetProcessMemoryInfo
@@ -235,6 +324,9 @@ class TestWin(unittest.TestCase):
 
 CASES = [
 	("counters_sample_per_luid_and_engine_spaces", TestWin("test_counters_sample_per_luid_and_engine_spaces")),
+	("counters_engine_load_is_a_mean_over_three_seconds", TestWin("test_counters_engine_load_is_a_mean_over_three_seconds")),
+	("counters_engine_history_drops_instances_gone_for_longer_than_the_window", TestWin("test_counters_engine_history_drops_instances_gone_for_longer_than_the_window")),
+	("amd_load_reads_the_driver_sensor", TestWin("test_amd_load_reads_the_driver_sensor")),
 	("pmc_ex2_to_ex_fallback", TestWin("test_pmc_ex2_to_ex_fallback")),
 	("live_this_process_and_system", TestWin("test_live_this_process_and_system")),
 	("proc_info_nonexistent_pid", TestWin("test_proc_info_nonexistent_pid")),

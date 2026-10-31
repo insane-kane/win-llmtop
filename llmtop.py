@@ -22,6 +22,7 @@ Sources:
 	/models, /slots?model=<preset>   router API: loaded preset and its flags, context in use, prompt progress, tokens decoded (live)
 	<preset>.log                     per-request timings from the model process; the router log has loads, queueing and evictions
 	Windows performance counters     dedicated and shared (system RAM) VRAM per process, GPU engine load, paging; DXGI gives the OS VRAM budget
+	                                 (the GPU load comes from the AMD driver's own sensor where there is one)
 	GGUF header + llama-fit-params   the model's tensors and llama.cpp's own memory projection
 
 History is kept for 24 h in memory and mirrored to disk so it survives restarts (--no-persist to disable).
@@ -215,6 +216,7 @@ def live(c, view):
 			except Exception as e:
 				err = traceback.format_exc()
 				view.msg = "collector error: %s" % e
+			pages.age_msg(view, t0, err is not None)
 			size = shutil.get_terminal_size((120, 40))
 			if (size.columns, size.lines) != last_size:  # a resize reflows what is on screen: start from a clean one
 				out.write("\x1b[2J")
@@ -377,6 +379,7 @@ def check(c, args):
 		watch_str = "watching %s" % watched["name"] if watched else "no adapter selected"
 		pdh_str = "PDH counters present" if pdh_ok else "PDH counters absent"
 		gpu_fact = "%s, %s; %s" % ("; ".join(ad_strs), watch_str, pdh_str)
+		gpu_fact += "; GPU load from the AMD driver" if (snap.get("gpu") or {}).get("load") is not None else "; GPU load from Windows engine counters"
 		gpu_status = "ok" if gpu_telemetry_ok else "FAIL"
 	print(ui.safe("%-18s %-5s %s" % ("gpu", gpu_status, gpu_fact)))
 

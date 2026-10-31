@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-30
+
 ### Changed
 
 - The install docs no longer recommend one method over another: `pipx` and `uv tool` are listed as equivalent isolated installs, and the README's install table states when to use each method.
